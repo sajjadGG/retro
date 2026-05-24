@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "retro"
+name = "retro-agent-memory"
 version = "0.1.0"
 description = "Capture, analyze, and mine Codex / Claude Code rollouts into durable local memory."
 readme = "README.md"
@@ -15,6 +15,11 @@ dependencies = [
 
 [project.scripts]
 retro = "retro.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/sajjadGG/retro"
+Repository = "https://github.com/sajjadGG/retro"
+Issues = "https://github.com/sajjadGG/retro/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/retro"]

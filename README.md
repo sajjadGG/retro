@@ -29,6 +29,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Mining](#mining)
 - [Dashboard](#dashboard)
 - [Pricing snapshot](#pricing-snapshot)
+- [Release and publishing](#release-and-publishing)
 - [Environment](#environment)
 - [Notes and guarantees](#notes-and-guarantees)
 
@@ -36,14 +37,24 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 
 ## Install
 
-Requires Python ≥ 3.10. From a clone:
+Requires Python ≥ 3.10.
+
+From PyPI:
+
+```bash
+pip install retro-agent-memory
+```
+
+That installs the `retro` CLI.
+
+From a clone:
 
 ```bash
 python3.13 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-That installs the `retro` CLI.
+The PyPI distribution is named `retro-agent-memory` because `retro` is already occupied on PyPI; the import package and CLI are still named `retro`.
 
 ---
 
@@ -388,6 +399,31 @@ The refresh script:
 4. Updates `_meta.snapshot_taken`.
 
 To add a model: add an empty entry under its name in the snapshot, then re-run `refresh.py`.
+
+---
+
+## Release and publishing
+
+CI lives in `.github/workflows/ci.yml`. It runs on pushes and pull requests to `main`, installs the package across Python 3.10-3.13, compiles `src/retro`, smoke-tests the CLI, builds the wheel/sdist, and validates them with `twine check`.
+
+Publishing lives in `.github/workflows/publish.yml`. It runs when a GitHub release is published, builds the package, publishes it to PyPI with trusted publishing, and attaches the wheel/sdist to the GitHub release.
+
+One-time PyPI setup:
+
+1. Create or claim the PyPI project `retro-agent-memory`.
+2. Add a trusted publisher for repository `sajjadGG/retro`.
+3. Use workflow `.github/workflows/publish.yml`.
+4. Use environment `pypi`.
+
+Release flow:
+
+```bash
+# bump version in pyproject.toml first
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Then publish a GitHub release for that tag. The release event triggers the PyPI publish job.
 
 ---
 
