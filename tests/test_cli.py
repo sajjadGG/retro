@@ -57,3 +57,11 @@ def test_show_unknown_host():
 def test_list_command(tmp_path):
     result = runner.invoke(app, ["list", "--root", str(tmp_path / "rollout-memory")])
     assert result.exit_code == 0
+
+
+def test_dashboard_view_non_interactive():
+    result = runner.invoke(app, ["dashboard", "view"])
+    assert result.exit_code == 0
+    assert "Retro Rollout Dashboard" in result.output or "Retro Portfolio Dashboard" in result.output
+    assert "Imported Sessions Summary" in result.output
+

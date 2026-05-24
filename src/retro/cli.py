@@ -639,5 +639,22 @@ def dashboard_build(
     console.print(f"[green]dashboard ready:[/green] {repo_root / 'dashboard' / 'index.html'}")
 
 
+@dashboard_app.command("view")
+def dashboard_view(
+    mode: str = typer.Option(
+        "auto",
+        "--mode",
+        help="Cost mode: auto, calculate, or display.",
+    ),
+):
+    """View the rollout dashboard interactively in the terminal."""
+    if mode not in {"auto", "calculate", "display"}:
+        raise typer.BadParameter("mode must be one of: auto, calculate, display")
+
+    from .dashboard_terminal import run_terminal_dashboard
+
+    run_terminal_dashboard(mode=mode)
+
+
 if __name__ == "__main__":
     app()
