@@ -7,12 +7,15 @@ activation/execution/termination blocks; procedures carry ordered steps).
 """
 from __future__ import annotations
 
-import json
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Literal, Sequence
+from typing import Any, Literal
 
 from ..schema import Host, NormalizedEvent
+from ..utils import event_text as _shared_event_text
+from ..utils import iter_messages as _shared_iter_messages
+from ..utils import truncate as _shared_truncate
 
 MemoryKind = Literal[
     "procedure",
@@ -178,22 +181,11 @@ def register_filter(name: str, *, description: str = "") -> Callable[[FilterFn],
 
 
 def event_text(ev: NormalizedEvent) -> str:
-    payload = ev.payload or {}
-    for key in ("text", "message", "thinking"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
-    raw = payload.get("raw_content")
-    if raw is not None:
-        return json.dumps(raw, ensure_ascii=False)
-    return ev.summary or ""
+    return _shared_event_text(ev)
 
 
 def truncate(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
+    return _shared_truncate(text, limit)
 
 
 def refs(events: Iterable[NormalizedEvent], *, limit: int = 5) -> list[str]:
@@ -205,11 +197,7 @@ def memory_id(session_id: str, method: str, index: int) -> str:
 
 
 def iter_messages(events: Sequence[NormalizedEvent], actor: str | None = None):
-    for ev in events:
-        if ev.event_type != "message":
-            continue
-        if actor is None or ev.actor == actor:
-            yield ev
+    return _shared_iter_messages(events, actor)
 
 
 def file_edit_events(events: Sequence[NormalizedEvent]) -> list[NormalizedEvent]:

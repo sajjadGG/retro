@@ -20,10 +20,11 @@ import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 
 from ..schema import NormalizedEvent, RawRef, write_events
 from ..storage import Layout
+from ..utils import iter_jsonl, truncate_summary
 from .base import ImportResult
 
 CODEX_HOME = Path.home() / ".codex"
@@ -255,7 +256,7 @@ class CodexImporter:
         raw_rollout = raw_dir / "rollout.jsonl"
         shutil.copy2(thread.rollout_path, raw_rollout)
 
-        thread_meta = {
+        thread_meta: dict[str, Any] = {
             "thread_id": thread.thread_id,
             "title": thread.title,
             "cwd": thread.cwd,
@@ -302,12 +303,13 @@ class CodexImporter:
         call_id_to_event_type: dict[str, str] = {}
         call_id_to_name: dict[str, str] = {}
 
-        for line_no, raw in _iter_jsonl(rollout_path):
+        for line_no, raw in iter_jsonl(rollout_path):
             seq = line_no
             etype = raw.get("type")
             ts = raw.get("timestamp")
-            payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
-            ptype = payload.get("type") if isinstance(payload, dict) else None
+            raw_payload = raw.get("payload")
+            payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
+            ptype = payload.get("type")
             event_id = f"{thread_id}:{line_no}"
             raw_ref = RawRef(path=str(rollout_path), line=line_no)
             common = dict(
@@ -362,20 +364,10 @@ class CodexImporter:
                 )
                 if ev is None:
                     continue  # intentional skips (duplicates of event_msg)
-                if isinstance(ev, NormalizedEvent):
-                    events.append(ev)
-                else:
+                if ev.event_type == "unknown":
                     unknown += 1
                     gaps.add(f"response_item/{ptype}")
-                    events.append(
-                        NormalizedEvent(
-                            actor="system",
-                            event_type="unknown",
-                            summary=f"response_item unknown payload.type={ptype}",
-                            payload=payload,
-                            **common,
-                        )
-                    )
+                events.append(ev)
             else:
                 unknown += 1
                 gaps.add(etype or "<missing>")
@@ -399,7 +391,7 @@ class CodexImporter:
             return NormalizedEvent(
                 actor="user",
                 event_type="message",
-                summary=_truncate(text),
+                summary=truncate_summary(text),
                 payload={"text": text, "images": payload.get("images") or []},
                 **common,
             )
@@ -408,7 +400,7 @@ class CodexImporter:
             return NormalizedEvent(
                 actor="assistant",
                 event_type="message",
-                summary=_truncate(text),
+                summary=truncate_summary(text),
                 payload={"text": text, "phase": payload.get("phase")},
                 **common,
             )
@@ -450,7 +442,7 @@ class CodexImporter:
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
-                summary=f"web_search query={_truncate(payload.get('query',''))}",
+                summary=f"web_search query={truncate_summary(payload.get('query',''))}",
                 payload=payload,
                 **common,
             )
@@ -463,7 +455,7 @@ class CodexImporter:
         common: dict[str, Any],
         call_id_to_event_type: dict[str, str],
         call_id_to_name: dict[str, str],
-    ) -> NormalizedEvent | None | object:
+    ) -> NormalizedEvent | None:
         if ptype == "message":
             role = payload.get("role")
             if role == "developer":
@@ -472,7 +464,7 @@ class CodexImporter:
                 return NormalizedEvent(
                     actor="system",
                     event_type="message",
-                    summary=_truncate(text),
+                    summary=truncate_summary(text),
                     payload={"role": role, "content": payload.get("content")},
                     **common,
                 )
@@ -553,7 +545,13 @@ class CodexImporter:
                 payload=payload,
                 **common,
             )
-        return object()  # sentinel: caller treats as unknown
+        return NormalizedEvent(
+            actor="system",
+            event_type="unknown",
+            summary=f"response_item unknown payload.type={ptype}",
+            payload=payload,
+            **common,
+        )
 
 
 def _read_session_meta(path: Path) -> dict[str, Any] | None:
@@ -582,18 +580,6 @@ def _read_session_meta(path: Path) -> dict[str, Any] | None:
     except OSError:
         return None
     return None
-
-
-def _iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for i, raw_line in enumerate(fh, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                yield i, json.loads(line)
-            except json.JSONDecodeError:
-                continue
 
 
 def _flatten_content(content: Any) -> str:
@@ -626,13 +612,6 @@ def _summarize_args(args: Any, limit: int = 80) -> str:
     if isinstance(args, dict):
         for k in ("cmd", "command", "path", "file", "workdir", "query"):
             if k in args:
-                return f"{k}={_truncate(str(args[k]), limit)}"
-        return _truncate(json.dumps(args, ensure_ascii=False), limit)
-    return _truncate(str(args), limit)
-
-
-def _truncate(text: str, limit: int = 200) -> str:
-    text = (text or "").replace("\n", " ").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
+                return f"{k}={truncate_summary(str(args[k]), limit)}"
+        return truncate_summary(json.dumps(args, ensure_ascii=False), limit)
+    return truncate_summary(str(args), limit)

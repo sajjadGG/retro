@@ -8,7 +8,7 @@ Paper: https://arxiv.org/abs/2512.10696
 """
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from ...schema import NormalizedEvent
 from ..base import (
@@ -68,7 +68,10 @@ def mine_reme_style(ctx: MiningContext) -> MiningResult:
                     "For project-planning or research requests, create durable docs "
                     "artifacts under docs/ or specs/, then report the exact paths."
                 ),
-                when_to_use="Use when the user asks for a spec, project purpose, research note, or landscape scan.",
+                when_to_use=(
+                    "Use when the user asks for a spec, project purpose, "
+                    "research note, or landscape scan."
+                ),
                 evidence_refs=refs(file_edit_events(events)),
                 confidence=0.78,
                 priority=4,

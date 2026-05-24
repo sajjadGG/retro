@@ -31,7 +31,7 @@ jobs:
       - name: Install package and build tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e . build twine
+          python -m pip install -e ".[dev]" build twine
 
       - name: Compile package
         run: python -m compileall src/retro
@@ -40,6 +40,16 @@ jobs:
         run: |
           retro --help
           retro methods
+
+      - name: Run tests
+        run: python -m pytest tests/ -v
+
+      - name: Lint with ruff
+        run: python -m ruff check src/retro/ tests/
+
+      - name: Type check with mypy
+        if: matrix.python-version == '3.13'
+        run: python -m mypy src/retro/
 
       - name: Build distributions
         run: python -m build

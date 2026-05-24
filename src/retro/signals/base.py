@@ -1,11 +1,14 @@
 """Core signal abstractions: SessionContext, SignalReading, Signal, registry."""
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Literal, Sequence
+from typing import Any, Literal
 
 from ..schema import Host, NormalizedEvent, read_events
+from ..utils import event_text as _shared_event_text
+from ..utils import iter_messages as _shared_iter_messages
 
 SignalGroup = Literal["activity", "outcome", "cost", "risk"]
 SignalKind = Literal["numeric", "boolean", "categorical", "text"]
@@ -116,22 +119,12 @@ def load_events(normalized_path: Path) -> list[NormalizedEvent]:
     return list(read_events(normalized_path))
 
 
-def iter_messages(events: Iterable[NormalizedEvent], actor: str) -> Iterator[NormalizedEvent]:
-    for ev in events:
-        if ev.actor == actor and ev.event_type == "message":
-            yield ev
+def iter_messages(events: Sequence[NormalizedEvent], actor: str) -> Iterator[NormalizedEvent]:
+    return _shared_iter_messages(events, actor)
 
 
 def event_text(ev: NormalizedEvent) -> str:
-    payload = ev.payload or {}
-    for key in ("text", "message", "thinking"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
-    raw = payload.get("raw_content")
-    if isinstance(raw, str):
-        return raw
-    return ev.summary or ""
+    return _shared_event_text(ev)
 
 
 def reading(

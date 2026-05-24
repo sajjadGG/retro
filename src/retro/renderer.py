@@ -5,8 +5,8 @@ This is a *view*. The source of truth is `raw/` + `normalized/*.events.jsonl`.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 from .schema import NormalizedEvent, read_events
 

@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from datetime import datetime
-from typing import Iterable
 
 from ..schema import NormalizedEvent
 from .base import SessionContext, event_text, iter_messages, reading, register
@@ -125,8 +125,8 @@ def _assistant_message_count(ctx: SessionContext):
     description="Wall-clock span between first and last timestamped event.",
 )
 def _session_duration_seconds(ctx: SessionContext):
-    timestamps = [_parse_ts(e.timestamp) for e in ctx.events if e.timestamp]
-    timestamps = [t for t in timestamps if t is not None]
+    parsed = [_parse_ts(e.timestamp) for e in ctx.events if e.timestamp]
+    timestamps: list[datetime] = [t for t in parsed if t is not None]
     if len(timestamps) < 2:
         return None
     duration = int((max(timestamps) - min(timestamps)).total_seconds())

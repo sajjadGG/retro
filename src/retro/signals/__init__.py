@@ -8,6 +8,11 @@ went* that can be aggregated across many sessions.
 
 See `specs/rollout_signals_spec.md`.
 """
+# Import the catalogs so the decorators register them.
+from . import (
+    external,  # noqa: F401
+    heuristics,  # noqa: F401
+)
 from .base import (  # noqa: F401
     REGISTRY,
     SessionContext,
@@ -21,7 +26,3 @@ from .runner import (  # noqa: F401
     run_signals,
     write_signal_artifacts,
 )
-
-# Import the catalogs so the decorators register them.
-from . import heuristics  # noqa: F401
-from . import external  # noqa: F401

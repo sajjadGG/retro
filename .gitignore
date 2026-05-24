@@ -9,3 +9,5 @@ rollout-memory/
 .claude/
 dashboard/data/
 dashboard/index.html
+.mypy_cache/
+.ruff_cache/

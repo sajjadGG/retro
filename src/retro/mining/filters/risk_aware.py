@@ -16,7 +16,6 @@ It does not invent new candidates — only re-ranks and prunes. Apply via
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 from ..base import MemoryCandidate, MiningResult, register_filter
 

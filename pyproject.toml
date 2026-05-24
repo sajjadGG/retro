@@ -13,6 +13,13 @@ dependencies = [
     "rich>=13",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.10",
+    "ruff>=0.4",
+]
+
 [project.scripts]
 retro = "retro.cli:app"
 
@@ -23,3 +30,29 @@ Issues = "https://github.com/sajjadGG/retro/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/retro"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = false
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["retro.importers.*"]
+disable_error_code = ["arg-type"]
+
+[[tool.mypy.overrides]]
+module = ["retro.cli"]
+disable_error_code = ["arg-type"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

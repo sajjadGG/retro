@@ -13,12 +13,14 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from ..schema import NormalizedEvent, RawRef, write_events
 from ..storage import Layout
+from ..utils import iter_jsonl, truncate_summary
 from .base import ImportResult
 
 CLAUDE_HOME = Path.home() / ".claude"
@@ -226,7 +228,7 @@ class ClaudeImporter:
         tool_use_names: dict[str, str] = {}
         seq = 0
 
-        for line_no, raw_event in _iter_jsonl(transcript_path):
+        for line_no, raw_event in iter_jsonl(transcript_path):
             seq += 1
             etype = raw_event.get("type")
             ts = raw_event.get("timestamp")
@@ -260,7 +262,7 @@ class ClaudeImporter:
                         event_id=uuid,
                         actor="system",
                         event_type="message",
-                        summary=_truncate(str(msg)),
+                        summary=truncate_summary(str(msg)),
                         payload={"message": msg},
                         **common,
                     )
@@ -331,7 +333,7 @@ class ClaudeImporter:
                 event_id=uuid,
                 actor="user",
                 event_type="message",
-                summary=_truncate(content),
+                summary=truncate_summary(content),
                 payload={"text": content},
                 **common,
             )
@@ -341,7 +343,7 @@ class ClaudeImporter:
                 event_id=uuid,
                 actor="user",
                 event_type="message",
-                summary=_truncate(str(content)),
+                summary=truncate_summary(str(content)),
                 payload={"raw_content": content},
                 **common,
             )
@@ -355,7 +357,7 @@ class ClaudeImporter:
                     event_id=part_id,
                     actor="user",
                     event_type="message",
-                    summary=_truncate(text),
+                    summary=truncate_summary(text),
                     payload={"text": text},
                     **common,
                 )
@@ -404,7 +406,7 @@ class ClaudeImporter:
                 event_id=uuid,
                 actor="assistant",
                 event_type="message",
-                summary=_truncate(str(content)),
+                summary=truncate_summary(str(content)),
                 payload={"raw_content": content},
                 **common,
             )
@@ -418,7 +420,7 @@ class ClaudeImporter:
                     event_id=part_id,
                     actor="assistant",
                     event_type="message",
-                    summary=_truncate(text),
+                    summary=truncate_summary(text),
                     payload={"text": text},
                     **common,
                 )
@@ -428,7 +430,7 @@ class ClaudeImporter:
                     event_id=part_id,
                     actor="assistant",
                     event_type="reasoning",
-                    summary=_truncate(text),
+                    summary=truncate_summary(text),
                     payload={"thinking": text},
                     **common,
                 )
@@ -459,30 +461,11 @@ class ClaudeImporter:
                 )
 
 
-def _iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
-    with path.open("r", encoding="utf-8") as fh:
-        for i, raw_line in enumerate(fh, start=1):
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                yield i, json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-
-def _truncate(text: str, limit: int = 200) -> str:
-    text = text.replace("\n", " ").strip()
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1] + "…"
-
-
 def _summarize_input(value: Any, limit: int = 80) -> str:
     if isinstance(value, dict):
         # Prefer a couple of likely-meaningful keys.
         for k in ("file_path", "path", "command", "pattern", "url", "query", "description"):
             if k in value and isinstance(value[k], (str, int, float)):
-                return f"{k}={_truncate(str(value[k]), limit)}"
-        return _truncate(json.dumps(value, ensure_ascii=False), limit)
-    return _truncate(str(value), limit)
+                return f"{k}={truncate_summary(str(value[k]), limit)}"
+        return truncate_summary(json.dumps(value, ensure_ascii=False), limit)
+    return truncate_summary(str(value), limit)

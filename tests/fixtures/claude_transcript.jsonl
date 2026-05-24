@@ -1,0 +1,10 @@
+{"type":"system","uuid":"sys-001","timestamp":"2025-06-01T10:00:00Z","message":"System initialized"}
+{"type":"user","uuid":"usr-001","timestamp":"2025-06-01T10:00:01Z","message":{"role":"user","content":"Fix the bug in auth.py"}}
+{"type":"assistant","uuid":"ast-001","timestamp":"2025-06-01T10:00:05Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll look at auth.py to find the bug."},{"type":"tool_use","id":"tu-001","name":"Read","input":{"file_path":"/home/user/project/auth.py"}}]}}
+{"type":"user","uuid":"usr-002","timestamp":"2025-06-01T10:00:06Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-001","content":"def login(user):\n    return True"}]}}
+{"type":"assistant","uuid":"ast-002","timestamp":"2025-06-01T10:00:10Z","message":{"role":"assistant","content":[{"type":"text","text":"Found it. The login function always returns True. Let me fix it."},{"type":"tool_use","id":"tu-002","name":"Edit","input":{"file_path":"/home/user/project/auth.py","old_string":"return True","new_string":"return check_password(user)"}}]}}
+{"type":"user","uuid":"usr-003","timestamp":"2025-06-01T10:00:11Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-002","content":"File edited successfully"}]}}
+{"type":"assistant","uuid":"ast-003","timestamp":"2025-06-01T10:00:15Z","message":{"role":"assistant","content":[{"type":"text","text":"Fixed! The login function now properly checks the password."},{"type":"tool_use","id":"tu-003","name":"Bash","input":{"command":"pytest tests/test_auth.py"}}]}}
+{"type":"user","uuid":"usr-004","timestamp":"2025-06-01T10:00:20Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-003","content":"2 passed, 0 failed\nProcess exited with code 0"}]}}
+{"type":"assistant","uuid":"ast-004","timestamp":"2025-06-01T10:00:22Z","message":{"role":"assistant","content":[{"type":"text","text":"All tests pass. The bug is fixed."}]}}
+{"type":"user","uuid":"usr-005","timestamp":"2025-06-01T10:00:25Z","message":{"role":"user","content":"Thanks, that's perfect!"}}

@@ -1,0 +1,13 @@
+{"type":"session_meta","timestamp":"2025-06-01T10:00:00Z","payload":{"id":"thread-001","cwd":"/home/user/project","model_provider":"openai","title":"Fix auth bug"}}
+{"type":"turn_context","timestamp":"2025-06-01T10:00:01Z","payload":{"turn_id":"turn-1","model":"gpt-5"}}
+{"type":"event_msg","timestamp":"2025-06-01T10:00:02Z","payload":{"type":"user_message","message":"Fix the login bug"}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:05Z","payload":{"type":"message","role":"developer","content":"You are a helpful assistant."}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:06Z","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"/home/user/project/auth.py\"}","call_id":"call-001"}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:07Z","payload":{"type":"function_call_output","call_id":"call-001","output":"def login(user):\n    return True"}}
+{"type":"event_msg","timestamp":"2025-06-01T10:00:08Z","payload":{"type":"agent_message","message":"Found the bug. Let me patch it."}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:09Z","payload":{"type":"function_call","name":"apply_patch","arguments":"{\"patch\":\"fix auth\"}","call_id":"call-002"}}
+{"type":"event_msg","timestamp":"2025-06-01T10:00:10Z","payload":{"type":"patch_apply_end","success":true,"changes":{"/home/user/project/auth.py":{"type":"update"}}}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:11Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"pytest tests/\"}","call_id":"call-003"}}
+{"type":"response_item","timestamp":"2025-06-01T10:00:12Z","payload":{"type":"function_call_output","call_id":"call-003","output":"2 passed\nProcess exited with code 0"}}
+{"type":"event_msg","timestamp":"2025-06-01T10:00:13Z","payload":{"type":"agent_message","message":"All tests pass. The bug is fixed."}}
+{"type":"event_msg","timestamp":"2025-06-01T10:00:14Z","payload":{"type":"task_complete","duration_ms":14000}}

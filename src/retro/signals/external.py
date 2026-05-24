@@ -18,8 +18,8 @@ def _parse_ts(value: str | None) -> datetime | None:
 
 
 def _session_bounds(ctx: SessionContext) -> tuple[datetime, datetime] | None:
-    stamps = [_parse_ts(e.timestamp) for e in ctx.events if e.timestamp]
-    stamps = [s for s in stamps if s is not None]
+    parsed = [_parse_ts(e.timestamp) for e in ctx.events if e.timestamp]
+    stamps: list[datetime] = [s for s in parsed if s is not None]
     if len(stamps) < 2:
         return None
     return min(stamps), max(stamps)

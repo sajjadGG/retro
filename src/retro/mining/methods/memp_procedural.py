@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Sequence
+from collections.abc import Sequence
 
 from ...schema import NormalizedEvent
 from ..base import (
@@ -112,7 +112,7 @@ def mine_memp_procedural(ctx: MiningContext) -> MiningResult:
                 confidence=round(confidence, 2),
                 priority=4 if len(steps) >= 3 else 2,
                 risk="medium",
-                scope=scope,
+                scope=scope,  # type: ignore[arg-type]
                 scope_reason=scope_reason,
                 origin_repo=origin,
                 structured=structured,
@@ -280,7 +280,9 @@ def _infer_outcome(events: Sequence[NormalizedEvent]) -> str:
     return ""
 
 
-def _infer_procedure_scope(events: Sequence[NormalizedEvent], origin: str | None) -> tuple[str, str]:
+def _infer_procedure_scope(
+    events: Sequence[NormalizedEvent], origin: str | None
+) -> tuple[str, str]:
     """Procedures usually reuse repo conventions, so default `repo`.
 
     Treat as `task` when:

@@ -286,7 +286,7 @@ def _response_schema() -> dict[str, Any]:
 
 
 def _candidates_from_response(ctx: MiningContext, response: dict[str, Any]) -> list[MemoryCandidate]:
-    out = []
+    out: list[MemoryCandidate] = []
     candidates = response.get("candidates")
     if not isinstance(candidates, list):
         return out

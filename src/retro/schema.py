@@ -7,9 +7,10 @@ consume it without consulting Python.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Literal, Optional
+from typing import Any, Literal
 
 Actor = Literal["user", "assistant", "tool", "system", "subagent", "hook"]
 EventType = Literal[
@@ -52,8 +53,8 @@ class NormalizedEvent:
     event_type: EventType
     summary: str
     raw_ref: RawRef
-    timestamp: Optional[str] = None
-    parent_event_id: Optional[str] = None
+    timestamp: str | None = None
+    parent_event_id: str | None = None
     payload: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
