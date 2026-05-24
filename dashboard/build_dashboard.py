@@ -1,0 +1,1755 @@
+#!/usr/bin/env python3
+"""Build a static dashboard from rollout-memory artifacts.
+
+This script is intentionally separate from the CLI package. It treats
+rollout-memory/ as an artifact store and emits a self-contained dashboard.
+
+CLI:
+    python dashboard/build_dashboard.py [--mode auto|calculate|display]
+
+Cost modes mirror ccusage:
+  - auto:      use embedded costUSD when an event provides it, else compute.
+  - calculate: always compute from token counts.
+  - display:   only show embedded costUSD; leave None when missing.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from html import escape
+from pathlib import Path
+from typing import Any, Iterable
+
+ROOT = Path(__file__).resolve().parents[1]
+ARTIFACT_ROOT = ROOT / "rollout-memory"
+DASHBOARD_DIR = ROOT / "dashboard"
+DATA_DIR = DASHBOARD_DIR / "data"
+PRICING_SNAPSHOT = DASHBOARD_DIR / "pricing" / "litellm-pricing.json"
+
+COST_MODE_AUTO = "auto"
+COST_MODE_CALCULATE = "calculate"
+COST_MODE_DISPLAY = "display"
+COST_MODES = (COST_MODE_AUTO, COST_MODE_CALCULATE, COST_MODE_DISPLAY)
+
+# Rough, editable defaults. Rates are USD per 1M tokens and mirror the
+# ccusage-style split between uncached input, cache creation, cache reads, and output.
+DEFAULT_RATES = {
+    "gpt-5": {"input": 1.25, "cache_create": 1.25, "cache_read": 0.125, "output": 10.0},
+    "gpt-5.1": {"input": 1.25, "cache_create": 1.25, "cache_read": 0.125, "output": 10.0},
+    "gpt-5.1-codex": {"input": 1.25, "cache_create": 1.25, "cache_read": 0.125, "output": 10.0},
+    "gpt-5.2": {"input": 1.75, "cache_create": 1.75, "cache_read": 0.175, "output": 14.0},
+    "gpt-5.2-codex": {"input": 1.75, "cache_create": 1.75, "cache_read": 0.175, "output": 14.0},
+    "gpt-5.3-codex": {"input": 1.75, "cache_create": 1.75, "cache_read": 0.175, "output": 14.0},
+    "gpt-5.4": {"input": 2.5, "cache_create": 2.5, "cache_read": 0.25, "output": 15.0},
+    "gpt-5.4-mini": {"input": 0.75, "cache_create": 0.75, "cache_read": 0.075, "output": 4.5},
+    "gpt-5.5": {"input": 5.0, "cache_create": 5.0, "cache_read": 0.5, "output": 30.0},
+    "claude-opus-4-7": {"input": 5.0, "cache_create": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-6": {"input": 5.0, "cache_create": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-opus-4-5": {"input": 5.0, "cache_create": 6.25, "cache_read": 0.50, "output": 25.0},
+    "claude-sonnet-4-6": {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-sonnet-4": {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-haiku-4-5": {"input": 1.0, "cache_create": 1.25, "cache_read": 0.10, "output": 5.0},
+    "claude-3-5-haiku": {"input": 0.8, "cache_create": 1.0, "cache_read": 0.08, "output": 4.0},
+    "claude-3-opus": {"input": 15.0, "cache_create": 18.75, "cache_read": 1.50, "output": 75.0},
+    "claude-3-sonnet": {"input": 3.0, "cache_create": 3.75, "cache_read": 0.30, "output": 15.0},
+    "claude-3-haiku": {"input": 0.25, "cache_create": 0.30, "cache_read": 0.03, "output": 1.25},
+    "unknown": {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0},
+}
+RATE_NOTE = "estimated from token logs and local model rates; not billing truth"
+
+
+# --- pricing ----------------------------------------------------------------
+
+
+class PricingMap:
+    """Single source of truth for per-model rates.
+
+    Prefers `dashboard/pricing/litellm-pricing.json` (LiteLLM-shape, USD per
+    token). Falls back to `DEFAULT_RATES` (USD per million tokens) for any
+    model not in the snapshot.
+    """
+
+    def __init__(self, snapshot: dict[str, Any], defaults: dict[str, dict[str, float]]):
+        self.meta = snapshot.get("_meta", {}) if snapshot else {}
+        self.snapshot = {k: v for k, v in (snapshot or {}).items() if k != "_meta"}
+        self.defaults = defaults
+
+    @classmethod
+    def load(cls, snapshot_path: Path = PRICING_SNAPSHOT) -> "PricingMap":
+        snapshot: dict[str, Any] = {}
+        if snapshot_path.exists():
+            try:
+                snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                snapshot = {}
+        return cls(snapshot, DEFAULT_RATES)
+
+    def rates_for(self, model: str | None) -> dict[str, float]:
+        """Return rates in USD per **million** tokens for the given model.
+
+        The returned dict has keys: input, output, cache_create, cache_read.
+        Missing fields default to 0 (rather than crashing on unknown models).
+        """
+        if not model:
+            return self.defaults["unknown"]
+        # 1. Exact match in LiteLLM snapshot.
+        entry = self.snapshot.get(model)
+        if not entry:
+            # 2. Substring match in snapshot (e.g. `gpt-5.2-2026-05-01` → `gpt-5.2`).
+            for known in sorted(self.snapshot, key=len, reverse=True):
+                if known != "unknown" and known in model:
+                    entry = self.snapshot[known]
+                    break
+        if entry:
+            return _rates_from_litellm(entry)
+        # 3. Exact match in defaults table.
+        if model in self.defaults:
+            return self.defaults[model]
+        # 4. Substring match in defaults.
+        for known in sorted(self.defaults, key=len, reverse=True):
+            if known != "unknown" and known in model:
+                return self.defaults[known]
+        return self.defaults["unknown"]
+
+    def source_note(self) -> str:
+        if self.snapshot:
+            taken = self.meta.get("snapshot_taken", "unknown")
+            return f"rates from LiteLLM snapshot (taken {taken}); fallback to local defaults"
+        return RATE_NOTE
+
+
+def _rates_from_litellm(entry: dict[str, Any]) -> dict[str, float]:
+    """Convert a LiteLLM entry (USD/token) into our shape (USD per 1M tokens)."""
+
+    def per_million(key: str, fallback_key: str | None = None) -> float:
+        v = entry.get(key)
+        if v is None and fallback_key is not None:
+            v = entry.get(fallback_key)
+        try:
+            return float(v) * 1_000_000 if v is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {
+        "input": per_million("input_cost_per_token"),
+        "output": per_million("output_cost_per_token"),
+        # LiteLLM names: cache_read_input_token_cost, cache_creation_input_token_cost.
+        # When cache_create is missing (rare), fall back to input rate.
+        "cache_read": per_million("cache_read_input_token_cost", "input_cost_per_token"),
+        "cache_create": per_million("cache_creation_input_token_cost", "input_cost_per_token"),
+    }
+
+
+# --- main -------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode",
+        choices=COST_MODES,
+        default=os.environ.get("RETRO_COST_MODE", COST_MODE_AUTO),
+        help="Cost calculation mode (default: %(default)s)",
+    )
+    args = parser.parse_args()
+    pricing = PricingMap.load()
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    sessions = collect_sessions(pricing=pricing, cost_mode=args.mode)
+    signal_readings_by_session, signal_aggregates = load_signal_data()
+    attach_signals_to_sessions(sessions, signal_readings_by_session)
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "rate_note": pricing.source_note(),
+        "rates_usd_per_million": DEFAULT_RATES,
+        "pricing_meta": pricing.meta,
+        "cost_mode": args.mode,
+        "summary": summarize_portfolio(sessions),
+        "memory": summarize_memory(sessions),
+        "signals": signal_aggregates,
+        "sessions": sessions,
+    }
+    data_path = DATA_DIR / "rollouts.json"
+    data_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    (DASHBOARD_DIR / "index.html").write_text(render_html(payload), encoding="utf-8")
+    print(f"wrote {data_path}")
+    print(f"wrote {DASHBOARD_DIR / 'index.html'}")
+    print(f"  cost_mode={args.mode}; {pricing.source_note()}")
+
+
+# --- signals ----------------------------------------------------------------
+
+
+def load_signal_data() -> tuple[dict[tuple[str, str], list[dict]], dict]:
+    """Read rollout-memory/signals/{readings.jsonl,aggregates.json} if present."""
+    signals_dir = ARTIFACT_ROOT / "signals"
+    readings_path = signals_dir / "readings.jsonl"
+    aggregates_path = signals_dir / "aggregates.json"
+    readings_by_session: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    if readings_path.exists():
+        for line in readings_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            readings_by_session[(r["host"], r["session_id"])].append(r)
+    aggregates: dict[str, Any] = {}
+    if aggregates_path.exists():
+        try:
+            aggregates = json.loads(aggregates_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            aggregates = {}
+    return readings_by_session, aggregates
+
+
+def attach_signals_to_sessions(
+    sessions: list[dict[str, Any]],
+    readings_by_session: dict[tuple[str, str], list[dict]],
+) -> None:
+    for session in sessions:
+        key = (session["host"], session["session_id"])
+        readings = readings_by_session.get(key, [])
+        session["signals"] = readings
+        session["signals_index"] = {r["signal"]: r["value"] for r in readings}
+
+
+def collect_sessions(
+    pricing: PricingMap | None = None,
+    cost_mode: str = COST_MODE_AUTO,
+) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    normalized_root = ARTIFACT_ROOT / "normalized"
+    if not normalized_root.exists():
+        return sessions
+    if pricing is None:
+        pricing = PricingMap.load()
+
+    for normalized_path in sorted(normalized_root.glob("*/*.events.jsonl")):
+        host = normalized_path.parent.name
+        session_id = normalized_path.name[: -len(".events.jsonl")]
+        events = read_jsonl(normalized_path)
+        sessions.append(
+            analyze_session(
+                host,
+                session_id,
+                normalized_path,
+                events,
+                pricing=pricing,
+                cost_mode=cost_mode,
+            )
+        )
+
+    sessions.sort(key=lambda s: (s.get("first_ts") or "", s["host"], s["session_id"]), reverse=True)
+    return sessions
+
+
+def analyze_session(
+    host: str,
+    session_id: str,
+    normalized_path: Path,
+    events: list[dict[str, Any]],
+    *,
+    pricing: PricingMap,
+    cost_mode: str = COST_MODE_AUTO,
+) -> dict[str, Any]:
+    event_counts = Counter(e.get("event_type", "unknown") for e in events)
+    actor_counts = Counter(e.get("actor", "unknown") for e in events)
+    tool_names = Counter()
+    files_touched: set[str] = set()
+    timestamps = [parse_ts(e.get("timestamp")) for e in events if e.get("timestamp")]
+    timestamps = [t for t in timestamps if t is not None]
+
+    command_count = 0
+    failed_count = 0
+    web_search_count = 0
+    for event in events:
+        etype = event.get("event_type")
+        payload = event.get("payload") or {}
+        name = tool_name(event)
+        if name:
+            tool_names[name] += 1
+        files_touched.update(extract_files(event))
+        if etype == "command":
+            command_count += 1
+        if is_failed_event(event):
+            failed_count += 1
+        if "web_search" in (event.get("summary") or "") or name in {"WebSearch", "web_search"}:
+            web_search_count += 1
+
+    first_ts = min(timestamps).isoformat() if timestamps else None
+    last_ts = max(timestamps).isoformat() if timestamps else None
+    duration_seconds = int((max(timestamps) - min(timestamps)).total_seconds()) if len(timestamps) >= 2 else None
+
+    raw_meta = read_raw_meta(host, session_id)
+    token_stats = extract_token_stats(events, host, session_id)
+    provider = infer_provider(host, raw_meta, events)
+    models = infer_models(host, session_id, raw_meta, events)
+    # Backfill `by_model` if extract_token_stats produced totals but no breakdown
+    # (e.g. older normalized files): attribute everything to the dominant model.
+    if not token_stats.get("by_model") and any(
+        token_stats.get(k, 0)
+        for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cached_input_tokens")
+    ):
+        token_stats["by_model"] = {
+            choose_cost_model(provider, host, models) or "unknown": _bucket_only(token_stats),
+        }
+    cost_breakdown = compute_cost(token_stats, provider, host, models, pricing, cost_mode)
+    rendered_path = ARTIFACT_ROOT / "rendered" / host / f"{session_id}.md"
+    mined = find_mined_artifacts(host, session_id)
+    title = infer_title(events, raw_meta)
+
+    return {
+        "host": host,
+        "session_id": session_id,
+        "title": title,
+        "date": first_ts[:10] if first_ts else "unknown",
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "duration_seconds": duration_seconds,
+        "event_count": len(events),
+        "event_counts": dict(sorted(event_counts.items())),
+        "actor_counts": dict(sorted(actor_counts.items())),
+        "user_messages": count_actor_type(events, "user", "message"),
+        "assistant_messages": count_actor_type(events, "assistant", "message"),
+        "reasoning_events": event_counts.get("reasoning", 0),
+        "tool_call_events": event_counts.get("tool_call", 0),
+        "tool_result_events": event_counts.get("tool_result", 0),
+        "command_events": command_count,
+        "failed_events": failed_count,
+        "file_read_events": event_counts.get("file_read", 0),
+        "file_edit_events": event_counts.get("file_edit", 0),
+        "web_search_events": web_search_count,
+        "unknown_events": event_counts.get("unknown", 0),
+        "events_without_timestamps": sum(1 for e in events if not e.get("timestamp")),
+        "unique_files_touched": len(files_touched),
+        "files_touched": sorted(files_touched)[:100],
+        "top_tools": [{"name": k, "count": v} for k, v in tool_names.most_common(12)],
+        "tokens": token_stats,
+        "tokens_by_model": token_stats.get("by_model") or {},
+        "provider": provider,
+        "models": models,
+        "cost_model": choose_cost_model(provider, host, models),
+        "estimated_cost_usd": cost_breakdown["total"],
+        "cost_by_model": cost_breakdown["by_model"],
+        "cost_mode_used": cost_breakdown["mode_used"],
+        "cost_source": cost_breakdown["source"],
+        "cost_note": pricing.source_note(),
+        "normalized_path": rel(normalized_path),
+        "rendered_path": rel(rendered_path) if rendered_path.exists() else None,
+        "rendered_markdown": read_text(rendered_path, limit=1_000_000) if rendered_path.exists() else "",
+        "raw_dir": rel(ARTIFACT_ROOT / "raw" / host / session_id),
+        "mined": mined,
+    }
+
+
+def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    by_day = defaultdict(
+        lambda: {
+            "sessions": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "tool_calls": 0,
+            "edits": 0,
+            "sessions_claude": 0,
+            "sessions_codex": 0,
+        }
+    )
+    by_host = Counter(s["host"] for s in sessions)
+    totals = Counter()
+    total_cost = 0.0
+    durations = []
+
+    for session in sessions:
+        day = session["date"]
+        by_day[day]["sessions"] += 1
+        if session["host"] == "claude-code":
+            by_day[day]["sessions_claude"] += 1
+        elif session["host"] == "codex":
+            by_day[day]["sessions_codex"] += 1
+        by_day[day]["tokens"] += session["tokens"].get("total_tokens", 0)
+        by_day[day]["cost"] += session.get("estimated_cost_usd") or 0.0
+        by_day[day]["tool_calls"] += session.get("tool_call_events", 0)
+        by_day[day]["edits"] += session.get("file_edit_events", 0)
+
+        totals["events"] += session["event_count"]
+        totals["user_messages"] += session["user_messages"]
+        totals["assistant_messages"] += session["assistant_messages"]
+        totals["tool_calls"] += session["tool_call_events"]
+        totals["tool_results"] += session["tool_result_events"]
+        totals["commands"] += session["command_events"]
+        totals["file_reads"] += session["file_read_events"]
+        totals["file_edits"] += session["file_edit_events"]
+        totals["errors"] += session["failed_events"]
+        totals["unknown_events"] += session["unknown_events"]
+        totals["tokens"] += session["tokens"].get("total_tokens", 0)
+        total_cost += session.get("estimated_cost_usd") or 0.0
+        if session.get("duration_seconds") is not None:
+            durations.append(session["duration_seconds"])
+
+    return {
+        "session_count": len(sessions),
+        "sessions_used_for_stats": len(sessions),
+        "sessions_with_token_usage": sum(1 for s in sessions if s["tokens"].get("total_tokens", 0) > 0),
+        "sessions_with_cost_estimate": sum(1 for s in sessions if s.get("estimated_cost_usd") is not None),
+        "active_days": len([d for d in by_day if d != "unknown"]),
+        "by_host": dict(by_host),
+        "by_day": dict(sorted(by_day.items())),
+        "totals": dict(totals),
+        "estimated_cost_usd": total_cost,
+        "avg_duration_seconds": int(sum(durations) / len(durations)) if durations else None,
+        "avg_events_per_session": round(totals["events"] / len(sessions), 1) if sessions else 0,
+        "avg_tool_calls_per_session": round(totals["tool_calls"] / len(sessions), 1) if sessions else 0,
+    }
+
+
+def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Roll up mined memory across every imported session.
+
+    Surfaces:
+      - sessions_with_memory: how many sessions have been mined at least once.
+      - methods_used: which mining methods produced output, with run counts.
+      - by_kind: candidate kind histogram (skill / procedure / failure_trigger / ...).
+      - by_method: per-method candidate count.
+      - candidate_count: total candidates across all sessions × methods.
+      - top_candidates: highest-priority/confidence candidates for the
+        portfolio-level "Memory" panel.
+    """
+    by_method: Counter[str] = Counter()
+    by_kind: Counter[str] = Counter()
+    by_scope: Counter[str] = Counter()
+    by_method_kind: dict[str, Counter[str]] = defaultdict(Counter)
+    top: list[dict[str, Any]] = []
+    all_candidates: list[dict[str, Any]] = []  # ALL candidates, for the "All Memories" tab
+    candidate_count = 0
+    sessions_with_memory = 0
+    method_session_counts: Counter[str] = Counter()
+
+    for session in sessions:
+        mined = session.get("mined") or []
+        seen_method_for_session: set[str] = set()
+        if not mined:
+            continue
+        sessions_with_memory += 1
+        for entry in mined:
+            method = entry.get("method") or "unknown"
+            seen_method_for_session.add(method)
+            for c in entry.get("candidates") or []:
+                kind = c.get("kind") or "unknown"
+                scope = c.get("scope") or "repo"
+                by_method[method] += 1
+                by_kind[kind] += 1
+                by_scope[scope] += 1
+                by_method_kind[method][kind] += 1
+                candidate_count += 1
+                # Flat record for the "All Memories" browser — includes session
+                # context plus the full candidate detail so the dashboard
+                # doesn't need to cross-reference back.
+                record = {
+                    "session_id": session["session_id"],
+                    "host": session["host"],
+                    "title": session.get("title") or session["session_id"],
+                    "date": session.get("date"),
+                    "method": method,
+                    "kind": kind,
+                    "scope": scope,
+                    "scope_reason": c.get("scope_reason") or "",
+                    "origin_repo": c.get("origin_repo"),
+                    "text": c.get("text") or "",
+                    "when_to_use": c.get("when_to_use") or "",
+                    "confidence": c.get("confidence"),
+                    "priority": c.get("priority"),
+                    "risk": c.get("risk"),
+                    "evidence_refs": c.get("evidence_refs") or [],
+                    "structured": c.get("structured"),
+                }
+                all_candidates.append(record)
+                top.append({k: record[k] for k in (
+                    "session_id", "host", "title", "method", "kind", "scope",
+                    "text", "when_to_use", "confidence", "priority", "risk",
+                )})
+        for method in seen_method_for_session:
+            method_session_counts[method] += 1
+
+    # Keep the prompt-ready preview small.
+    top.sort(
+        key=lambda c: (
+            -(c.get("priority") or 0),
+            -(c.get("confidence") or 0),
+            c.get("kind") or "",
+        )
+    )
+
+    return {
+        "sessions_with_memory": sessions_with_memory,
+        "candidate_count": candidate_count,
+        "by_method": dict(by_method.most_common()),
+        "by_kind": dict(by_kind.most_common()),
+        "by_scope": dict(by_scope.most_common()),
+        "by_method_kind": {m: dict(c.most_common()) for m, c in by_method_kind.items()},
+        "method_session_counts": dict(method_session_counts.most_common()),
+        "top_candidates": top[:12],
+        "all_candidates": all_candidates,  # full list for the "All Memories" tab
+    }
+
+
+_BUCKET_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_creation_tokens",
+    "cached_input_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _empty_bucket() -> dict[str, int]:
+    return {k: 0 for k in _BUCKET_KEYS}
+
+
+def _add_to_bucket(bucket: dict[str, int], usage: dict[str, int]) -> None:
+    for key, value in usage.items():
+        if key in bucket and isinstance(value, (int, float)):
+            bucket[key] += int(value)
+
+
+def _bucket_only(stats: dict[str, Any]) -> dict[str, int]:
+    return {k: int(stats.get(k, 0) or 0) for k in _BUCKET_KEYS}
+
+
+def extract_token_stats(events: list[dict[str, Any]], host: str, session_id: str) -> dict[str, Any]:
+    """Return totals + per-model breakdown for a session.
+
+    Output shape:
+        {
+          # session totals (sum across models)
+          "input_tokens", "output_tokens", "cache_creation_tokens",
+          "cached_input_tokens", "reasoning_output_tokens", "total_tokens",
+          # per-model breakdown
+          "by_model": {"<model>": { ...bucket... }, ...},
+          # informational
+          "embedded_cost_usd": float | None,  # sum of any provider-embedded costUSD
+        }
+    """
+    if host == "claude-code":
+        return _extract_claude_token_stats(events, session_id)
+    if host == "codex":
+        return _extract_codex_token_stats(events, session_id)
+    return {**_empty_bucket(), "by_model": {}, "embedded_cost_usd": None}
+
+
+def _extract_claude_token_stats(events: list[dict[str, Any]], session_id: str) -> dict[str, Any]:
+    """Walk the raw Claude transcript so we get per-message `usage` + `model`.
+
+    Normalized events drop per-message `usage` to keep the event stream lean,
+    so we read the raw transcript directly. The dedup key `(message.id,
+    requestId)` matches ccusage's behavior — Claude can replay the same
+    message across project files when sessions are continued.
+    """
+    raw_path = ARTIFACT_ROOT / "raw" / "claude-code" / session_id / "transcript.jsonl"
+    totals = _empty_bucket()
+    by_model: dict[str, dict[str, int]] = {}
+    embedded_cost = 0.0
+    embedded_count = 0
+    if raw_path.exists():
+        seen: set[tuple[str, str]] = set()
+        for raw in read_jsonl(raw_path):
+            message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+            usage = message.get("usage") if isinstance(message.get("usage"), dict) else None
+            if not usage:
+                continue
+            msg_id = message.get("id")
+            req_id = raw.get("requestId") or raw.get("request_id")
+            if msg_id and req_id:
+                key = (msg_id, req_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+            normalized = normalize_usage(usage)
+            model = message.get("model") or "unknown"
+            if model == "<synthetic>":
+                continue
+            _add_to_bucket(totals, normalized)
+            bucket = by_model.setdefault(model, _empty_bucket())
+            _add_to_bucket(bucket, normalized)
+            # Claude future-proofing: pick up costUSD if Anthropic ever embeds it.
+            for key in ("costUSD", "cost_usd"):
+                v = raw.get(key)
+                if v is None:
+                    v = message.get(key)
+                if isinstance(v, (int, float)):
+                    embedded_cost += float(v)
+                    embedded_count += 1
+                    break
+    _finalize_totals(totals, by_model)
+    return {
+        **totals,
+        "by_model": by_model,
+        "embedded_cost_usd": embedded_cost if embedded_count else None,
+        "embedded_cost_events": embedded_count,
+    }
+
+
+def _extract_codex_token_stats(events: list[dict[str, Any]], session_id: str) -> dict[str, Any]:
+    """Codex emits `token_count` events with cumulative `total_token_usage`.
+
+    Recent Codex builds also include `last_token_usage` (per-turn delta) which
+    we prefer. When absent we subtract previous cumulative ourselves. The
+    active model comes from `turn_context.model`, which precedes each token
+    event; we track it as we walk.
+    """
+    totals = _empty_bucket()
+    by_model: dict[str, dict[str, int]] = {}
+    current_model: str | None = None
+    previous_cumulative: dict[str, int] | None = None
+
+    for event in events:
+        payload = event.get("payload") or {}
+        # turn_context arrives as an attachment event in the normalized stream;
+        # the payload still carries `model`.
+        if isinstance(payload, dict) and "model" in payload and "turn_id" in payload:
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                current_model = model
+        if payload.get("type") != "token_count":
+            continue
+        info = payload.get("info") or {}
+        if not isinstance(info, dict) or not info:
+            continue
+        # Prefer the explicit per-turn delta if Codex provided it.
+        last = info.get("last_token_usage")
+        delta = normalize_usage(last) if isinstance(last, dict) and last else None
+        cumulative = normalize_usage(info.get("total_token_usage") or {})
+        if delta is None:
+            if previous_cumulative is None:
+                delta = dict(cumulative)
+            else:
+                delta = {
+                    k: max(0, cumulative.get(k, 0) - previous_cumulative.get(k, 0))
+                    for k in _BUCKET_KEYS
+                }
+        previous_cumulative = cumulative or previous_cumulative
+        if not any(delta.get(k, 0) for k in _BUCKET_KEYS):
+            continue
+        model_key = current_model or "unknown"
+        _add_to_bucket(totals, delta)
+        bucket = by_model.setdefault(model_key, _empty_bucket())
+        _add_to_bucket(bucket, delta)
+
+    # Sanity: if we never saw a delta but the final cumulative is non-zero,
+    # fall back to the cumulative (old Codex builds without last_token_usage).
+    if (
+        not any(totals.get(k, 0) for k in _BUCKET_KEYS)
+        and previous_cumulative
+        and any(previous_cumulative.get(k, 0) for k in _BUCKET_KEYS)
+    ):
+        _add_to_bucket(totals, previous_cumulative)
+        model_key = current_model or "unknown"
+        bucket = by_model.setdefault(model_key, _empty_bucket())
+        _add_to_bucket(bucket, previous_cumulative)
+
+    _finalize_totals(totals, by_model)
+    return {**totals, "by_model": by_model, "embedded_cost_usd": None, "embedded_cost_events": 0}
+
+
+def _finalize_totals(totals: dict[str, int], by_model: dict[str, dict[str, int]]) -> None:
+    """Patch up `total_tokens` from the sum of buckets when the provider didn't set it."""
+
+    def _bucket_total(b: dict[str, int]) -> int:
+        return (
+            b.get("input_tokens", 0)
+            + b.get("output_tokens", 0)
+            + b.get("cache_creation_tokens", 0)
+            + b.get("cached_input_tokens", 0)
+        )
+
+    if totals.get("total_tokens", 0) <= 0:
+        totals["total_tokens"] = _bucket_total(totals)
+    for bucket in by_model.values():
+        if bucket.get("total_tokens", 0) <= 0:
+            bucket["total_tokens"] = _bucket_total(bucket)
+
+
+def normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
+    mapping = {
+        "input_tokens": "input_tokens",
+        "output_tokens": "output_tokens",
+        "total_tokens": "total_tokens",
+        "cached_input_tokens": "cached_input_tokens",
+        "cache_read_input_tokens": "cached_input_tokens",
+        "cache_creation_input_tokens": "cache_creation_tokens",
+        "reasoning_output_tokens": "reasoning_output_tokens",
+    }
+    out: dict[str, int] = {}
+    for src, dest in mapping.items():
+        value = usage.get(src)
+        if isinstance(value, (int, float)):
+            out[dest] = out.get(dest, 0) + int(value)
+    cache_creation = usage.get("cache_creation")
+    if "cache_creation_input_tokens" not in usage and isinstance(cache_creation, dict):
+        for value in cache_creation.values():
+            if isinstance(value, (int, float)):
+                out["cache_creation_tokens"] = out.get("cache_creation_tokens", 0) + int(value)
+    return out
+
+
+def compute_cost(
+    token_stats: dict[str, Any],
+    provider: str,
+    host: str,
+    models: list[str],
+    pricing: PricingMap,
+    mode: str = COST_MODE_AUTO,
+) -> dict[str, Any]:
+    """Per-model cost calculation honoring auto / calculate / display modes.
+
+    Returns:
+        {
+          "total": float | None,
+          "by_model": {model: float},
+          "mode_used": "auto"|"calculate"|"display",
+          "source": "embedded"|"calculated"|"empty"
+        }
+
+    - In `display` mode we only return embedded `costUSD` (None when missing).
+    - In `auto` mode embedded cost wins when present; otherwise we compute.
+    - In `calculate` mode we always compute, ignoring any embedded value.
+    """
+    embedded = token_stats.get("embedded_cost_usd")
+    if mode == COST_MODE_DISPLAY:
+        return {
+            "total": round(float(embedded), 6) if isinstance(embedded, (int, float)) else None,
+            "by_model": {},
+            "mode_used": mode,
+            "source": "embedded" if isinstance(embedded, (int, float)) else "empty",
+        }
+    if mode == COST_MODE_AUTO and isinstance(embedded, (int, float)):
+        return {
+            "total": round(float(embedded), 6),
+            "by_model": {},
+            "mode_used": mode,
+            "source": "embedded",
+        }
+
+    by_model_tokens = token_stats.get("by_model") or {}
+    if not by_model_tokens:
+        return {"total": None, "by_model": {}, "mode_used": mode, "source": "empty"}
+
+    cost_by_model: dict[str, float] = {}
+    total = 0.0
+    for model, bucket in by_model_tokens.items():
+        rates = pricing.rates_for(model)
+        cost = _cost_one_model(bucket, rates, host)
+        cost_by_model[model] = round(cost, 6)
+        total += cost
+    return {
+        "total": round(total, 6),
+        "by_model": cost_by_model,
+        "mode_used": mode,
+        "source": "calculated",
+    }
+
+
+def _cost_one_model(bucket: dict[str, int], rates: dict[str, float], host: str) -> float:
+    """Apply rates to a single per-model token bucket.
+
+    For Codex (OpenAI) `input_tokens` is the cumulative input INCLUDING cached
+    reads, so we subtract `cached_input_tokens` before pricing — ccusage
+    `adapter/codex.rs:475`. Anthropic's `input_tokens` is already fresh
+    non-cached input (cache reads are a disjoint field), so we leave it alone.
+    """
+    input_tokens = bucket.get("input_tokens", 0)
+    cached_tokens = bucket.get("cached_input_tokens", 0)
+    cache_create = bucket.get("cache_creation_tokens", 0)
+    output_tokens = bucket.get("output_tokens", 0)
+    if host == "codex":
+        input_tokens = max(0, input_tokens - cached_tokens)
+    return (
+        input_tokens * rates.get("input", 0.0)
+        + cache_create * rates.get("cache_create", 0.0)
+        + cached_tokens * rates.get("cache_read", 0.0)
+        + output_tokens * rates.get("output", 0.0)
+    ) / 1_000_000
+
+
+def rates_for_model(model: str | None) -> dict[str, float]:
+    """Compatibility shim: legacy callers still expect a direct lookup.
+
+    New code should use `PricingMap.rates_for()` instead.
+    """
+    if not model:
+        return DEFAULT_RATES["unknown"]
+    if model in DEFAULT_RATES:
+        return DEFAULT_RATES[model]
+    for known in sorted(DEFAULT_RATES, key=len, reverse=True):
+        if known != "unknown" and known in model:
+            return DEFAULT_RATES[known]
+    return DEFAULT_RATES["unknown"]
+
+
+def choose_cost_model(provider: str, host: str, models: list[str]) -> str | None:
+    if models:
+        return models[0]
+    if host == "codex" or provider == "openai":
+        return "gpt-5"
+    if host == "claude-code" or provider == "anthropic":
+        return None
+    return None
+
+
+def infer_models(host: str, session_id: str, raw_meta: dict[str, Any], events: list[dict[str, Any]]) -> list[str]:
+    models = Counter()
+    for key in ("model", "model_name"):
+        value = raw_meta.get(key)
+        if isinstance(value, str) and value:
+            models[value] += 1
+
+    raw_dir = ARTIFACT_ROOT / "raw" / host / session_id
+    raw_path = raw_dir / ("transcript.jsonl" if host == "claude-code" else "rollout.jsonl")
+    if host == "claude-code" and raw_path.exists():
+        for raw in read_jsonl(raw_path):
+            message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
+            model = message.get("model")
+            if isinstance(model, str) and model and model != "<synthetic>":
+                models[model] += 1
+    elif host == "codex":
+        for event in events:
+            model = codex_model_from_payload(event.get("payload") or {})
+            if model:
+                models[model] += 1
+        if raw_path.exists():
+            for raw in read_jsonl(raw_path):
+                payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
+                model = codex_model_from_payload(payload)
+                if model:
+                    models[model] += 1
+    return [model for model, _ in models.most_common()]
+
+
+def codex_model_from_payload(payload: dict[str, Any]) -> str | None:
+    for candidate in (payload, payload.get("info"), payload.get("data"), payload.get("result"), payload.get("response")):
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("model", "model_name"):
+            value = candidate.get(key)
+            if isinstance(value, str) and value:
+                return value
+        metadata = candidate.get("metadata")
+        if isinstance(metadata, dict):
+            value = metadata.get("model")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def infer_provider(host: str, raw_meta: dict[str, Any], events: list[dict[str, Any]]) -> str:
+    if raw_meta.get("model_provider"):
+        provider = str(raw_meta["model_provider"]).lower()
+        if "openai" in provider:
+            return "openai"
+        if "anthropic" in provider or "claude" in provider:
+            return "anthropic"
+    if host == "claude-code":
+        return "anthropic"
+    if host == "codex":
+        return "openai"
+    return "unknown"
+
+
+def read_raw_meta(host: str, session_id: str) -> dict[str, Any]:
+    raw_dir = ARTIFACT_ROOT / "raw" / host / session_id
+    for name in ("thread.json", "import_meta.json"):
+        path = raw_dir / name
+        if path.exists():
+            try:
+                return json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return {}
+    return {}
+
+
+def find_mined_artifacts(host: str, session_id: str) -> list[dict[str, Any]]:
+    """Collect all mined artifacts (one per method) for this session.
+
+    For each method, surface:
+      - paths + the prompt-block text (for the Memory drill-down),
+      - lightweight per-candidate previews (kind, confidence, priority, risk,
+        evidence_refs, structured), so the dashboard can render structured
+        cards and aggregate by kind/method across the portfolio.
+    """
+    mined_root = ARTIFACT_ROOT / "mined"
+    out = []
+    if not mined_root.exists():
+        return out
+    for json_path in sorted(mined_root.glob(f"*/{host}/{session_id}.json")):
+        method = json_path.parents[1].name
+        prompt_path = json_path.with_suffix(".prompt.md")
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+        raw_candidates = data.get("candidates") or []
+        candidates: list[dict[str, Any]] = []
+        for c in raw_candidates:
+            candidates.append(
+                {
+                    "id": c.get("id"),
+                    "kind": c.get("kind"),
+                    "text": c.get("text") or "",
+                    "when_to_use": c.get("when_to_use") or "",
+                    "confidence": c.get("confidence"),
+                    "priority": c.get("priority"),
+                    "risk": c.get("risk"),
+                    "scope": c.get("scope") or "repo",
+                    "scope_reason": c.get("scope_reason") or "",
+                    "origin_repo": c.get("origin_repo"),
+                    "evidence_refs": c.get("evidence_refs") or [],
+                    "structured": c.get("structured"),
+                }
+            )
+        out.append(
+            {
+                "method": method,
+                "json_path": rel(json_path),
+                "prompt_path": rel(prompt_path) if prompt_path.exists() else None,
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+                "filters_applied": data.get("filters_applied") or [],
+                "notes": data.get("notes") or [],
+                "prompt_text": read_text(prompt_path, limit=200_000) if prompt_path.exists() else "",
+            }
+        )
+    return out
+
+
+def tool_name(event: dict[str, Any]) -> str | None:
+    payload = event.get("payload") or {}
+    for key in ("name", "tool_name"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+    action = payload.get("action")
+    if isinstance(action, dict) and isinstance(action.get("type"), str):
+        return action["type"]
+    return None
+
+
+def extract_files(event: dict[str, Any]) -> set[str]:
+    payload = event.get("payload") or {}
+    files: set[str] = set()
+    for candidate in walk_values(payload):
+        if isinstance(candidate, str) and looks_like_path(candidate):
+            files.add(candidate)
+    changes = payload.get("changes")
+    if isinstance(changes, dict):
+        files.update(str(k) for k in changes.keys())
+    return files
+
+
+def walk_values(value: Any):
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from walk_values(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from walk_values(child)
+    else:
+        yield value
+
+
+def looks_like_path(value: str) -> bool:
+    return value.startswith("/") and len(value) < 300 and ("\n" not in value)
+
+
+def is_failed_event(event: dict[str, Any]) -> bool:
+    payload = event.get("payload") or {}
+    if payload.get("is_error") is True or payload.get("success") is False:
+        return True
+    status = payload.get("status")
+    if isinstance(status, str) and status.lower() in {"failed", "error"}:
+        return True
+    output = payload.get("output")
+    if isinstance(output, str) and '"exit_code":' in output:
+        match = re.search(r'"exit_code"\s*:\s*(\d+)', output)
+        if match and int(match.group(1)) != 0:
+            return True
+    return event.get("event_type") == "error"
+
+
+def infer_title(events: list[dict[str, Any]], raw_meta: dict[str, Any]) -> str:
+    if raw_meta.get("title"):
+        return str(raw_meta["title"]).strip().splitlines()[0][:180]
+    for event in events:
+        if event.get("actor") == "user" and event.get("event_type") == "message":
+            return (event.get("summary") or "").strip().splitlines()[0][:180]
+    return events[0].get("summary", "untitled")[:180] if events else "untitled"
+
+
+def count_actor_type(events: list[dict[str, Any]], actor: str, event_type: str) -> int:
+    return sum(1 for event in events if event.get("actor") == actor and event.get("event_type") == event_type)
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def parse_ts(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def read_text(path: Path, *, limit: int) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if len(text) > limit:
+        return text[:limit] + "\n\n[dashboard truncated preview]"
+    return text
+
+
+def rel(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def render_html(payload: dict[str, Any]) -> str:
+    data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rollout Dashboard</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --panel: #ffffff;
+      --line: #d8d7d0;
+      --ink: #20211f;
+      --muted: #686b63;
+      --accent: #0f766e;
+      --accent-soft: #d9efeb;
+      /* Host colors: Claude = orange, Codex = blue. */
+      --host-claude: #ea580c;
+      --host-claude-soft: #ffedd5;
+      --host-claude-line: #fdba74;
+      --host-codex: #2563eb;
+      --host-codex-soft: #dbeafe;
+      --host-codex-line: #93c5fd;
+      --warn: #b45309;
+      --bad: #b91c1c;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; background: var(--bg); color: var(--ink); }}
+    header {{ padding: 24px 28px 16px; border-bottom: 1px solid var(--line); background: #fbfbf8; }}
+    h1 {{ margin: 0 0 4px; font-size: 24px; font-weight: 720; letter-spacing: 0; }}
+    .subtle {{ color: var(--muted); font-size: 13px; }}
+    main {{ padding: 20px 28px 32px; display: grid; gap: 18px; }}
+    .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }}
+    .kpi, .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }}
+    .kpi {{ padding: 12px; min-height: 78px; }}
+    .kpi .label {{ font-size: 12px; color: var(--muted); }}
+    .kpi .value {{ margin-top: 6px; font-size: 23px; font-weight: 720; }}
+    .controls {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+    input, select {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: white; color: var(--ink); min-height: 38px; }}
+    input {{ min-width: min(420px, 100%); flex: 1; }}
+    .grid {{ display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(360px, .9fr); gap: 16px; align-items: start; }}
+    .panel {{ overflow: hidden; }}
+    .panel h2 {{ margin: 0; padding: 13px 14px; font-size: 15px; border-bottom: 1px solid var(--line); background: #fbfbf8; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
+    th {{ color: var(--muted); font-weight: 650; background: #fbfbf8; position: sticky; top: 0; }}
+    tr {{ cursor: pointer; }}
+    tr:hover, tr.selected {{ background: var(--accent-soft); }}
+    .scroll {{ max-height: 560px; overflow: auto; }}
+    .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 600; background: #ecebe4; color: #353731; }}
+    .badge.codex {{ background: var(--host-codex-soft); color: var(--host-codex); border: 1px solid var(--host-codex-line); }}
+    .badge.claude-code {{ background: var(--host-claude-soft); color: var(--host-claude); border: 1px solid var(--host-claude-line); }}
+    tr.host-codex td:first-child {{ box-shadow: inset 3px 0 0 var(--host-codex); }}
+    tr.host-claude-code td:first-child {{ box-shadow: inset 3px 0 0 var(--host-claude); }}
+    .kpi.host-codex {{ border-top: 3px solid var(--host-codex); }}
+    .kpi.host-claude-code {{ border-top: 3px solid var(--host-claude); }}
+    .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }}
+    .dot.codex {{ background: var(--host-codex); }}
+    .dot.claude-code {{ background: var(--host-claude); }}
+    .stacked-bar {{ display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: #e5e4dc; }}
+    .stacked-bar .seg.codex {{ background: var(--host-codex); }}
+    .stacked-bar .seg.claude-code {{ background: var(--host-claude); }}
+    .legend {{ display: flex; gap: 14px; padding: 0 12px 8px; font-size: 12px; color: var(--muted); align-items: center; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 12px; }}
+    .metric {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px; background: #fff; }}
+    .metric .label {{ color: var(--muted); font-size: 12px; }}
+    .metric .value {{ margin-top: 3px; font-weight: 720; }}
+    .tabs {{ display: flex; gap: 6px; padding: 10px 12px 0; border-top: 1px solid var(--line); }}
+    button {{ border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; background: white; cursor: pointer; }}
+    button.active {{ background: var(--accent); color: white; border-color: var(--accent); }}
+    pre {{ margin: 0; padding: 12px; overflow: auto; max-height: 520px; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.45; background: #111827; color: #f9fafb; }}
+    .bars {{ padding: 12px; display: grid; gap: 8px; }}
+    .barrow {{ display: grid; grid-template-columns: 92px 1fr 60px; gap: 8px; align-items: center; font-size: 12px; }}
+    .bar {{ height: 8px; border-radius: 999px; background: #e5e4dc; overflow: hidden; }}
+    .bar > span {{ display: block; height: 100%; background: var(--accent); }}
+    .signal-aggs {{ padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }}
+    .sigcard {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: #fff; }}
+    .sigcard .name {{ font-size: 12px; color: var(--muted); }}
+    .sigcard .v {{ margin-top: 4px; font-weight: 720; }}
+    .sigcard .sub {{ margin-top: 3px; color: var(--muted); font-size: 11px; }}
+    .mem-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; padding: 12px; }}
+    .mem-block {{ border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: #fff; }}
+    .mem-block h3 {{ margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; }}
+    .mem-row {{ display: flex; justify-content: space-between; gap: 8px; font-size: 13px; padding: 3px 0; align-items: baseline; }}
+    .mem-row .label {{ color: var(--muted); }}
+    .mem-row .val {{ font-weight: 650; }}
+    .mem-kind {{ display: inline-flex; align-items: center; border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: 600; }}
+    .mem-kind.skill {{ background: #e0e7ff; color: #3730a3; }}
+    .mem-kind.procedure {{ background: #d1fae5; color: #065f46; }}
+    .mem-kind.failure_trigger {{ background: #fee2e2; color: #991b1b; }}
+    .mem-kind.tool_lesson {{ background: #fef3c7; color: #92400e; }}
+    .mem-kind.risk_rule {{ background: #fde68a; color: #78350f; }}
+    .mem-kind.user_preference {{ background: #ede9fe; color: #5b21b6; }}
+    .mem-kind.repo_convention {{ background: #ccfbf1; color: #115e59; }}
+    .mem-card {{ border: 1px solid var(--line); border-radius: 6px; padding: 11px 13px; margin: 8px 0; background: #fff; }}
+    .mem-card .hdr {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 5px; }}
+    .mem-card .when {{ color: var(--muted); font-size: 12px; margin-bottom: 6px; font-style: italic; }}
+    .mem-card .body {{ font-size: 13px; line-height: 1.4; }}
+    .mem-card details {{ margin-top: 8px; font-size: 12px; }}
+    .mem-card details summary {{ cursor: pointer; color: var(--muted); }}
+    .mem-card details pre {{ margin: 6px 0 0; padding: 8px; background: #f7f7f4; color: var(--ink); border-radius: 4px; font-size: 11px; max-height: 240px; }}
+    .mem-meta {{ font-size: 11px; color: var(--muted); }}
+    .pill {{ display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; background: #eef0e9; color: #3f4339; }}
+    .pill.risk-high {{ background: #fee2e2; color: #991b1b; }}
+    .pill.risk-low {{ background: #dcfce7; color: #14532d; }}
+    .pill.method-skill_pro {{ background: #e0e7ff; color: #3730a3; }}
+    .pill.method-reme_refine_poc {{ background: #fef3c7; color: #92400e; }}
+    .pill.method-memp_procedural {{ background: #d1fae5; color: #065f46; }}
+    .pill.scope-user {{ background: #fef3c7; color: #92400e; }}
+    .pill.scope-repo {{ background: #ddd6fe; color: #5b21b6; }}
+    .pill.scope-task {{ background: #cffafe; color: #155e75; }}
+    .pill.scope-global {{ background: #fce7f3; color: #9f1239; }}
+    .all-mem-controls {{ display: flex; gap: 8px; flex-wrap: wrap; padding: 0 12px 10px; align-items: center; }}
+    .all-mem-controls .count {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
+    .all-mem-list {{ padding: 0 12px 12px; max-height: 720px; overflow: auto; }}
+    .scope-counts {{ display: flex; gap: 8px; padding: 0 12px 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }}
+    .scope-counts span code {{ background: #f1f1eb; padding: 0 4px; border-radius: 3px; }}
+    .group-activity {{ border-left: 3px solid #3b82f6; }}
+    .group-outcome  {{ border-left: 3px solid #0f766e; }}
+    .group-cost     {{ border-left: 3px solid #b45309; }}
+    .group-risk     {{ border-left: 3px solid #b91c1c; }}
+    .signal-table table {{ width: 100%; }}
+    .signal-table td.value {{ font-weight: 720; }}
+    @media (max-width: 960px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Rollout Dashboard</h1>
+    <div class="subtle">Generated {escape(payload["generated_at"])}. cost_mode=<code>{escape(payload.get("cost_mode", "auto"))}</code>. {escape(payload["rate_note"])}.</div>
+  </header>
+  <main>
+    <section class="kpis" id="kpis"></section>
+    <section class="panel" id="memoryPanel">
+      <h2>Memory · Mined Across Portfolio</h2>
+      <div class="legend">
+        <span><span class="dot claude-code"></span> Claude Code</span>
+        <span><span class="dot codex"></span> Codex</span>
+      </div>
+      <div class="mem-grid" id="memoryGrid"></div>
+    </section>
+    <section class="panel" id="allMemoriesPanel">
+      <h2 id="allMemoriesTitle">All Memories · Full Detail</h2>
+      <div class="scope-counts" id="scopeCounts"></div>
+      <div class="all-mem-controls">
+        <select id="amHost">
+          <option value="all">All hosts</option>
+          <option value="claude-code">Claude Code</option>
+          <option value="codex">Codex</option>
+        </select>
+        <select id="amScope">
+          <option value="all">All scopes</option>
+          <option value="user">user</option>
+          <option value="repo">repo</option>
+          <option value="task">task</option>
+          <option value="global">global</option>
+        </select>
+        <select id="amKind">
+          <option value="all">All kinds</option>
+        </select>
+        <select id="amMethod">
+          <option value="all">All methods</option>
+        </select>
+        <select id="amRisk">
+          <option value="all">All risk</option>
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+        </select>
+        <input id="amSearch" placeholder="Search memory text or activation…" />
+        <span class="count" id="amCount"></span>
+      </div>
+      <div class="all-mem-list" id="allMemoriesList"></div>
+    </section>
+    <section class="panel" id="signalsPanel">
+      <h2>Signals · Portfolio Aggregates</h2>
+      <div class="signal-aggs" id="signalAggs"></div>
+    </section>
+    <section class="panel">
+      <h2>Activity By Day · <span style="color:var(--host-claude)">Claude</span> + <span style="color:var(--host-codex)">Codex</span></h2>
+      <div class="bars" id="dayBars"></div>
+    </section>
+    <section class="controls">
+      <input id="search" placeholder="Search title, id, host, file..." />
+      <select id="hostFilter">
+        <option value="all">All hosts</option>
+        <option value="codex">Codex</option>
+        <option value="claude-code">Claude Code</option>
+      </select>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2 id="sessionsTitle">Sessions</h2>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Host</th><th>Date</th><th>Title</th><th>Events</th><th>Tools</th><th>Edits</th><th>Tokens</th><th>Cost</th><th>Memory</th><th>Risk</th></tr></thead>
+            <tbody id="sessionRows"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 id="detailTitle">Session Detail</h2>
+        <div class="metrics" id="detailMetrics"></div>
+        <div class="tabs">
+          <button id="tabSummary" class="active">Summary</button>
+          <button id="tabModels">Models</button>
+          <button id="tabSignals">Signals</button>
+          <button id="tabTranscript">Transcript</button>
+          <button id="tabMemory">Memory</button>
+        </div>
+        <pre id="detailText">Select a session.</pre>
+        <div id="detailHtml" style="display:none; padding: 12px; max-height: 620px; overflow:auto;"></div>
+      </div>
+    </section>
+  </main>
+  <script id="rollout-data" type="application/json">{data_json}</script>
+  <script>
+    const DATA = JSON.parse(document.getElementById('rollout-data').textContent);
+    let selected = DATA.sessions[0] || null;
+    let activeTab = 'summary';
+
+    const fmt = new Intl.NumberFormat();
+    const money = v => v == null ? 'n/a' : '$' + Number(v).toFixed(4);
+    const dur = s => s == null ? 'n/a' : (s < 60 ? s + 's' : Math.floor(s/60) + 'm ' + (s%60) + 's');
+
+    function kpi(label, value, klass='') {{
+      return `<div class="kpi ${{klass}}"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`;
+    }}
+    function renderKpis() {{
+      const t = DATA.summary.totals;
+      const byHost = DATA.summary.by_host || {{}};
+      const claudeCount = byHost['claude-code'] || 0;
+      const codexCount = byHost['codex'] || 0;
+      const secretAgg = DATA.signals?.by_signal?.secret_exposure_signal || {{}};
+      const mem = DATA.memory || {{}};
+      document.getElementById('kpis').innerHTML = [
+        kpi('Sessions used', fmt.format(DATA.summary.sessions_used_for_stats || DATA.summary.session_count)),
+        kpi('Claude sessions', fmt.format(claudeCount), 'host-claude-code'),
+        kpi('Codex sessions', fmt.format(codexCount), 'host-codex'),
+        kpi('Memory candidates', fmt.format(mem.candidate_count || 0)),
+        kpi('With token data', fmt.format(DATA.summary.sessions_with_token_usage || 0)),
+        kpi('With cost estimate', fmt.format(DATA.summary.sessions_with_cost_estimate || 0)),
+        kpi('Secret-risk sessions', fmt.format(secretAgg.true_count || 0)),
+        kpi('Active days', fmt.format(DATA.summary.active_days)),
+        kpi('Events', fmt.format(t.events || 0)),
+        kpi('Tool calls', fmt.format(t.tool_calls || 0)),
+        kpi('File edits', fmt.format(t.file_edits || 0)),
+        kpi('Tokens', fmt.format(t.tokens || 0)),
+        kpi('Est. cost', money(DATA.summary.estimated_cost_usd)),
+      ].join('');
+    }}
+
+    function renderDayBars() {{
+      const days = Object.entries(DATA.summary.by_day || {{}});
+      const max = Math.max(1, ...days.map(([,d]) => d.sessions));
+      document.getElementById('dayBars').innerHTML = days.map(([day,d]) => {{
+        const claude = d.sessions_claude || 0;
+        const codex = d.sessions_codex || 0;
+        const claudePct = 100 * claude / max;
+        const codexPct = 100 * codex / max;
+        return `<div class="barrow">
+          <span>${{day}}</span>
+          <div class="stacked-bar">
+            <span class="seg claude-code" style="width:${{claudePct}}%"></span>
+            <span class="seg codex" style="width:${{codexPct}}%"></span>
+          </div>
+          <span title="claude / codex">${{claude}}+${{codex}}</span>
+        </div>`;
+      }}).join('');
+    }}
+
+    function renderMemoryAggregates() {{
+      const mem = DATA.memory || {{}};
+      const grid = document.getElementById('memoryGrid');
+      const panel = document.getElementById('memoryPanel');
+      if (!mem.candidate_count) {{
+        panel.style.display = 'none';
+        return;
+      }}
+      const byKind = mem.by_kind || {{}};
+      const byMethod = mem.by_method || {{}};
+      const methodSessions = mem.method_session_counts || {{}};
+      const top = mem.top_candidates || [];
+      const blocks = [];
+
+      // Block 1: overview counts.
+      blocks.push(`<div class="mem-block">
+        <h3>Overview</h3>
+        <div class="mem-row"><span class="label">Sessions with mined memory</span><span class="val">${{fmt.format(mem.sessions_with_memory || 0)}}</span></div>
+        <div class="mem-row"><span class="label">Total candidates</span><span class="val">${{fmt.format(mem.candidate_count || 0)}}</span></div>
+      </div>`);
+
+      // Block 2: by method.
+      const methodRows = Object.entries(byMethod).map(([name, n]) => `
+        <div class="mem-row">
+          <span class="label"><span class="pill method-${{name}}">${{name}}</span> across ${{methodSessions[name] || 0}} session(s)</span>
+          <span class="val">${{fmt.format(n)}}</span>
+        </div>
+      `).join('');
+      blocks.push(`<div class="mem-block"><h3>By method</h3>${{methodRows || '<div class="mem-meta">no data</div>'}}</div>`);
+
+      // Block 3: by kind.
+      const kindMax = Math.max(1, ...Object.values(byKind));
+      const kindRows = Object.entries(byKind).map(([kind, n]) => `
+        <div class="mem-row">
+          <span class="label"><span class="mem-kind ${{kind}}">${{kind}}</span></span>
+          <span class="val">${{fmt.format(n)}}</span>
+        </div>
+        <div class="bar"><span style="width:${{100*n/kindMax}}%; background: var(--accent);"></span></div>
+      `).join('');
+      blocks.push(`<div class="mem-block"><h3>By kind</h3>${{kindRows || '<div class="mem-meta">no data</div>'}}</div>`);
+
+      // Block 4: top candidates.
+      const topRows = top.slice(0, 6).map(c => `
+        <div style="margin-top:6px; padding:6px 0; border-top: 1px solid var(--line);">
+          <div class="mem-row">
+            <span class="label">
+              <span class="mem-kind ${{c.kind}}">${{c.kind}}</span>
+              <span class="pill method-${{c.method}}" style="margin-left:4px">${{c.method}}</span>
+            </span>
+            <span class="mem-meta">p${{c.priority}} · ${{Number(c.confidence).toFixed(2)}}</span>
+          </div>
+          <div class="mem-meta" style="margin-top:3px">${{escapeHtml(c.text).slice(0, 140)}}</div>
+          <div class="mem-meta"><span class="badge ${{c.host}}">${{c.host}}</span> ${{escapeHtml(c.title || '').slice(0, 80)}}</div>
+        </div>
+      `).join('');
+      blocks.push(`<div class="mem-block" style="grid-column: span 2;"><h3>Top candidates</h3>${{topRows || '<div class="mem-meta">none</div>'}}</div>`);
+
+      grid.innerHTML = blocks.join('');
+    }}
+
+    function escapeHtml(s) {{
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }}
+
+    function renderSignalAggregates() {{
+      const wrap = document.getElementById('signalAggs');
+      const agg = (DATA.signals && DATA.signals.by_signal) || {{}};
+      const names = Object.keys(agg).sort();
+      if (!names.length) {{
+        document.getElementById('signalsPanel').style.display = 'none';
+        return;
+      }}
+      wrap.innerHTML = names.map(name => {{
+        const a = agg[name];
+        const klass = 'sigcard group-' + (a.group || 'activity');
+        let value = '—';
+        let sub = `${{a.sessions_with_reading || 0}} session(s)`;
+        if (a.kind === 'numeric' && a.mean !== undefined) {{
+          value = 'mean ' + (Number.isInteger(a.mean) ? a.mean : a.mean.toFixed(2));
+          sub = `median ${{a.median}} · max ${{a.max}} · n=${{a.sessions_with_reading}}`;
+        }} else if (a.kind === 'boolean') {{
+          value = `${{a.true_count}}/${{a.true_count + a.false_count}} true`;
+          sub = `ratio ${{a.true_ratio == null ? 'n/a' : a.true_ratio}}`;
+        }} else if (a.kind === 'categorical' && a.histogram) {{
+          const top = Object.entries(a.histogram).slice(0,3).map(([k,v]) => `${{k}}=${{v}}`).join(', ');
+          value = top || '—';
+          sub = `n=${{a.sessions_with_reading}}`;
+        }}
+        return `<div class="${{klass}}">
+          <div class="name">${{name}} <span class="badge" style="background:#ecebe4">${{a.group}}</span></div>
+          <div class="v">${{value}}</div>
+          <div class="sub">${{sub}} · ${{a.unit || a.kind}}</div>
+        </div>`;
+      }}).join('');
+    }}
+
+    function filteredSessions() {{
+      const q = document.getElementById('search').value.toLowerCase();
+      const host = document.getElementById('hostFilter').value;
+      return DATA.sessions.filter(s => {{
+        if (host !== 'all' && s.host !== host) return false;
+        const hay = [s.host, s.session_id, s.title, ...(s.files_touched || [])].join(' ').toLowerCase();
+        return hay.includes(q);
+      }});
+    }}
+
+    function memorySummary(s) {{
+      const mined = s.mined || [];
+      if (!mined.length) return '<span class="mem-meta">—</span>';
+      const totalCands = mined.reduce((acc, m) => acc + (m.candidate_count || 0), 0);
+      const methods = mined.length;
+      return `<span class="mem-meta">${{fmt.format(totalCands)}}c / ${{methods}}m</span>`;
+    }}
+
+    function renderRows() {{
+      const rows = filteredSessions();
+      document.getElementById('sessionsTitle').textContent =
+        `Sessions · showing ${{fmt.format(rows.length)}} of ${{fmt.format(DATA.summary.session_count)}}`;
+      document.getElementById('sessionRows').innerHTML = rows.map(s => {{
+        const hostClass = `host-${{s.host}}`;
+        const isSelected = selected && selected.session_id === s.session_id && selected.host === s.host;
+        return `
+        <tr data-id="${{s.host}}/${{s.session_id}}" class="${{hostClass}} ${{isSelected ? 'selected' : ''}}">
+          <td><span class="badge ${{s.host}}">${{s.host}}</span></td>
+          <td>${{s.date}}</td>
+          <td>${{s.title || s.session_id}}</td>
+          <td>${{fmt.format(s.event_count)}}</td>
+          <td>${{fmt.format(s.tool_call_events + s.tool_result_events)}}</td>
+          <td>${{fmt.format(s.file_edit_events)}}</td>
+          <td>${{fmt.format(s.tokens.total_tokens || 0)}}</td>
+          <td>${{money(s.estimated_cost_usd)}}</td>
+          <td>${{memorySummary(s)}}</td>
+          <td>${{s.signals_index?.secret_exposure_signal ? '<span class="badge" style="background:#fee2e2;color:#991b1b">secret</span>' : ''}}</td>
+        </tr>
+      `;}}).join('');
+      document.querySelectorAll('#sessionRows tr').forEach(tr => tr.addEventListener('click', () => {{
+        const [host, id] = tr.dataset.id.split('/');
+        selected = DATA.sessions.find(s => s.host === host && s.session_id === id);
+        activeTab = 'summary';
+        renderAll();
+      }}));
+    }}
+
+    function renderDetail() {{
+      if (!selected) return;
+      document.getElementById('detailTitle').textContent = selected.title || selected.session_id;
+      const modelCount = Object.keys(selected.tokens_by_model || {{}}).length;
+      const costLabel = modelCount > 1
+        ? `${{money(selected.estimated_cost_usd)}} · ${{modelCount}} models`
+        : money(selected.estimated_cost_usd);
+      const costSource = selected.cost_source === 'embedded'
+        ? 'embedded'
+        : selected.cost_source === 'calculated' ? 'calculated' : 'n/a';
+      document.getElementById('detailMetrics').innerHTML = [
+        metric('Host', selected.host),
+        metric('Duration', dur(selected.duration_seconds)),
+        metric('Events', fmt.format(selected.event_count)),
+        metric('Commands', fmt.format(selected.command_events)),
+        metric('File edits', fmt.format(selected.file_edit_events)),
+        metric('Files touched', fmt.format(selected.unique_files_touched)),
+        metric('Tokens', fmt.format(selected.tokens.total_tokens || 0)),
+        metric('Est. cost', costLabel),
+        metric('Cost source', costSource),
+        metric('Secret risk', selected.signals_index?.secret_exposure_signal ? 'yes' : 'no'),
+        metric('Cost model', selected.cost_model || 'unknown'),
+      ].join('');
+      document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+      document.getElementById('tab' + activeTab[0].toUpperCase() + activeTab.slice(1)).classList.add('active');
+      // Memory tab uses structured HTML cards; everything else stays in the
+      // monospaced <pre>.
+      const textEl = document.getElementById('detailText');
+      const htmlEl = document.getElementById('detailHtml');
+      if (activeTab === 'memory') {{
+        textEl.style.display = 'none';
+        htmlEl.style.display = 'block';
+        htmlEl.innerHTML = memoryHtml(selected);
+      }} else {{
+        textEl.style.display = '';
+        htmlEl.style.display = 'none';
+        textEl.textContent = detailText(selected);
+      }}
+    }}
+
+    function memoryHtml(s) {{
+      const mined = s.mined || [];
+      if (!mined.length) {{
+        return '<div class="mem-meta">No mined memory found for this session. Run `retro mine ' + s.host + ' ' + s.session_id + ' --method all`.</div>';
+      }}
+      const sections = mined.map(entry => {{
+        const cards = (entry.candidates || []).map(c => renderMemCard(c, {{showMethod: false, showSession: false}})).join('');
+        const filters = (entry.filters_applied || []).length ? `<span class="mem-meta">filters: ${{entry.filters_applied.join(', ')}}</span>` : '';
+        return `<div class="mem-block" style="margin-bottom:12px">
+          <h3 style="display:flex; gap:8px; align-items:center;">
+            <span class="pill method-${{entry.method}}">${{entry.method}}</span>
+            <span class="mem-meta">${{entry.candidate_count}} candidate(s)</span>
+            ${{filters}}
+          </h3>
+          ${{cards || '<div class="mem-meta">no candidates</div>'}}
+          <details><summary>raw prompt block</summary><pre style="white-space:pre-wrap; font-size:11px;">${{escapeHtml(entry.prompt_text || '')}}</pre></details>
+        </div>`;
+      }}).join('');
+      return sections;
+    }}
+
+    // Shared card renderer used by the per-session drill-down and the
+    // global "All Memories" browser. `opts.showMethod` includes a method
+    // pill in the header; `opts.showSession` adds session/host/title context.
+    function renderMemCard(c, opts) {{
+      opts = opts || {{}};
+      const conf = c.confidence != null ? Number(c.confidence).toFixed(2) : 'n/a';
+      const riskClass = c.risk === 'high' ? 'risk-high' : c.risk === 'low' ? 'risk-low' : '';
+      const scope = c.scope || 'repo';
+      const scopeReason = c.scope_reason || 'default';
+      const structuredHtml = c.structured ? renderStructured(c.kind, c.structured) : '';
+      const evidence = (c.evidence_refs || []).slice(0, 4).map(e => `<code>${{escapeHtml(e).slice(0,12)}}…</code>`).join(' ');
+      const origin = c.origin_repo ? `<span class="mem-meta">origin: <code>${{escapeHtml(c.origin_repo)}}</code></span>` : '';
+      const methodPill = opts.showMethod && c.method ? `<span class="pill method-${{c.method}}">${{c.method}}</span>` : '';
+      const sessionLine = opts.showSession ? `<div class="mem-meta" style="margin-top:6px">
+        From <span class="badge ${{c.host}}">${{c.host}}</span>
+        <code>${{escapeHtml(String(c.session_id || '').slice(0,12))}}…</code>
+        ${{c.title ? '· ' + escapeHtml(c.title).slice(0,80) : ''}}
+      </div>` : '';
+      return `<div class="mem-card">
+        <div class="hdr">
+          <span class="mem-kind ${{c.kind}}">${{c.kind}}</span>
+          ${{methodPill}}
+          <span class="pill scope-${{scope}}" title="${{escapeHtml(scopeReason)}}">scope: ${{scope}}</span>
+          <span class="pill ${{riskClass}}">risk: ${{c.risk || 'medium'}}</span>
+          <span class="pill">priority: ${{c.priority}}</span>
+          <span class="pill">confidence: ${{conf}}</span>
+        </div>
+        <div class="body"><b>${{escapeHtml(c.text)}}</b></div>
+        ${{c.when_to_use ? `<div class="when">When to use: ${{escapeHtml(c.when_to_use)}}</div>` : ''}}
+        ${{structuredHtml}}
+        <div class="mem-meta" style="margin-top:6px">
+          ${{origin}}
+          ${{scopeReason ? '<span class="mem-meta"> · scope reason: ' + escapeHtml(scopeReason) + '</span>' : ''}}
+        </div>
+        ${{evidence ? `<div class="mem-meta" style="margin-top:6px">Evidence: ${{evidence}}</div>` : ''}}
+        ${{sessionLine}}
+      </div>`;
+    }}
+
+    // ---- All Memories browser --------------------------------------------
+
+    function initAllMemoriesFilters() {{
+      const mem = DATA.memory || {{}};
+      const all = mem.all_candidates || [];
+      const kinds = [...new Set(all.map(c => c.kind))].sort();
+      const methods = [...new Set(all.map(c => c.method))].sort();
+      const kindSel = document.getElementById('amKind');
+      const methodSel = document.getElementById('amMethod');
+      kinds.forEach(k => {{
+        const o = document.createElement('option');
+        o.value = k; o.textContent = k;
+        kindSel.appendChild(o);
+      }});
+      methods.forEach(m => {{
+        const o = document.createElement('option');
+        o.value = m; o.textContent = m;
+        methodSel.appendChild(o);
+      }});
+      ['amHost', 'amScope', 'amKind', 'amMethod', 'amRisk'].forEach(id => {{
+        document.getElementById(id).addEventListener('change', renderAllMemories);
+      }});
+      document.getElementById('amSearch').addEventListener('input', renderAllMemories);
+    }}
+
+    function renderAllMemories() {{
+      const mem = DATA.memory || {{}};
+      const all = mem.all_candidates || [];
+      const panel = document.getElementById('allMemoriesPanel');
+      if (!all.length) {{
+        panel.style.display = 'none';
+        return;
+      }}
+
+      // Scope counts summary line (always reflects the full corpus, not filters).
+      const byScope = mem.by_scope || {{}};
+      document.getElementById('scopeCounts').innerHTML =
+        '<span><b>By scope:</b></span>' +
+        ['user', 'repo', 'task', 'global'].map(s =>
+          `<span><span class="pill scope-${{s}}">${{s}}</span> <code>${{fmt.format(byScope[s] || 0)}}</code></span>`
+        ).join('');
+
+      const host = document.getElementById('amHost').value;
+      const scope = document.getElementById('amScope').value;
+      const kind = document.getElementById('amKind').value;
+      const method = document.getElementById('amMethod').value;
+      const risk = document.getElementById('amRisk').value;
+      const q = document.getElementById('amSearch').value.toLowerCase();
+
+      const filtered = all.filter(c => {{
+        if (host !== 'all' && c.host !== host) return false;
+        if (scope !== 'all' && c.scope !== scope) return false;
+        if (kind !== 'all' && c.kind !== kind) return false;
+        if (method !== 'all' && c.method !== method) return false;
+        if (risk !== 'all' && c.risk !== risk) return false;
+        if (q) {{
+          const hay = [c.text, c.when_to_use, c.title, c.origin_repo].filter(Boolean).join(' ').toLowerCase();
+          if (!hay.includes(q)) return false;
+        }}
+        return true;
+      }});
+
+      // Stable sort: highest priority/confidence first, then by scope (user > global > task > repo).
+      const scopeOrder = {{user: 0, global: 1, task: 2, repo: 3}};
+      filtered.sort((a, b) =>
+        (b.priority || 0) - (a.priority || 0)
+        || (b.confidence || 0) - (a.confidence || 0)
+        || (scopeOrder[a.scope] ?? 9) - (scopeOrder[b.scope] ?? 9)
+      );
+
+      document.getElementById('amCount').textContent =
+        `${{fmt.format(filtered.length)}} of ${{fmt.format(all.length)}} memories`;
+      document.getElementById('allMemoriesList').innerHTML =
+        filtered.length
+          ? filtered.map(c => renderMemCard(c, {{showMethod: true, showSession: true}})).join('')
+          : '<div class="mem-meta">No memories match the current filters.</div>';
+    }}
+
+    function renderStructured(kind, s) {{
+      if (!s) return '';
+      const lines = [];
+      if (kind === 'skill') {{
+        if (s.activation) lines.push(`<div><b>Activation:</b> ${{escapeHtml(s.activation)}}</div>`);
+        if (s.steps && s.steps.length) {{
+          lines.push('<div><b>Steps:</b><ol style="margin:4px 0 4px 18px; padding:0">' +
+            s.steps.map(x => `<li>${{escapeHtml(x)}}</li>`).join('') + '</ol></div>');
+        }}
+        if (s.termination) lines.push(`<div><b>Termination:</b> ${{escapeHtml(s.termination)}}</div>`);
+        if (s.verification) lines.push(`<div><b>Verification:</b> ${{escapeHtml(s.verification)}}</div>`);
+      }} else if (kind === 'procedure') {{
+        if (s.goal) lines.push(`<div><b>Goal:</b> ${{escapeHtml(s.goal)}}</div>`);
+        if (s.preconditions && s.preconditions.length) lines.push(`<div><b>Preconditions:</b> ${{escapeHtml(s.preconditions.join(', '))}}</div>`);
+        if (s.steps && s.steps.length) {{
+          lines.push('<div><b>Steps:</b><ol style="margin:4px 0 4px 18px; padding:0">' +
+            s.steps.map(x => `<li>${{escapeHtml(x)}}</li>`).join('') + '</ol></div>');
+        }}
+        if (s.warnings && s.warnings.length) lines.push(`<div><b>Warnings:</b> ${{escapeHtml(s.warnings.join('; '))}}</div>`);
+        if (s.outcome) lines.push(`<div><b>Outcome:</b> ${{escapeHtml(s.outcome)}}</div>`);
+      }}
+      return lines.length ? `<div class="body" style="margin-top:6px">${{lines.join('')}}</div>` : '';
+    }}
+
+    function metric(label, value) {{ return `<div class="metric"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`; }}
+    function detailText(s) {{
+      if (activeTab === 'transcript') return s.rendered_markdown || 'No rendered transcript found.';
+      // activeTab === 'memory' is handled in renderDetail() via memoryHtml.
+      if (activeTab === 'models') {{
+        const tokens = s.tokens_by_model || {{}};
+        const costs = s.cost_by_model || {{}};
+        const names = Object.keys(tokens);
+        if (!names.length) {{
+          return 'No per-model token data for this session.\\n\\n(For embedded-cost sessions cost is taken as-is and not broken down by model.)';
+        }}
+        names.sort((a, b) => (tokens[b].total_tokens || 0) - (tokens[a].total_tokens || 0));
+        const lines = [];
+        const pad = (s, n) => String(s).padEnd(n);
+        lines.push(pad('model', 28) + pad('input', 12) + pad('cache_create', 13) + pad('cache_read', 12) + pad('output', 10) + pad('total', 12) + 'cost');
+        lines.push('-'.repeat(98));
+        for (const m of names) {{
+          const t = tokens[m] || {{}};
+          const c = costs[m];
+          lines.push(
+            pad(m, 28)
+            + pad(fmt.format(t.input_tokens || 0), 12)
+            + pad(fmt.format(t.cache_creation_tokens || 0), 13)
+            + pad(fmt.format(t.cached_input_tokens || 0), 12)
+            + pad(fmt.format(t.output_tokens || 0), 10)
+            + pad(fmt.format(t.total_tokens || 0), 12)
+            + (c == null ? 'n/a' : money(c))
+          );
+        }}
+        lines.push('');
+        lines.push(`cost_mode: ${{DATA.cost_mode}}  ·  cost_source: ${{s.cost_source}}`);
+        lines.push(`pricing: ${{DATA.rate_note}}`);
+        return lines.join('\\n');
+      }}
+      if (activeTab === 'signals') {{
+        const readings = s.signals || [];
+        if (!readings.length) return 'No signals computed for this session. Run `retro signal run` then rebuild the dashboard.';
+        const groupOrder = ['activity','outcome','cost','risk'];
+        const byGroup = {{}};
+        readings.forEach(r => {{ (byGroup[r.group] = byGroup[r.group] || []).push(r); }});
+        const lines = [];
+        groupOrder.forEach(g => {{
+          if (!byGroup[g]) return;
+          lines.push('# ' + g);
+          byGroup[g].sort((a,b) => a.signal.localeCompare(b.signal)).forEach(r => {{
+            const value = r.value === null ? '∅ (missing)' : r.value;
+            const meta = r.metadata && Object.keys(r.metadata).length ? '  ' + JSON.stringify(r.metadata) : '';
+            const unit = r.unit ? ' ' + r.unit : '';
+            const conf = r.confidence !== undefined && r.confidence !== 1.0 ? ` conf=${{r.confidence}}` : '';
+            lines.push(`  ${{r.signal.padEnd(28)}} ${{String(value)}}${{unit}}${{conf}}${{meta}}`);
+          }});
+          lines.push('');
+        }});
+        return lines.join('\\n');
+      }}
+      return JSON.stringify({{
+        session_id: s.session_id,
+        host: s.host,
+        date: s.date,
+        first_ts: s.first_ts,
+        last_ts: s.last_ts,
+        duration_seconds: s.duration_seconds,
+        event_counts: s.event_counts,
+        actor_counts: s.actor_counts,
+        top_tools: s.top_tools,
+        tokens: s.tokens,
+        models: s.models,
+        cost_model: s.cost_model,
+        estimated_cost_usd: s.estimated_cost_usd,
+        cost_note: s.cost_note,
+        files_touched: s.files_touched,
+        artifacts: {{
+          normalized: s.normalized_path,
+          rendered: s.rendered_path,
+          raw_dir: s.raw_dir,
+          mined: s.mined,
+        }}
+      }}, null, 2);
+    }}
+
+    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderRows(); renderDetail(); }}
+    initAllMemoriesFilters();
+    document.getElementById('search').addEventListener('input', renderRows);
+    document.getElementById('hostFilter').addEventListener('change', renderRows);
+    document.getElementById('tabSummary').addEventListener('click', () => {{ activeTab='summary'; renderDetail(); }});
+    document.getElementById('tabModels').addEventListener('click', () => {{ activeTab='models'; renderDetail(); }});
+    document.getElementById('tabSignals').addEventListener('click', () => {{ activeTab='signals'; renderDetail(); }});
+    document.getElementById('tabTranscript').addEventListener('click', () => {{ activeTab='transcript'; renderDetail(); }});
+    document.getElementById('tabMemory').addEventListener('click', () => {{ activeTab='memory'; renderDetail(); }});
+    renderAll();
+  </script>
+</body>
+</html>
+"""
+
+
+if __name__ == "__main__":
+    main()

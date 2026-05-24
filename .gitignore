@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+build/
+rollout-memory/
+.DS_Store
+.claude/
+dashboard/data/
+dashboard/index.html
