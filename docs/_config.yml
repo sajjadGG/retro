@@ -1,0 +1,17 @@
+title: retro
+description: Local-first rollout capture, evaluation, memory mining, and retrieval.
+theme: minima
+markdown: kramdown
+
+header_pages:
+  - onboarding.md
+  - guides.md
+  - cli.md
+  - architecture.md
+  - memory-backend.md
+  - dashboard.md
+  - contributing.md
+  - roadmap.md
+
+exclude:
+  - README.md

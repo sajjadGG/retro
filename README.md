@@ -4,6 +4,8 @@
 
 Capture **Codex** and **Claude Code** rollouts into durable local artifacts, evaluate them with signals, mine them into prompt-time memory, and report on cost and behavior via a static dashboard. Local-first, no cloud, evidence-linked.
 
+Project wiki and onboarding guides: <https://sajjadgg.github.io/retro/>
+
 This project answers two questions that "another memory store" doesn't:
 
 1. **How did this rollout actually go?** (signals: activity, outcome, cost, risk)
