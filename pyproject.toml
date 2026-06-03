@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "retro-agent-memory"
+name = "retro-ai"
 version = "0.1.0"
 description = "Capture, analyze, and mine Codex / Claude Code rollouts into durable local memory."
 readme = "README.md"
