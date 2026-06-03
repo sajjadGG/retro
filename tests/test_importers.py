@@ -83,6 +83,23 @@ class TestClaudeImporter:
         with pytest.raises(FileNotFoundError):
             imp.import_session(identifier="nonexistent")
 
+    def test_reimport_allowed_without_force_if_newer(self, tmp_path: Path, claude_transcript: Path):
+        imp, _ = self._make_importer(tmp_path, claude_transcript)
+        imp.import_session(identifier="sess-100")
+
+        # Modifying the source file (appending and shifting mtime)
+        session = imp.find_session("sess-100")
+        import os
+        import time
+        with session.transcript_path.open("a", encoding="utf-8") as f:
+            f.write("\n")
+        new_mtime = time.time() + 10
+        os.utime(session.transcript_path, (new_mtime, new_mtime))
+
+        # Should be allowed to re-import without force
+        result = imp.import_session(identifier="sess-100")
+        assert result.event_count > 0
+
 
 # ---- Codex importer --------------------------------------------------------
 
@@ -147,3 +164,20 @@ class TestCodexImporter:
 
         with pytest.raises(FileExistsError):
             imp.import_session(identifier="thread-001")
+
+    def test_reimport_allowed_without_force_if_newer(self, tmp_path: Path, codex_rollout: Path):
+        imp, _ = self._make_importer(tmp_path, codex_rollout)
+        imp.import_session(identifier="thread-001")
+
+        # Modifying the source rollout file (appending and shifting mtime)
+        thread = imp.find_thread("thread-001")
+        import os
+        import time
+        with thread.rollout_path.open("a", encoding="utf-8") as f:
+            f.write("\n")
+        new_mtime = time.time() + 10
+        os.utime(thread.rollout_path, (new_mtime, new_mtime))
+
+        # Should be allowed to re-import without force
+        result = imp.import_session(identifier="thread-001")
+        assert result.event_count > 0

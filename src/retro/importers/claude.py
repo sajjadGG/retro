@@ -158,10 +158,25 @@ class ClaudeImporter:
                 f"under {self.projects_dir}"
             )
         raw_dir = self.layout.raw_dir(self.host, session.session_id)
+        raw_transcript = raw_dir / "transcript.jsonl"
         if raw_dir.exists() and not force:
-            raise FileExistsError(
-                f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
-            )
+            if raw_transcript.exists():
+                should_raise = False
+                try:
+                    src_stat = session.transcript_path.stat()
+                    raw_stat = raw_transcript.stat()
+                    if src_stat.st_mtime <= raw_stat.st_mtime and src_stat.st_size <= raw_stat.st_size:
+                        should_raise = True
+                except OSError:
+                    pass
+                if should_raise:
+                    raise FileExistsError(
+                        f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
+                    )
+            else:
+                raise FileExistsError(
+                    f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
+                )
         raw_dir.mkdir(parents=True, exist_ok=True)
         raw_transcript = raw_dir / "transcript.jsonl"
         shutil.copy2(session.transcript_path, raw_transcript)
