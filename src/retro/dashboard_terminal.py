@@ -984,6 +984,59 @@ def show_accounting_costs(data: dict[str, Any]) -> None:
         )
         console.print()
 
+        # Generate last 35 days for Heatmap
+        from datetime import datetime, timedelta
+        dates = []
+        now = datetime.now()
+        for i in range(34, -1, -1):
+            d = now - timedelta(days=i)
+            dates.append(d.strftime("%Y-%m-%d"))
+
+        by_day = summary.get("by_day", {})
+        grid_rows = []
+        for w in range(5):
+            week_cells = []
+            for d_idx in range(7):
+                date = dates[w * 7 + d_idx]
+                day_data = by_day.get(date)
+                if day_data:
+                    rate_limit_hits = day_data.get("rate_limit_hits", 0)
+                    tokens = day_data.get("tokens", 0)
+                    cost = day_data.get("cost", 0.0)
+                    token_ratio = min(1.0, tokens / 1_000_000)
+                    cost_ratio = min(1.0, cost / 1.0)
+                    util = max(token_ratio, cost_ratio)
+
+                    if rate_limit_hits > 0:
+                        week_cells.append("[bold yellow]★[/bold yellow]")
+                    elif util >= 1.0:
+                        week_cells.append("[bold green]█[/bold green]")
+                    elif util >= 0.5:
+                        week_cells.append("[green]▒[/green]")
+                    elif util > 0.0:
+                        week_cells.append("[green]░[/green]")
+                    else:
+                        week_cells.append("[dim]·[/dim]")
+                else:
+                    week_cells.append("[dim]·[/dim]")
+            grid_rows.append("  ".join(week_cells))
+
+        grid_str = "\n".join(grid_rows)
+        legend_parts = [
+            "Legend: [dim]·[/dim] Empty",
+            "[green]░[/green] <50%",
+            "[green]▒[/green] 50-100%",
+            "[bold green]█[/bold green] Full",
+            "[bold yellow]★[/bold yellow] Maximized",
+        ]
+        heatmap_panel = Panel(
+            grid_str,
+            title="[bold green]Quotas & Ceiling Heatmap (Last 35 Days)[/bold green]",
+            subtitle="  ".join(legend_parts),
+        )
+        console.print(heatmap_panel)
+        console.print()
+
         # Legend
         console.print(
             "Legend: [blue]█[/blue] Input  "

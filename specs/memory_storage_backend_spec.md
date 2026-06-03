@@ -1,10 +1,10 @@
 # Memory Storage & Retrieval Backend Spec
 
 Status: proposed
-Author: drafted with Claude Code (research-web access was blocked in the drafting
-environment; the comparative-systems section below is from model knowledge as of
-the Jan 2026 cutoff and the repo's own `agent_rollout_memory_landscape.md`, not
-freshly re-verified citations — treat external claims as approximate).
+Author: drafted with Claude Code. The Hermes row in the comparative section is
+web-verified (sources linked inline); the remaining systems are from model
+knowledge (Jan 2026 cutoff) plus the repo's own `agent_rollout_memory_landscape.md`
+and are not all individually re-fetched.
 
 ## Purpose
 
@@ -82,10 +82,12 @@ Conclusion: the flat layout is the right **source of truth** and the wrong
 
 Grounded in this repo's `agent_rollout_memory_landscape.md` and the lineage in
 `self_evolving_memory_generation_spec.md` (MemP, MemRL, SkillRL, SkillNet,
-MemGen), plus general model knowledge of the broader systems. Not web-reverified.
+MemGen), plus general model knowledge. The **Hermes** row is web-verified (see
+sources below); the rest are not all individually re-fetched.
 
 | System | Storage backend | Lookup | Extraction / consolidation | Skills |
 | --- | --- | --- | --- | --- |
+| **Hermes (Nous Research)** — the closest analog | **SQLite + FTS5, WAL, single writer; raw transcripts in JSONL files; no server.** Prompt memory in `MEMORY.md`/`USER.md` (hard char caps). | FTS5 keyword `session_search`, results LLM-summarized (Gemini Flash) before injection; prompt memory injected as a frozen block at session start. **No vectors in core.** | periodic self-"nudges" + capacity-threshold (>80%) consolidation: merge/compress/dedup; security scan (prompt-injection/credential/invisible-unicode) before accept | **`~/.hermes/skills/*.md`** (agentskills.io / SKILL.md), **progressive disclosure** (summary by default, full on demand → flat token cost); created on ≥5 tool calls / error recovery / user correction / non-obvious success |
 | Generative Agents (Stanford) | in-memory "memory stream" (list of records) | score = recency + importance + relevance (embedding cosine) | periodic LLM "reflection" synthesizes higher-level memories | — |
 | MemGPT / Letta | **SQLite/Postgres** + vector store; tiered (core vs archival) | self-issued function calls to page memory in/out | LLM self-edits core memory; archival via embeddings | — |
 | Voyager | flat files of **code** (skill = function) | embedding over skill descriptions | adds a skill when a task succeeds; skills compose | skill library is the whole point |
@@ -106,6 +108,31 @@ The consensus that is actually relevant to a single-user local CLI:
   of multi-tenant scale we do not have.
 - Linking (A-MEM Zettelkasten) ≈ our `[[wiki-links]]`; it gives graph-style
   recall *without* a graph DB if links are a join table.
+
+**Independent validation by Hermes.** The most directly comparable system — a
+production self-improving local agent — converged on this spec's core choices
+without sharing them: SQLite+FTS5 in WAL mode as the index, JSONL transcripts as
+source of truth, no server, file-based markdown skills, and **no vectors in the
+core path** (keyword + LLM summarization only). That last point is the strongest
+signal: it confirms the embedding tier here should stay *optional*, not required.
+
+**Concrete patterns to adopt from Hermes** (additive to the parent spec, cheap to
+implement):
+- **Progressive disclosure for skills.** Store a short summary per skill loaded by
+  default; fetch full `SKILL.md` body only on demand. Keeps injected-context cost
+  flat as the skill count grows. Maps onto the parent spec's `memory weave` step.
+- **Skill-creation trigger heuristics:** generate a skill when a session had ≥5
+  tool calls, an error→recovery sequence, a user correction, or a non-obvious
+  success. Useful default gates for the SessionEnd reflection hook and `retro mine`.
+- **Capacity-threshold consolidation:** when a scope's memory set grows past a
+  budget, run an LLM merge/compress/dedup pass rather than appending forever.
+- **Security scan before `accepted`:** reject prompt-injection strings, credential
+  exfiltration, and invisible-unicode in memory text — broaden the parent spec's
+  secret-exposure guard to cover these at promotion time.
+
+Sources (web-verified, June 2026): Hermes memory architecture —
+https://www.glukhov.org/ai-systems/hermes/hermes-agent-memory-system/ and
+https://mranand.substack.com/p/inside-hermes-agent-how-a-self-improving
 
 ## Decision: SQLite as a Rebuildable Index over File Source-of-Truth
 

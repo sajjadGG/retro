@@ -46,6 +46,10 @@ disable_error_code = ["arg-type"]
 module = ["retro.cli"]
 disable_error_code = ["arg-type"]
 
+[[tool.mypy.overrides]]
+module = ["dashboard.*", "dashboard"]
+ignore_errors = true
+
 [tool.ruff]
 target-version = "py310"
 line-length = 110

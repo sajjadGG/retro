@@ -269,6 +269,7 @@ def analyze_session(
     command_count = 0
     failed_count = 0
     web_search_count = 0
+    rate_limit_count = 0
     for event in events:
         etype = event.get("event_type")
         payload = event.get("payload") or {}
@@ -282,6 +283,8 @@ def analyze_session(
             failed_count += 1
         if "web_search" in (event.get("summary") or "") or name in {"WebSearch", "web_search"}:
             web_search_count += 1
+        if _is_rate_limit_hit(event):
+            rate_limit_count += 1
 
     first_ts = min(timestamps).isoformat() if timestamps else None
     last_ts = max(timestamps).isoformat() if timestamps else None
@@ -291,8 +294,6 @@ def analyze_session(
     token_stats = extract_token_stats(events, host, session_id)
     provider = infer_provider(host, raw_meta, events)
     models = infer_models(host, session_id, raw_meta, events)
-    # Backfill `by_model` if extract_token_stats produced totals but no breakdown
-    # (e.g. older normalized files): attribute everything to the dominant model.
     if not token_stats.get("by_model") and any(
         token_stats.get(k, 0)
         for k in ("input_tokens", "output_tokens", "cache_creation_tokens", "cached_input_tokens")
@@ -342,6 +343,7 @@ def analyze_session(
             "categories",
             {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
         ),
+        "rate_limit_hits": rate_limit_count,
         "cost_mode_used": cost_breakdown["mode_used"],
         "cost_source": cost_breakdown["source"],
         "cost_note": pricing.source_note(),
@@ -367,6 +369,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             "cost_cache_create": 0.0,
             "cost_cache_read": 0.0,
             "cost_output": 0.0,
+            "rate_limit_hits": 0,
         }
     )
     by_host = Counter(s["host"] for s in sessions)
@@ -385,6 +388,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         by_day[day]["cost"] += session.get("estimated_cost_usd") or 0.0
         by_day[day]["tool_calls"] += session.get("tool_call_events", 0)
         by_day[day]["edits"] += session.get("file_edit_events", 0)
+        by_day[day]["rate_limit_hits"] += session.get("rate_limit_hits", 0)
 
         # Accumulate daily breakdown
         cats = session.get("cost_categories") or {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
@@ -405,6 +409,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         totals["unknown_events"] += session["unknown_events"]
         totals["tokens"] += session["tokens"].get("total_tokens", 0)
         total_cost += session.get("estimated_cost_usd") or 0.0
+        totals["rate_limit_hits"] += session.get("rate_limit_hits", 0)
 
         # Accumulate global totals
         totals["cost_input"] += cats.get("input", 0.0)
@@ -1082,6 +1087,29 @@ def is_failed_event(event: dict[str, Any]) -> bool:
     return event.get("event_type") == "error"
 
 
+def _is_rate_limit_hit(event: dict[str, Any]) -> bool:
+    text = (event.get("summary") or "").lower()
+    payload = event.get("payload") or {}
+    for key in ("text", "message", "error", "output", "raw_content"):
+        val = payload.get(key)
+        if isinstance(val, str):
+            text += " " + val.lower()
+    phrases = [
+        "rate limit",
+        "reached the limit",
+        "wait until",
+        "quota exceeded",
+        "exceeded quota",
+        "exceeded your quota",
+        "resource_exhausted",
+        "resource exhausted",
+        "throttled",
+        "too many requests",
+        "try again in",
+    ]
+    return any(p in text for p in phrases)
+
+
 def infer_title(events: list[dict[str, Any]], raw_meta: dict[str, Any]) -> str:
     if raw_meta.get("title"):
         return str(raw_meta["title"]).strip().splitlines()[0][:180]
@@ -1219,6 +1247,8 @@ def render_html(payload: dict[str, Any]) -> str:
     .cost-stacked-bar {{ display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: #e5e4dc; width: 100%; }}
     .cost-stacked-bar .seg {{ height: 100%; transition: opacity 0.15s ease; cursor: pointer; }}
     .cost-stacked-bar .seg:hover {{ opacity: 0.85; }}
+    .heatmap-cell {{ transition: transform 0.15s ease, border-color 0.15s ease; }}
+    .heatmap-cell:hover {{ transform: scale(1.15); border-color: #1e293b !important; z-index: 10; }}
     .signal-aggs {{ padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }}
     .sigcard {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: #fff; }}
     .sigcard .name {{ font-size: 12px; color: var(--muted); }}
@@ -1351,6 +1381,53 @@ def render_html(payload: dict[str, Any]) -> str:
           </thead>
           <tbody id="accountingRows"></tbody>
         </table>
+      </div>
+    </section>
+    <section class="panel" id="ceilingPanel">
+      <h2>Ceiling Maximization &amp; Daily Quotas</h2>
+      <div style="display: grid; grid-template-columns: 280px 1fr; gap: 20px; padding: 16px; flex-wrap: wrap;">
+        <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; background: #fafaf9; border: 1px solid var(--line); border-radius: 8px; padding: 16px; position: relative;">
+          <h3 style="margin: 0 0 12px; font-size: 13px; color: var(--muted); text-transform: uppercase;">Daily Utilization</h3>
+          <svg width="180" height="180" viewBox="0 0 180 180" style="transform: rotate(-90deg);">
+            <circle cx="90" cy="90" r="75" fill="transparent" stroke="#e5e7eb" stroke-width="12" />
+            <circle cx="90" cy="90" r="55" fill="transparent" stroke="#e5e7eb" stroke-width="12" />
+            <circle cx="90" cy="90" r="35" fill="transparent" stroke="#e5e7eb" stroke-width="12" />
+            <circle id="ringTokens" cx="90" cy="90" r="75" fill="transparent" stroke="#f97316" stroke-width="12"
+                    stroke-dasharray="471.2" stroke-dashoffset="471.2" stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
+            <circle id="ringCost" cx="90" cy="90" r="55" fill="transparent" stroke="#10b981" stroke-width="12"
+                    stroke-dasharray="345.6" stroke-dashoffset="345.6" stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
+            <circle id="ringLimits" cx="90" cy="90" r="35" fill="transparent" stroke="#eab308" stroke-width="12"
+                    stroke-dasharray="219.9" stroke-dashoffset="219.9" stroke-linecap="round" style="transition: stroke-dashoffset 0.5s ease;" />
+          </svg>
+          <div style="margin-top: 16px; font-size: 11px; color: var(--muted); display: grid; gap: 4px; width: 100%;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span><span class="dot" style="background:#f97316"></span> Tokens (1M target)</span>
+              <b id="ringTokensText">0%</b>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span><span class="dot" style="background:#10b981"></span> Cost ($1.00 target)</span>
+              <b id="ringCostText">0%</b>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span><span class="dot" style="background:#eab308"></span> Maximization (1 hit)</span>
+              <b id="ringLimitsText">0%</b>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; flex-direction: column;">
+          <h3 style="margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase;">Quotas Heatmap (Last 35 Days)</h3>
+          <div class="legend" style="padding: 0 0 8px;">
+            <span><span style="display:inline-block; width:12px; height:12px; background:#f3f4f6; border:1px solid #d1d5db; border-radius:2px; vertical-align:middle; margin-right:4px;"></span> Unused</span>
+            <span><span style="display:inline-block; width:12px; height:12px; background:#dcfce7; border:1px solid #86efac; border-radius:2px; vertical-align:middle; margin-right:4px;"></span> &lt; 50%</span>
+            <span><span style="display:inline-block; width:12px; height:12px; background:#86efac; border:1px solid #4ade80; border-radius:2px; vertical-align:middle; margin-right:4px;"></span> 50-100%</span>
+            <span><span style="display:inline-block; width:12px; height:12px; background:#22c55e; border:1px solid #16a34a; border-radius:2px; vertical-align:middle; margin-right:4px;"></span> Full Quota</span>
+            <span><span style="display:inline-block; width:12px; height:12px; background:#fef08a; border:2px solid #eab308; box-shadow: 0 0 6px rgba(234, 179, 8, 0.4); border-radius:2px; vertical-align:middle; margin-right:4px;"></span> Maximized (Rate Limit Hit!)</span>
+          </div>
+          <div id="heatmapGrid" style="display: grid; grid-template-columns: repeat(7, 18px); gap: 6px; margin-top: 6px;"></div>
+          <div id="heatmapDetail" style="margin-top: 16px; font-size: 12px; color: var(--muted); font-style: italic;">
+            Click a day in the heatmap to view its quota rings.
+          </div>
+        </div>
       </div>
     </section>
     <section class="controls">
@@ -1908,7 +1985,94 @@ def render_html(payload: dict[str, Any]) -> str:
       }}).join('');
     }}
 
-    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderRows(); renderDetail(); }}
+    function renderCeilingHeatmap() {{
+      const grid = document.getElementById('heatmapGrid');
+      const byDay = DATA.summary.by_day || {{}};
+      const dates = [];
+      const now = new Date();
+      for (let i = 34; i >= 0; i--) {{
+        const d = new Date(now.getTime() - i * 24 * 60 * 60 * 1000);
+        const yyyy = d.getFullYear();
+        const mm = String(d.getMonth() + 1).padStart(2, '0');
+        const dd = String(d.getDate()).padStart(2, '0');
+        dates.push(`${{yyyy}}-${{mm}}-${{dd}}`);
+      }}
+      
+      grid.innerHTML = dates.map(date => {{
+        const dayData = byDay[date] || {{ tokens: 0, cost: 0.0, rate_limit_hits: 0 }};
+        const tokens = dayData.tokens || 0;
+        const cost = dayData.cost || 0.0;
+        const rateLimitHits = dayData.rate_limit_hits || 0;
+        const tokenRatio = Math.min(1.0, tokens / 1000000);
+        const costRatio = Math.min(1.0, cost / 1.0);
+        const util = Math.max(tokenRatio, costRatio);
+        
+        let bgColor = '#f3f4f6';
+        let borderColor = '#d1d5db';
+        let style = '';
+        
+        if (rateLimitHits > 0) {{
+          bgColor = '#fef08a';
+          borderColor = '#eab308';
+          style = 'border: 2px solid #eab308; box-shadow: 0 0 6px rgba(234,179,8,0.5); background-color: #fef08a;';
+        }} else if (util > 0.99) {{
+          bgColor = '#22c55e';
+          borderColor = '#16a34a';
+        }} else if (util >= 0.5) {{
+          bgColor = '#86efac';
+          borderColor = '#4ade80';
+        }} else if (util > 0) {{
+          bgColor = '#dcfce7';
+          borderColor = '#86efac';
+        }}
+        
+        const tooltip = `${{date}}: ${{fmt.format(tokens)}} tokens, ${{money(cost)}}, ${{rateLimitHits}} rate limit hit(s)`;
+        return `<div class="heatmap-cell" data-date="${{date}}" title="${{tooltip}}" style="width: 18px; height: 18px; border-radius: 4px; background: ${{bgColor}}; border: 1px solid ${{borderColor}}; cursor: pointer; ${{style}}"></div>`;
+      }}).join('');
+      
+      document.querySelectorAll('.heatmap-cell').forEach(cell => {{
+        cell.addEventListener('click', () => {{
+          const date = cell.dataset.date;
+          updateRingsForDate(date);
+        }});
+      }});
+      
+      const lastDate = dates[34];
+      updateRingsForDate(lastDate);
+    }}
+
+    function updateRingsForDate(date) {{
+      const byDay = DATA.summary.by_day || {{}};
+      const dayData = byDay[date] || {{ tokens: 0, cost: 0.0, rate_limit_hits: 0 }};
+      const tokens = dayData.tokens || 0;
+      const cost = dayData.cost || 0.0;
+      const rateLimitHits = dayData.rate_limit_hits || 0;
+      
+      const tokenRatio = Math.min(1.0, tokens / 1000000);
+      const costRatio = Math.min(1.0, cost / 1.0);
+      const limitRatio = Math.min(1.0, rateLimitHits / 1);
+      
+      const offsetTokens = 471.2 * (1 - tokenRatio);
+      const offsetCost = 345.6 * (1 - costRatio);
+      const offsetLimits = 219.9 * (1 - limitRatio);
+      
+      document.getElementById('ringTokens').style.strokeDashoffset = offsetTokens;
+      document.getElementById('ringCost').style.strokeDashoffset = offsetCost;
+      document.getElementById('ringLimits').style.strokeDashoffset = offsetLimits;
+      
+      document.getElementById('ringTokensText').textContent = `${{Math.round(tokenRatio * 100)}}%`;
+      document.getElementById('ringCostText').textContent = `${{Math.round(costRatio * 100)}}%`;
+      document.getElementById('ringLimitsText').textContent = `${{Math.round(limitRatio * 100)}}%`;
+      
+      document.getElementById('heatmapDetail').innerHTML = `
+        <b>Showing Quotas for ${{date}}:</b><br/>
+        • Tokens: ${{fmt.format(tokens)}} / 1,000,000 (${{Math.round(tokenRatio * 100)}}%)<br/>
+        • Cost: ${{money(cost)}} / $1.00 (${{Math.round(costRatio * 100)}}%)<br/>
+        • Rate limit warnings: ${{rateLimitHits}} / 1 target (${{Math.round(limitRatio * 100)}}%)
+      `;
+    }}
+
+    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);
