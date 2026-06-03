@@ -163,6 +163,20 @@ def main() -> None:
     sessions = collect_sessions(pricing=pricing, cost_mode=args.mode)
     signal_readings_by_session, signal_aggregates = load_signal_data()
     attach_signals_to_sessions(sessions, signal_readings_by_session)
+
+    # Load quest state
+    quest_state_path = ARTIFACT_ROOT / "quests" / "state.json"
+    quest_state = {}
+    if quest_state_path.exists():
+        try:
+            quest_state = json.loads(quest_state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+
+    # Compute operator diagnostics profile
+    from retro.analyzer import analyze_operator_portfolio
+    operator_profile = analyze_operator_portfolio(sessions)
+
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "rate_note": pricing.source_note(),
@@ -173,6 +187,8 @@ def main() -> None:
         "memory": summarize_memory(sessions),
         "signals": signal_aggregates,
         "sessions": sessions,
+        "quests": quest_state,
+        "operator_profile": operator_profile,
     }
     data_path = DATA_DIR / "rollouts.json"
     data_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1434,6 +1450,54 @@ def render_html(payload: dict[str, Any]) -> str:
   </header>
   <main>
     <section class="kpis" id="kpis"></section>
+
+    <!-- Operator Quests & Streaks Section (Issue 8) -->
+    <section class="panel" id="questsPanel" style="display:none; margin-bottom: 18px;">
+      <h2>Operator Quests &amp; Progression Loop</h2>
+      <div style="padding: 16px; display: grid; grid-template-columns: minmax(240px, 300px) 1fr; gap: 20px; flex-wrap: wrap;">
+        <div style="background: linear-gradient(135deg, #0f766e 0%, #115e59 100%); color: white; border-radius: 8px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; min-height: 160px; box-shadow: 0 4px 10px rgba(15, 118, 110, 0.25);">
+          <div>
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.85;">Current Rank</div>
+            <div id="questUserLevel" style="font-size: 18px; font-weight: 800; margin: 4px 0 10px 0;">Novice Prompt Mechanic</div>
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.85;">Operator Progress</div>
+            <div style="font-size: 26px; font-weight: 900; margin-top: 2px;" id="questXp">0 <span style="font-size: 14px; font-weight: 500; opacity: 0.85;">XP</span></div>
+          </div>
+          <div style="border-top: 1px solid rgba(255,255,255,0.25); padding-top: 10px; margin-top: 12px; display: flex; align-items: center; justify-content: space-between;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 24px;">🔥</span>
+              <span id="questStreak" style="font-size: 15px; font-weight: 700;">0 Day Streak</span>
+            </div>
+            <span id="questStreakFreeze" style="font-size: 11px; background: rgba(255,255,255,0.2); padding: 2px 6px; border-radius: 4px;">Freezes: 0</span>
+          </div>
+        </div>
+        <div>
+          <h3 style="margin: 0 0 12px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;">Active Daily Quests</h3>
+          <div id="questsList" style="display: grid; gap: 10px;"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Operator Diagnostics & Mentorship Section (Issue 9) -->
+    <section class="panel" id="operatorProfilePanel" style="margin-bottom: 18px;">
+      <h2>Operator Diagnostics &amp; Mentorship</h2>
+      <div style="padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; flex-wrap: wrap;">
+        <div>
+          <h3 style="margin: 0 0 12px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;">Performance Indicators</h3>
+          <div style="display: grid; gap: 6px;">
+            <div class="mem-row"><span class="label">Average Turns per Session</span><span class="val" id="opAvgTurns">0</span></div>
+            <div class="mem-row"><span class="label">Command Failure Rate</span><span class="val" id="opCmdFailure">0%</span></div>
+            <div class="mem-row"><span class="label">Exploration vs Exploitation</span><span class="val" id="opExplorBalance">0.5 / 0.5</span></div>
+            <div class="mem-row"><span class="label">Average Session Token Cost</span><span class="val" id="opAvgCost">$0.0000</span></div>
+            <div class="mem-row"><span class="label">Operator Role Classification</span><span class="val" id="opRoleClass">General Software Engineer</span></div>
+          </div>
+        </div>
+        <div>
+          <h3 style="margin: 0 0 12px 0; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em;">Mentorship Recommendations</h3>
+          <div id="opRecommendations" style="display: flex; flex-direction: column; gap: 8px;"></div>
+        </div>
+      </div>
+    </section>
+
     <section class="panel" id="memoryPanel">
       <h2>Memory · Mined Across Portfolio</h2>
       <div class="legend">
@@ -2302,7 +2366,56 @@ def render_html(payload: dict[str, Any]) -> str:
       }}
     }}
 
-    function renderAll() {{ populateProjects(); renderKpis(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
+    function renderQuests() {{
+      const qState = DATA.quests || {{}};
+      const panel = document.getElementById('questsPanel');
+      if (!qState.daily_quests || qState.daily_quests.length === 0) {{
+        panel.style.display = 'none';
+        return;
+      }}
+      panel.style.display = 'block';
+      document.getElementById('questUserLevel').textContent = qState.user_level || 'Novice Prompt Mechanic';
+      document.getElementById('questXp').innerHTML = `${{qState.experience_points || 0}} <span style="font-size: 14px; font-weight: 500; opacity: 0.85;">XP</span>`;
+      document.getElementById('questStreak').textContent = `${{qState.streak_count || 0}} Day Streak`;
+      document.getElementById('questStreakFreeze').textContent = `Freezes: ${{qState.streak_freezes || 0}}`;
+
+      const listDiv = document.getElementById('questsList');
+      listDiv.innerHTML = qState.daily_quests.map(q => {{
+        const isCompleted = q.status === 'completed';
+        const cardBg = isCompleted ? '#f0fdf4' : '#ffffff';
+        const cardBorder = isCompleted ? '1px solid #bbf7d0' : '1px solid var(--line)';
+        const badgeColor = isCompleted ? 'background:#dcfce7; color:#166534;' : 'background:#fef3c7; color:#92400e;';
+        const badgeText = isCompleted ? 'Completed' : 'Active';
+        
+        return `<div style="background:${{cardBg}}; border:${{cardBorder}}; border-radius: 6px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px; transition: transform 0.15s ease;">
+          <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px;">
+            <b style="font-size:14px; color:${{isCompleted ? '#166534' : 'var(--ink)'}};">${{escapeHtml(q.name)}}</b>
+            <span style="font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; ${{badgeColor}}">${{badgeText}}</span>
+          </div>
+          <div style="font-size: 12px; color: ${{isCompleted ? '#15803d' : 'var(--ink)'}};">${{escapeHtml(q.objective)}}</div>
+          <div style="font-size: 11px; color: var(--muted); font-style: italic;">${{escapeHtml(q.rationale)}}</div>
+        </div>`;
+      }}).join('');
+    }}
+
+    function renderOperatorProfile() {{
+      const op = DATA.operator_profile || {{}};
+      document.getElementById('opAvgTurns').textContent = op.avg_turns || '0.0';
+      document.getElementById('opCmdFailure').textContent = `${{Math.round((op.cmd_failure_rate || 0) * 100)}}%`;
+      document.getElementById('opExplorBalance').textContent = `${{op.explore_ratio || 0.5}} Explore / ${{op.exploit_ratio || 0.5}} Exploit`;
+      document.getElementById('opAvgCost').textContent = money(op.avg_cost || 0.0);
+      document.getElementById('opRoleClass').textContent = op.role || 'General Software Engineer';
+
+      const recsDiv = document.getElementById('opRecommendations');
+      const recs = op.recommendations || [];
+      recsDiv.innerHTML = recs.map(rec => `
+        <div style="border-left: 3px solid var(--accent); background: #fafaf9; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); border-radius: 0 4px 4px 0; padding: 10px; font-size: 12px; line-height: 1.4;">
+          ${{escapeHtml(rec)}}
+        </div>
+      `).join('');
+    }}
+
+    function renderAll() {{ populateProjects(); renderKpis(); renderQuests(); renderOperatorProfile(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);

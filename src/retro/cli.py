@@ -61,6 +61,12 @@ memory_app = typer.Typer(
 )
 app.add_typer(memory_app, name="memory")
 
+quest_app = typer.Typer(
+    no_args_is_help=True,
+    help="Manage daily quests and streaks.",
+)
+app.add_typer(quest_app, name="quest")
+
 console = Console()
 
 
@@ -266,6 +272,15 @@ def _do_import(imp, identifier: str, *, force: bool, lay: Layout, render: bool) 
         dest = lay.rendered_path(result.host, result.session_id)
         n = render_file(result.normalized_path, dest)
         console.print(f"  rendered:   {dest}  ({n:,} bytes)")
+
+    try:
+        from .analyzer import check_operator_diagnostics
+        events = list(read_events(result.normalized_path))
+        tips = check_operator_diagnostics(events)
+        for tip in tips:
+            console.print(f"[yellow]{tip}[/yellow]")
+    except Exception:
+        pass
 
 
 def _import_many(
@@ -858,6 +873,114 @@ def _fmt_counts(counts: dict[str, int]) -> str:
     if not counts:
         return "-"
     return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+
+
+@app.callback()
+def callback(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """retro: local-first coding agent session capture and memory tool."""
+    # Print streak message on execution if in a TTY
+    if sys.stdout.isatty():
+        try:
+            from .quest import ensure_daily_quests, load_quest_state, save_quest_state
+            lay = default_layout(root or Path.cwd() / "rollout-memory")
+            state = load_quest_state(lay)
+            gen_new = ensure_daily_quests(lay, state)
+            if gen_new:
+                save_quest_state(lay, state)
+            
+            streak = state.get("streak_count", 0)
+            active_quests_count = sum(1 for q in state.get("daily_quests", []) if q["status"] == "active")
+            if active_quests_count > 0:
+                console.print(
+                    f"[bold teal]\\[retro][/bold teal] Streak: {streak} Days. "
+                    f"{active_quests_count} New Quests Available."
+                )
+        except Exception:
+            pass
+
+
+@quest_app.command("list")
+def quest_list(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """List active daily quests, progression, and streak count."""
+    from .quest import ensure_daily_quests, load_quest_state, save_quest_state
+    lay = _layout(root)
+    state = load_quest_state(lay)
+    ensure_daily_quests(lay, state)
+    save_quest_state(lay, state)
+
+    console.print()
+    console.print("[bold teal]Operator Ranks & Progression[/bold teal]")
+    console.print(f"  Current Rank:   [bold green]{state.get('user_level')}[/bold green]")
+    console.print(f"  Streak Count:   [bold yellow]{state.get('streak_count')} Days[/bold yellow]")
+    console.print(f"  Streak Freezes: [bold cyan]{state.get('streak_freezes', 0)}[/bold cyan]")
+    console.print(f"  Experience:     [bold]{state.get('experience_points')} XP[/bold]")
+    console.print()
+
+    console.print("[bold]Active Daily Quests:[/bold]")
+    quests = state.get("daily_quests", [])
+    if not quests:
+        console.print("  No quests available.")
+    else:
+        for q in quests:
+            is_comp = q["status"] == "completed"
+            status_str = "[green]Completed[/green]" if is_comp else "[yellow]Active[/yellow]"
+            console.print(f"  • [bold]{q['name']}[/bold] ({status_str})")
+            console.print(f"    Objective: {q['objective']}")
+            console.print(f"    Rationale: {q['rationale']}")
+            console.print()
+
+
+@quest_app.command("verify")
+def quest_verify(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """Run local metrics checks to verify active daily quests."""
+    from .quest import load_quest_state, save_quest_state, verify_quests
+    lay = _layout(root)
+    state = load_quest_state(lay)
+
+    report = verify_quests(lay, state)
+    save_quest_state(lay, state)
+
+    console.print()
+    console.print("[bold teal]Quest Verification Summary[/bold teal]")
+    console.print()
+
+    for q, verified, reason in report["results"]:
+        status_str = "[green]✓ Verified[/green]" if verified else "[red]✗ Not Verified[/red]"
+        console.print(f"  • [bold]{q['name']}[/bold]: {status_str}")
+        console.print(f"    {reason}")
+        console.print()
+
+    if report["xp_gained"] > 0:
+        console.print(f"[bold green]+{report['xp_gained']} XP Gained![/bold green]")
+        console.print(
+            f"New Experience: [bold]{report['new_xp']} XP[/bold] "
+            f"(Rank: [bold]{report['new_level']}[/bold])"
+        )
+        for q_id in report["now_completed_ids"]:
+            console.print(f"Completed Quest: [bold]{q_id}[/bold]")
+    else:
+        console.print("No quests verified this run. Keep working on them!")
+    console.print()
+
+
+@quest_app.command("buy-freeze")
+def quest_buy_freeze(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """Purchase a Streak Freeze to protect your streak on inactive days (costs 200 XP)."""
+    from .quest import buy_streak_freeze, load_quest_state, save_quest_state
+    lay = _layout(root)
+    state = load_quest_state(lay)
+
+    msg = buy_streak_freeze(state)
+    save_quest_state(lay, state)
+    console.print(msg)
 
 
 if __name__ == "__main__":

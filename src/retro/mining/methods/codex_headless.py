@@ -8,11 +8,10 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
+from ...llm import call_codex_headless
 from ..base import (
     MemoryCandidate,
     MiningContext,
@@ -40,59 +39,19 @@ def mine_codex_headless(ctx: MiningContext) -> MiningResult:
     schema = _response_schema()
     capture_path = _headless_capture_path(ctx)
 
-    with tempfile.TemporaryDirectory(prefix="retro-codex-headless-") as td:
-        tmp = Path(td)
-        schema_path = tmp / "schema.json"
-        response_path = tmp / "response.json"
-        schema_path.write_text(json.dumps(schema, indent=2), encoding="utf-8")
+    try:
+        response = call_codex_headless(
+            prompt=prompt,
+            schema=schema,
+            cwd=ctx.origin_repo(),
+            timeout=900,
+            capture_path=capture_path,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"codex headless mining failed: {exc}") from exc
 
-        cmd = [
-            "codex",
-            "-a",
-            "never",
-            "exec",
-            "--json",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--output-schema",
-            str(schema_path),
-            "-o",
-            str(response_path),
-            "-",
-        ]
-        cwd = ctx.origin_repo()
-        if cwd and Path(cwd).exists():
-            cmd[3:3] = ["-C", cwd]
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                input=prompt,
-                text=True,
-                capture_output=True,
-                timeout=900,
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise RuntimeError("`codex` executable was not found on PATH") from exc
-        except subprocess.TimeoutExpired as exc:
-            _write_headless_capture(capture_path, exc.stdout or "", exc.stderr or "")
-            raise RuntimeError("codex headless mining timed out") from exc
-
-        _write_headless_capture(capture_path, proc.stdout, proc.stderr)
-        if proc.returncode != 0:
-            raise RuntimeError(
-                f"codex headless mining failed with exit {proc.returncode}; "
-                f"capture={capture_path}"
-            )
-        if not response_path.exists():
-            raise RuntimeError(f"codex headless produced no final response; capture={capture_path}")
-
-        try:
-            response = json.loads(response_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"codex headless final response was not JSON; capture={capture_path}") from exc
+    if not isinstance(response, dict):
+        raise RuntimeError(f"codex headless mining did not return a JSON object; capture={capture_path}")
 
     candidates = _candidates_from_response(ctx, response)
     if not candidates:
@@ -323,19 +282,3 @@ def _clamp_float(value, lo: float, hi: float, default: float) -> float:
 def _headless_capture_path(ctx: MiningContext) -> Path:
     root = ctx.artifact_root() or Path.cwd() / "rollout-memory"
     return root / "headless" / METHOD / ctx.host / f"{ctx.session_id}.codex.jsonl"
-
-
-def _write_headless_capture(path: Path, stdout: str | bytes | None, stderr: str | bytes | None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(stdout, bytes):
-        stdout_text = stdout.decode("utf-8", errors="replace")
-    else:
-        stdout_text = stdout or ""
-    if isinstance(stderr, bytes):
-        stderr_text = stderr.decode("utf-8", errors="replace")
-    else:
-        stderr_text = stderr or ""
-    text = stdout_text
-    if stderr_text.strip():
-        text += "\n" + json.dumps({"type": "stderr", "text": stderr_text}, ensure_ascii=False) + "\n"
-    path.write_text(text, encoding="utf-8")

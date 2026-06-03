@@ -422,3 +422,152 @@ def render_console_report(stats: dict[str, Any]) -> None:
         trans_table.add_row(from_type, to_type, f"{count:,}")
 
     console.print(trans_table)
+
+
+def check_operator_diagnostics(events: list[NormalizedEvent]) -> list[str]:
+    """Check a single session for operator anti-patterns and return a list of non-intrusive tips."""
+    tips = []
+
+    # 1. Turn count check
+    user_msgs = sum(1 for e in events if e.event_type == "message" and e.actor == "user")
+    if user_msgs > 35:
+        tips.append(
+            "[retro tip] This session took many turns. Splitting large features into smaller "
+            "sub-tasks in fresh sessions can save up to 40% in token usage!"
+        )
+
+    # 2. Context bloat / excessive grep scans
+    grep_count = 0
+    for e in events:
+        if e.event_type == "command" and e.actor == "assistant":
+            payload = e.payload or {}
+            cmd = (payload.get("command") or payload.get("cmd") or "").lower()
+            if any(x in cmd for x in ("grep", "rg", "find", "fd", "ag")):
+                grep_count += 1
+    if grep_count > 10:
+        tips.append(
+            "[retro tip] Excessive search/grep commands detected. Consider creating an AGENTS.md "
+            "or .cursorrules file to document the repository structure and key entry points."
+        )
+
+    # 3. High command failure rate
+    total_cmds = 0
+    failed_cmds = 0
+    for e in events:
+        if e.event_type in {"tool_result", "command"} and e.actor == "tool":
+            total_cmds += 1
+            if _is_failed(e):
+                failed_cmds += 1
+    if total_cmds > 5 and (failed_cmds / total_cmds) > 0.3:
+        tips.append(
+            "[retro tip] High command failure rate detected (over 30%). "
+            "Try aligning on a plan in planning mode "
+            "before running code edits to avoid loop behavior."
+        )
+
+    return tips
+
+
+def analyze_operator_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Analyze the operator's portfolio of sessions and return stats and recommendations."""
+    if not sessions:
+        return {
+            "avg_turns": 0.0,
+            "cmd_failure_rate": 0.0,
+            "explore_ratio": 0.0,
+            "exploit_ratio": 0.0,
+            "avg_cost": 0.0,
+            "role": "General Software Engineer",
+            "recommendations": [],
+        }
+
+    total_sessions = len(sessions)
+    avg_turns = sum(s.get("user_messages", 0) for s in sessions) / total_sessions
+
+    total_cmds = sum(s.get("command_events", 0) for s in sessions)
+    total_fails = sum(s.get("failed_events", 0) for s in sessions)
+    cmd_failure_rate = total_fails / total_cmds if total_cmds > 0 else 0.0
+
+    explore_ratios = []
+    exploit_ratios = []
+    for s in sessions:
+        sig_idx = s.get("signals_index") or {}
+        exp_val = sig_idx.get("trajectory_exploration_ratio")
+        ept_val = sig_idx.get("trajectory_exploitation_ratio")
+        if exp_val is not None:
+            explore_ratios.append(exp_val)
+        if ept_val is not None:
+            exploit_ratios.append(ept_val)
+
+    explore_ratio = sum(explore_ratios) / len(explore_ratios) if explore_ratios else 0.5
+    exploit_ratio = sum(exploit_ratios) / len(exploit_ratios) if exploit_ratios else 0.5
+
+    avg_cost = sum(s.get("estimated_cost_usd") or 0.0 for s in sessions) / total_sessions
+
+    # Role classification based on command / tool names
+    tool_counts: Counter[str] = Counter()
+    for s in sessions:
+        for t in s.get("top_tools") or []:
+            tool_counts[t["name"]] += t["count"]
+
+    sys_score = sum(
+        tool_counts[k]
+        for k in ("cargo", "go", "make", "docker", "gcc", "clang", "git_worktree")
+    )
+    ds_score = sum(
+        tool_counts[k]
+        for k in ("python", "python3", "jupyter", "pandas", "numpy", "conda")
+    )
+    fe_score = sum(
+        tool_counts[k]
+        for k in ("npm", "node", "tsc", "vite", "eslint", "prettier", "yarn", "pnpm")
+    )
+
+    if sys_score > ds_score and sys_score > fe_score:
+        role = "Systems Programmer"
+    elif ds_score > sys_score and ds_score > fe_score:
+        role = "Data Scientist / ML Engineer"
+    elif fe_score > sys_score and fe_score > ds_score:
+        role = "Frontend Engineer"
+    else:
+        role = "General Software Engineer"
+
+    recommendations = []
+
+    # 1. Context Bloat
+    if explore_ratio > 0.65:
+        recommendations.append(
+            "High exploration ratio detected. Consider creating an AGENTS.md or .cursorrules file "
+            "in your repository root to document entry points, which will reduce redundant file scans."
+        )
+
+    # 2. Session Lifespan
+    if avg_turns > 25:
+        recommendations.append(
+            "Your sessions average over 25 turns, which leads to context bloat and higher token costs. "
+            "Try splitting large feature tickets into smaller tasks in fresh sessions."
+        )
+
+    # 3. High failure rate
+    if cmd_failure_rate > 0.20:
+        recommendations.append(
+            "More than 20% of commands run are failing. To save tokens and avoid loops, "
+            "try aligning on a plan upfront or using verification commands before running edits."
+        )
+
+    # 4. Standard check
+    if not recommendations:
+        recommendations.append(
+            "Your operator hygiene is excellent! Keep maintaining short, focused sessions and "
+            "writing clear plans."
+        )
+
+    return {
+        "avg_turns": round(avg_turns, 1),
+        "cmd_failure_rate": round(cmd_failure_rate, 3),
+        "explore_ratio": round(explore_ratio, 3),
+        "exploit_ratio": round(exploit_ratio, 3),
+        "avg_cost": round(avg_cost, 4),
+        "role": role,
+        "recommendations": recommendations,
+    }
