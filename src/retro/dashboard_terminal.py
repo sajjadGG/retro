@@ -939,6 +939,125 @@ def show_signal_aggregates(data: dict[str, Any]) -> None:
             break
 
 
+def show_accounting_costs(data: dict[str, Any]) -> None:
+    """Render the Accounting & Costs TUI view."""
+    while True:
+        clear_screen()
+        summary = data.get("summary", {})
+        cats = summary.get("cost_categories") or {
+            "input": 0.0,
+            "cache_create": 0.0,
+            "cache_read": 0.0,
+            "output": 0.0,
+        }
+
+        # KPIs grid
+        kpi_table = Table.grid(expand=True, padding=1)
+        kpi_table.add_column(ratio=1)
+        kpi_table.add_column(ratio=1)
+        kpi_table.add_column(ratio=1)
+        kpi_table.add_column(ratio=1)
+
+        input_panel = Panel(
+            f"[bold]{format_money(cats.get('input'))}[/bold]", title="Input Cost"
+        )
+        cc_panel = Panel(
+            f"[bold]{format_money(cats.get('cache_create'))}[/bold]",
+            title="Cache Create Cost",
+        )
+        cr_panel = Panel(
+            f"[bold]{format_money(cats.get('cache_read'))}[/bold]",
+            title="Cache Read Cost",
+        )
+        output_panel = Panel(
+            f"[bold]{format_money(cats.get('output'))}[/bold]", title="Output Cost"
+        )
+
+        kpi_table.add_row(input_panel, cc_panel, cr_panel, output_panel)
+
+        console.print(
+            Panel(
+                kpi_table,
+                title="[bold green]Accounting & Costs Summary[/bold green]",
+                subtitle=f"Total Cost: [bold]{format_money(summary.get('estimated_cost_usd'))}[/bold]",
+            )
+        )
+        console.print()
+
+        # Legend
+        console.print(
+            "Legend: [blue]█[/blue] Input  "
+            "[orange3]█[/orange3] Cache Create  "
+            "[yellow]█[/yellow] Cache Read  "
+            "[green]█[/green] Output"
+        )
+        console.print()
+
+        # Daily Table
+        table = Table(title="Daily Cost Breakdown")
+        table.add_column("Date", style="cyan", width=12)
+        table.add_column("Breakdown", width=35)
+        table.add_column("Input", justify="right", style="blue")
+        table.add_column("Cache Create", justify="right", style="orange3")
+        table.add_column("Cache Read", justify="right", style="yellow")
+        table.add_column("Output", justify="right", style="green")
+        table.add_column("Total Cost", justify="right", style="bold white")
+
+        by_day = summary.get("by_day", {})
+        for day, d in sorted(by_day.items()):
+            ci = d.get("cost_input", 0.0)
+            ccc = d.get("cost_cache_create", 0.0)
+            ccr = d.get("cost_cache_read", 0.0)
+            co = d.get("cost_output", 0.0)
+            total = d.get("cost", 0.0)
+
+            sum_cats = ci + ccc + ccr + co
+            width = 30
+            if sum_cats > 0:
+                ci_len = int(round((ci / sum_cats) * width))
+                ccc_len = int(round((ccc / sum_cats) * width))
+                ccr_len = int(round((ccr / sum_cats) * width))
+                # Adjust output length to keep total length constant
+                co_len = max(0, width - (ci_len + ccc_len + ccr_len))
+
+                # Handle minimal representations if cost is positive
+                if ci > 0 and ci_len == 0:
+                    ci_len = 1
+                if ccc > 0 and ccc_len == 0:
+                    ccc_len = 1
+                if ccr > 0 and ccr_len == 0:
+                    ccr_len = 1
+                if co > 0 and co_len == 0:
+                    co_len = 1
+
+                bar_str = (
+                    "[blue]" + "█" * ci_len + "[/blue]"
+                    + "[orange3]" + "█" * ccc_len + "[/orange3]"
+                    + "[yellow]" + "█" * ccr_len + "[/yellow]"
+                    + "[green]" + "█" * co_len + "[/green]"
+                )
+            else:
+                bar_str = "[dim]░" * width + "[/dim]"
+
+            table.add_row(
+                day,
+                bar_str,
+                format_money(ci),
+                format_money(ccc),
+                format_money(ccr),
+                format_money(co),
+                format_money(total),
+            )
+
+        console.print(table)
+        console.print()
+        console.print("  [bold]b[/bold] Back to main menu")
+        console.print()
+        choice = input("Choice: ").strip().lower()
+        if choice == "b":
+            break
+
+
 def run_terminal_dashboard(mode: str = "auto") -> None:
     """Main runner for the terminal dashboard."""
     data = load_dashboard_data(mode)
@@ -960,6 +1079,7 @@ def run_terminal_dashboard(mode: str = "auto") -> None:
         # Main menu options
         console.print("Main Menu:")
         console.print("  [bold]s[/bold]  Browse Sessions List")
+        console.print("  [bold]c[/bold]  Accounting & Costs")
         console.print("  [bold]m[/bold]  Mined Memory Aggregates")
         console.print("  [bold]a[/bold]  All Memories Browser")
         console.print("  [bold]g[/bold]  Signal Aggregates")
@@ -972,6 +1092,8 @@ def run_terminal_dashboard(mode: str = "auto") -> None:
             break
         elif choice in ("s", "sessions"):
             show_session_list(data)
+        elif choice in ("c", "costs", "accounting"):
+            show_accounting_costs(data)
         elif choice in ("m", "memory", "aggregates"):
             show_memory_aggregates(data)
         elif choice in ("a", "all-memories"):

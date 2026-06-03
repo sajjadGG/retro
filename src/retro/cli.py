@@ -656,5 +656,22 @@ def dashboard_view(
     run_terminal_dashboard(mode=mode)
 
 
+@app.command("analyze")
+def analyze(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Analyze command and tool call patterns across imported sessions."""
+    from .analyzer import analyze_sessions, generate_report, render_console_report
+
+    lay = _layout(root)
+    stats = analyze_sessions(lay)
+    render_console_report(stats)
+
+    report_path = lay.root / "analysis_report.md"
+    generate_report(stats, report_path)
+    console.print()
+    console.print(f"[green]Wrote analysis report to:[/green] [bold]{report_path}[/bold]")
+
+
 if __name__ == "__main__":
     app()

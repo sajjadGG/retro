@@ -338,6 +338,10 @@ def analyze_session(
         "cost_model": choose_cost_model(provider, host, models),
         "estimated_cost_usd": cost_breakdown["total"],
         "cost_by_model": cost_breakdown["by_model"],
+        "cost_categories": cost_breakdown.get(
+            "categories",
+            {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
+        ),
         "cost_mode_used": cost_breakdown["mode_used"],
         "cost_source": cost_breakdown["source"],
         "cost_note": pricing.source_note(),
@@ -359,6 +363,10 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             "edits": 0,
             "sessions_claude": 0,
             "sessions_codex": 0,
+            "cost_input": 0.0,
+            "cost_cache_create": 0.0,
+            "cost_cache_read": 0.0,
+            "cost_output": 0.0,
         }
     )
     by_host = Counter(s["host"] for s in sessions)
@@ -378,6 +386,13 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         by_day[day]["tool_calls"] += session.get("tool_call_events", 0)
         by_day[day]["edits"] += session.get("file_edit_events", 0)
 
+        # Accumulate daily breakdown
+        cats = session.get("cost_categories") or {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
+        by_day[day]["cost_input"] += cats.get("input", 0.0)
+        by_day[day]["cost_cache_create"] += cats.get("cache_create", 0.0)
+        by_day[day]["cost_cache_read"] += cats.get("cache_read", 0.0)
+        by_day[day]["cost_output"] += cats.get("output", 0.0)
+
         totals["events"] += session["event_count"]
         totals["user_messages"] += session["user_messages"]
         totals["assistant_messages"] += session["assistant_messages"]
@@ -390,8 +405,25 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         totals["unknown_events"] += session["unknown_events"]
         totals["tokens"] += session["tokens"].get("total_tokens", 0)
         total_cost += session.get("estimated_cost_usd") or 0.0
+
+        # Accumulate global totals
+        totals["cost_input"] += cats.get("input", 0.0)
+        totals["cost_cache_create"] += cats.get("cache_create", 0.0)
+        totals["cost_cache_read"] += cats.get("cache_read", 0.0)
+        totals["cost_output"] += cats.get("output", 0.0)
+
         if session.get("duration_seconds") is not None:
             durations.append(session["duration_seconds"])
+
+    # Round daily metrics
+    sorted_by_day = {}
+    for day, metrics in sorted(by_day.items()):
+        metrics["cost"] = round(metrics["cost"], 6)
+        metrics["cost_input"] = round(metrics["cost_input"], 6)
+        metrics["cost_cache_create"] = round(metrics["cost_cache_create"], 6)
+        metrics["cost_cache_read"] = round(metrics["cost_cache_read"], 6)
+        metrics["cost_output"] = round(metrics["cost_output"], 6)
+        sorted_by_day[day] = metrics
 
     return {
         "session_count": len(sessions),
@@ -400,9 +432,15 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "sessions_with_cost_estimate": sum(1 for s in sessions if s.get("estimated_cost_usd") is not None),
         "active_days": len([d for d in by_day if d != "unknown"]),
         "by_host": dict(by_host),
-        "by_day": dict(sorted(by_day.items())),
+        "by_day": sorted_by_day,
         "totals": dict(totals),
-        "estimated_cost_usd": total_cost,
+        "estimated_cost_usd": round(total_cost, 6),
+        "cost_categories": {
+            "input": round(totals["cost_input"], 6),
+            "cache_create": round(totals["cost_cache_create"], 6),
+            "cache_read": round(totals["cost_cache_read"], 6),
+            "output": round(totals["cost_output"], 6),
+        },
         "avg_duration_seconds": int(sum(durations) / len(durations)) if durations else None,
         "avg_events_per_session": round(totals["events"] / len(sessions), 1) if sessions else 0,
         "avg_tool_calls_per_session": round(totals["tool_calls"] / len(sessions), 1) if sessions else 0,
@@ -713,46 +751,108 @@ def compute_cost(
         {
           "total": float | None,
           "by_model": {model: float},
+          "categories": {"input": float, "cache_create": float, "cache_read": float, "output": float},
           "mode_used": "auto"|"calculate"|"display",
           "source": "embedded"|"calculated"|"empty"
         }
-
-    - In `display` mode we only return embedded `costUSD` (None when missing).
-    - In `auto` mode embedded cost wins when present; otherwise we compute.
-    - In `calculate` mode we always compute, ignoring any embedded value.
     """
     embedded = token_stats.get("embedded_cost_usd")
+    by_model_tokens = token_stats.get("by_model") or {}
+
+    # Helper to calculate calc-based category breakdown for scaling/display
+    calc_categories = {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
+    calc_total = 0.0
+    if by_model_tokens:
+        for model, bucket in by_model_tokens.items():
+            rates = pricing.rates_for(model)
+            details = _cost_one_model_detailed(bucket, rates, host)
+            calc_total += details["total"]
+            for k in calc_categories:
+                calc_categories[k] += details[k]
+
     if mode == COST_MODE_DISPLAY:
+        embedded_val = float(embedded) if isinstance(embedded, (int, float)) else None
+        if embedded_val is not None:
+            if calc_total > 0:
+                ratio = embedded_val / calc_total
+                categories = {k: round(v * ratio, 6) for k, v in calc_categories.items()}
+            else:
+                categories = {"input": round(embedded_val, 6), "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
+        else:
+            categories = {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
         return {
             "total": round(float(embedded), 6) if isinstance(embedded, (int, float)) else None,
             "by_model": {},
+            "categories": categories,
             "mode_used": mode,
             "source": "embedded" if isinstance(embedded, (int, float)) else "empty",
         }
+
     if mode == COST_MODE_AUTO and isinstance(embedded, (int, float)):
+        embedded_val = float(embedded)
+        if calc_total > 0:
+            ratio = embedded_val / calc_total
+            categories = {k: round(v * ratio, 6) for k, v in calc_categories.items()}
+        else:
+            categories = {"input": round(embedded_val, 6), "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
         return {
-            "total": round(float(embedded), 6),
+            "total": round(embedded_val, 6),
             "by_model": {},
+            "categories": categories,
             "mode_used": mode,
             "source": "embedded",
         }
 
-    by_model_tokens = token_stats.get("by_model") or {}
     if not by_model_tokens:
-        return {"total": None, "by_model": {}, "mode_used": mode, "source": "empty"}
+        return {
+            "total": None,
+            "by_model": {},
+            "categories": {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0},
+            "mode_used": mode,
+            "source": "empty",
+        }
 
     cost_by_model: dict[str, float] = {}
+    categories = {"input": 0.0, "cache_create": 0.0, "cache_read": 0.0, "output": 0.0}
     total = 0.0
     for model, bucket in by_model_tokens.items():
         rates = pricing.rates_for(model)
-        cost = _cost_one_model(bucket, rates, host)
-        cost_by_model[model] = round(cost, 6)
-        total += cost
+        details = _cost_one_model_detailed(bucket, rates, host)
+        cost_by_model[model] = details["total"]
+        total += details["total"]
+        for k in categories:
+            categories[k] += details[k]
+
     return {
         "total": round(total, 6),
         "by_model": cost_by_model,
+        "categories": {k: round(v, 6) for k, v in categories.items()},
         "mode_used": mode,
         "source": "calculated",
+    }
+
+
+def _cost_one_model_detailed(bucket: dict[str, int], rates: dict[str, float], host: str) -> dict[str, float]:
+    """Calculate detailed costs for single model by categories."""
+    input_tokens = bucket.get("input_tokens", 0)
+    cached_tokens = bucket.get("cached_input_tokens", 0)
+    cache_create = bucket.get("cache_creation_tokens", 0)
+    output_tokens = bucket.get("output_tokens", 0)
+    if host == "codex":
+        input_tokens = max(0, input_tokens - cached_tokens)
+
+    input_cost = (input_tokens * rates.get("input", 0.0)) / 1_000_000
+    cache_create_cost = (cache_create * rates.get("cache_create", 0.0)) / 1_000_000
+    cache_read_cost = (cached_tokens * rates.get("cache_read", 0.0)) / 1_000_000
+    output_cost = (output_tokens * rates.get("output", 0.0)) / 1_000_000
+    total = input_cost + cache_create_cost + cache_read_cost + output_cost
+
+    return {
+        "input": input_cost,
+        "cache_create": cache_create_cost,
+        "cache_read": cache_read_cost,
+        "output": output_cost,
+        "total": total,
     }
 
 
@@ -1061,6 +1161,10 @@ def render_html(payload: dict[str, Any]) -> str:
       --host-codex-line: #93c5fd;
       --warn: #b45309;
       --bad: #b91c1c;
+      --cost-input: #2563eb;
+      --cost-cache-create: #ea580c;
+      --cost-cache-read: #eab308;
+      --cost-output: #16a34a;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
@@ -1112,6 +1216,9 @@ def render_html(payload: dict[str, Any]) -> str:
     .barrow {{ display: grid; grid-template-columns: 92px 1fr 60px; gap: 8px; align-items: center; font-size: 12px; }}
     .bar {{ height: 8px; border-radius: 999px; background: #e5e4dc; overflow: hidden; }}
     .bar > span {{ display: block; height: 100%; background: var(--accent); }}
+    .cost-stacked-bar {{ display: flex; height: 16px; border-radius: 4px; overflow: hidden; background: #e5e4dc; width: 100%; }}
+    .cost-stacked-bar .seg {{ height: 100%; transition: opacity 0.15s ease; cursor: pointer; }}
+    .cost-stacked-bar .seg:hover {{ opacity: 0.85; }}
     .signal-aggs {{ padding: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }}
     .sigcard {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: #fff; }}
     .sigcard .name {{ font-size: 12px; color: var(--muted); }}
@@ -1218,6 +1325,33 @@ def render_html(payload: dict[str, Any]) -> str:
     <section class="panel">
       <h2>Activity By Day · <span style="color:var(--host-claude)">Claude</span> + <span style="color:var(--host-codex)">Codex</span></h2>
       <div class="bars" id="dayBars"></div>
+    </section>
+    <section class="panel" id="accountingPanel">
+      <h2>Accounting &amp; Costs</h2>
+      <div class="legend">
+        <span><span class="dot" style="background:var(--cost-input)"></span> Input</span>
+        <span><span class="dot" style="background:var(--cost-cache-create)"></span> Cache Create</span>
+        <span><span class="dot" style="background:var(--cost-cache-read)"></span> Cache Read</span>
+        <span><span class="dot" style="background:var(--cost-output)"></span> Output</span>
+      </div>
+      <div class="metrics" style="grid-template-columns: repeat(4, 1fr); padding: 12px 12px 6px;">
+        <div class="metric"><div class="label">Total Input Cost</div><div class="value" id="accInputCost">$0.0000</div></div>
+        <div class="metric"><div class="label">Total Cache Create Cost</div><div class="value" id="accCacheCreateCost">$0.0000</div></div>
+        <div class="metric"><div class="label">Total Cache Read Cost</div><div class="value" id="accCacheReadCost">$0.0000</div></div>
+        <div class="metric"><div class="label">Total Output Cost</div><div class="value" id="accOutputCost">$0.0000</div></div>
+      </div>
+      <div class="scroll" style="max-height: 400px; padding: 0 12px 12px;">
+        <table id="accountingTable">
+          <thead>
+            <tr>
+              <th style="width: 120px;">Date</th>
+              <th>Cost breakdown by category (Input / Cache Create / Cache Read / Output)</th>
+              <th style="width: 100px; text-align: right;">Total Cost</th>
+            </tr>
+          </thead>
+          <tbody id="accountingRows"></tbody>
+        </table>
+      </div>
     </section>
     <section class="controls">
       <input id="search" placeholder="Search title, id, host, file..." />
@@ -1735,7 +1869,46 @@ def render_html(payload: dict[str, Any]) -> str:
       }}, null, 2);
     }}
 
-    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderRows(); renderDetail(); }}
+    function renderAccounting() {{
+      const cats = DATA.summary.cost_categories || {{input: 0, cache_create: 0, cache_read: 0, output: 0}};
+      document.getElementById('accInputCost').textContent = money(cats.input);
+      document.getElementById('accCacheCreateCost').textContent = money(cats.cache_create);
+      document.getElementById('accCacheReadCost').textContent = money(cats.cache_read);
+      document.getElementById('accOutputCost').textContent = money(cats.output);
+
+      const days = Object.entries(DATA.summary.by_day || {{}});
+      document.getElementById('accountingRows').innerHTML = days.map(([day, d]) => {{
+        const total = d.cost || 0;
+        const ci = d.cost_input || 0;
+        const ccc = d.cost_cache_create || 0;
+        const ccr = d.cost_cache_read || 0;
+        const co = d.cost_output || 0;
+        const sum = ci + ccc + ccr + co;
+
+        let ciPct = 0, cccPct = 0, ccrPct = 0, coPct = 0;
+        if (sum > 0) {{
+          ciPct = (ci / sum) * 100;
+          cccPct = (ccc / sum) * 100;
+          ccrPct = (ccr / sum) * 100;
+          coPct = (co / sum) * 100;
+        }}
+
+        return `<tr>
+          <td><b>${{day}}</b></td>
+          <td>
+            <div class="cost-stacked-bar">
+              ${{ci > 0 ? `<div class="seg" style="width:${{ciPct}}%; background:var(--cost-input);" title="Input: ${{money(ci)}} (${{ciPct.toFixed(1)}}%)"></div>` : ''}}
+              ${{ccc > 0 ? `<div class="seg" style="width:${{cccPct}}%; background:var(--cost-cache-create);" title="Cache Create: ${{money(ccc)}} (${{cccPct.toFixed(1)}}%)"></div>` : ''}}
+              ${{ccr > 0 ? `<div class="seg" style="width:${{ccrPct}}%; background:var(--cost-cache-read);" title="Cache Read: ${{money(ccr)}} (${{ccrPct.toFixed(1)}}%)"></div>` : ''}}
+              ${{co > 0 ? `<div class="seg" style="width:${{coPct}}%; background:var(--cost-output);" title="Output: ${{money(co)}} (${{coPct.toFixed(1)}}%)"></div>` : ''}}
+            </div>
+          </td>
+          <td style="text-align: right;"><b>${{money(total)}}</b></td>
+        </tr>`;
+      }}).join('');
+    }}
+
+    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderRows(); renderDetail(); }}
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);

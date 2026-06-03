@@ -65,3 +65,11 @@ def test_dashboard_view_non_interactive():
     assert "Retro Rollout Dashboard" in result.output or "Retro Portfolio Dashboard" in result.output
     assert "Imported Sessions Summary" in result.output
 
+
+def test_analyze_command(tmp_path):
+    result = runner.invoke(app, ["analyze", "--root", str(tmp_path / "rollout-memory")])
+    assert result.exit_code == 0
+    assert "Retro Command & Tool Call Analysis" in result.output
+    assert "Wrote analysis report to:" in result.output
+
+

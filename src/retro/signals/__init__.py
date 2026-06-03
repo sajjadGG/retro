@@ -12,6 +12,7 @@ See `specs/rollout_signals_spec.md`.
 from . import (
     external,  # noqa: F401
     heuristics,  # noqa: F401
+    trajectory,  # noqa: F401
 )
 from .base import (  # noqa: F401
     REGISTRY,
