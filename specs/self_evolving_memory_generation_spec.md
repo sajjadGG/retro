@@ -209,11 +209,7 @@ Add a canonical self-evolving memory store:
 rollout-memory/memories/
   items.jsonl                         # all accepted/candidate memory records
   events.jsonl                        # memory lifecycle log
-  indexes/
-    by_repo.json
-    by_user.json
-    by_kind.json
-    by_skill.json
+  index.sqlite                        # derived SQLite/FTS index; rebuildable
   skills/
     <skill-id>/SKILL.md               # optional exported Codex-compatible skill
     <skill-id>/references/*.md
@@ -626,23 +622,25 @@ Responsibilities:
 
 - append/update `items.jsonl`,
 - write lifecycle events,
-- build simple indexes,
+- build the derived SQLite/FTS index,
 - deduplicate by content hash + scope + kind,
 - preserve source provenance.
 
 ### Phase 4: Retrieval And Weaving
 
-Add:
+Implemented in:
 
 ```text
-src/retro/memory_retrieval.py
-src/retro/memory_weaver.py
+src/retro/memory_store.py
 ```
 
 Commands:
 
 ```bash
-retro memory list --cwd /path/to/repo
+retro memory init
+retro memory reindex
+retro memory doctor
+retro memory import-authored /path/to/markdown
 retro memory retrieve --query "..." --cwd /path/to/repo
 retro memory weave --query "..." --cwd /path/to/repo
 retro memory update-utility --memory-id ... --reward 0.8 --session-id ...
@@ -688,4 +686,3 @@ Add dashboard sections:
 - Do not require FAISS, LangChain, vLLM, Ray, or benchmark environments for local use.
 - Do not vendor MemP, SkillRL, MemRL, SkillNet, SkillZero, or MemGen into this repo.
 - Do not inject memories automatically into live Codex/Claude sessions until retrieval risk controls exist.
-

@@ -133,7 +133,11 @@ def _register_category_signals() -> None:
                 REGISTRY[signal_name],
                 len(hits),
                 evidence=_evidence(hits),
-                metadata={"category": category, "total_steps": len(steps), "first_step_indices": [s.index for s in hits[:8]]},
+                metadata={
+                    "category": category,
+                    "total_steps": len(steps),
+                    "first_step_indices": [s.index for s in hits[:8]],
+                },
             )
 
         @register(
@@ -152,7 +156,11 @@ def _register_category_signals() -> None:
                 REGISTRY[signal_name],
                 value,
                 evidence=_evidence(hits),
-                metadata={"category": category, "total_steps": len(steps), "first_step_indices": [s.index for s in hits[:8]]},
+                metadata={
+                    "category": category,
+                    "total_steps": len(steps),
+                    "first_step_indices": [s.index for s in hits[:8]],
+                },
             )
 
 
@@ -190,7 +198,7 @@ def _trajectory_action_redundancy(ctx: SessionContext):
 def _trajectory_consecutive_repetition_count(ctx: SessionContext):
     steps = _steps(ctx)
     hits = []
-    for prev, cur in zip(steps, steps[1:]):
+    for prev, cur in zip(steps, steps[1:], strict=False):
         if (
             prev.action_fingerprint_key == cur.action_fingerprint_key
             or prev.action_category == cur.action_category
@@ -294,7 +302,9 @@ def _trajectory_sequence_entropy(ctx: SessionContext):
 )
 def _trajectory_phase_transition_count(ctx: SessionContext):
     steps = _steps(ctx)
-    value = sum(1 for a, b in zip(steps, steps[1:]) if a.action_category != b.action_category)
+    value = sum(
+        1 for a, b in zip(steps, steps[1:], strict=False) if a.action_category != b.action_category
+    )
     return reading(ctx, _trajectory_phase_transition_count, value)
 
 
@@ -405,13 +415,16 @@ def _trajectory_premature_finish_without_validation(ctx: SessionContext):
     group="risk",
     kind="numeric",
     unit="count",
-    description="Repeated fix/test cycles where validation appears to keep failing without exploration between cycles.",
+    description=(
+        "Repeated fix/test cycles where validation appears to keep failing "
+        "without exploration between cycles."
+    ),
 )
 def _trajectory_test_fix_loop_count(ctx: SessionContext):
     steps = _steps(ctx)
     count = 0
     evidence_steps = []
-    for a, b, c, d in zip(steps, steps[1:], steps[2:], steps[3:]):
+    for a, b, c, d in zip(steps, steps[1:], steps[2:], steps[3:], strict=False):
         if (
             a.action_category == "generate_fix"
             and b.action_category == "run_tests"
@@ -470,7 +483,7 @@ def _trajectory_failed_result_recovery_steps(ctx: SessionContext):
 def _trajectory_failure_ignored_count(ctx: SessionContext):
     steps = _steps(ctx)
     hits = []
-    for step, later in zip(steps, steps[1:]):
+    for step, later in zip(steps, steps[1:], strict=False):
         if not result_is_failed_text(step.result_text):
             continue
         if (
@@ -499,7 +512,7 @@ def _trajectory_result_token_reuse_ratio(ctx: SessionContext):
     eligible = 0
     reused = 0
     examples = []
-    for step, later in zip(steps, steps[1:]):
+    for step, later in zip(steps, steps[1:], strict=False):
         terms = _salient_terms(step.result_text)
         if not terms:
             continue
@@ -529,7 +542,7 @@ def _trajectory_error_to_search_or_edit_ratio(ctx: SessionContext):
     steps = _steps(ctx)
     failures = 0
     recovered = 0
-    for step, later in zip(steps, steps[1:]):
+    for step, later in zip(steps, steps[1:], strict=False):
         if not result_is_failed_text(step.result_text):
             continue
         failures += 1
@@ -583,8 +596,12 @@ def _trajectory_balance_score(ctx: SessionContext):
     steps = _steps(ctx)
     if not steps:
         return reading(ctx, _trajectory_balance_score, 0.0)
-    explore = sum(1 for s in steps if s.action_category in {"explore", "search", "locate", "explain"}) / len(steps)
-    exploit = sum(1 for s in steps if s.action_category in {"reproduce", "generate_fix", "run_tests", "refactor"}) / len(steps)
+    explore = sum(
+        1 for s in steps if s.action_category in {"explore", "search", "locate", "explain"}
+    ) / len(steps)
+    exploit = sum(
+        1 for s in steps if s.action_category in {"reproduce", "generate_fix", "run_tests", "refactor"}
+    ) / len(steps)
     return reading(ctx, _trajectory_balance_score, round(1 - abs(explore - exploit), 4))
 
 

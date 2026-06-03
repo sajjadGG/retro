@@ -26,8 +26,20 @@ class Layout:
     def mined_prompt_path(self, host: Host, session_id: str, method: str) -> Path:
         return self.root / "mined" / method / host / f"{session_id}.prompt.md"
 
+    def memories_dir(self) -> Path:
+        return self.root / "memories"
+
+    def memory_items_path(self) -> Path:
+        return self.memories_dir() / "items.jsonl"
+
+    def memory_events_path(self) -> Path:
+        return self.memories_dir() / "events.jsonl"
+
+    def memory_index_path(self) -> Path:
+        return self.memories_dir() / "index.sqlite"
+
     def ensure(self) -> None:
-        for sub in ("raw", "normalized", "rendered", "mined"):
+        for sub in ("raw", "normalized", "rendered", "mined", "memories"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_imported(self, host: Host) -> list[str]:

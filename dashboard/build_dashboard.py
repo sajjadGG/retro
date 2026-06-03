@@ -18,11 +18,12 @@ import argparse
 import json
 import os
 import re
+import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_ROOT = ROOT / "rollout-memory"
@@ -79,7 +80,7 @@ class PricingMap:
         self.defaults = defaults
 
     @classmethod
-    def load(cls, snapshot_path: Path = PRICING_SNAPSHOT) -> "PricingMap":
+    def load(cls, snapshot_path: Path = PRICING_SNAPSHOT) -> PricingMap:
         snapshot: dict[str, Any] = {}
         if snapshot_path.exists():
             try:
@@ -272,7 +273,6 @@ def analyze_session(
     rate_limit_count = 0
     for event in events:
         etype = event.get("event_type")
-        payload = event.get("payload") or {}
         name = tool_name(event)
         if name:
             tool_names[name] += 1
@@ -532,6 +532,7 @@ def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "sessions_with_memory": sessions_with_memory,
         "candidate_count": candidate_count,
+        "index": summarize_memory_index(),
         "by_method": dict(by_method.most_common()),
         "by_kind": dict(by_kind.most_common()),
         "by_scope": dict(by_scope.most_common()),
@@ -540,6 +541,62 @@ def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "top_candidates": top[:12],
         "all_candidates": all_candidates,  # full list for the "All Memories" tab
     }
+
+
+def summarize_memory_index() -> dict[str, Any]:
+    index_path = ARTIFACT_ROOT / "memories" / "index.sqlite"
+    empty = {
+        "available": False,
+        "memory_count": 0,
+        "by_kind": {},
+        "by_scope": {},
+        "by_status": {},
+        "top_utility": [],
+        "lifecycle": [],
+    }
+    if not index_path.exists():
+        return empty
+    con = sqlite3.connect(index_path)
+    con.row_factory = sqlite3.Row
+    try:
+        return {
+            "available": True,
+            "memory_count": con.execute("SELECT COUNT(*) FROM memory").fetchone()[0],
+            "by_kind": _db_counts(con, "kind"),
+            "by_scope": _db_counts(con, "scope"),
+            "by_status": _db_counts(con, "status"),
+            "top_utility": [
+                dict(row)
+                for row in con.execute(
+                    """
+                    SELECT id, kind, scope, status, q_value, hits, successes, failures, text
+                    FROM memory
+                    ORDER BY q_value DESC, hits DESC, priority DESC
+                    LIMIT 10
+                    """
+                ).fetchall()
+            ],
+            "lifecycle": [
+                dict(row)
+                for row in con.execute(
+                    """
+                    SELECT event, COUNT(*) AS count
+                    FROM memory_event
+                    GROUP BY event
+                    ORDER BY count DESC
+                    """
+                ).fetchall()
+            ],
+        }
+    except sqlite3.DatabaseError:
+        return empty
+    finally:
+        con.close()
+
+
+def _db_counts(con: sqlite3.Connection, column: str) -> dict[str, int]:
+    rows = con.execute(f"SELECT {column}, COUNT(*) AS count FROM memory GROUP BY {column}").fetchall()
+    return {row[0]: row["count"] for row in rows}
 
 
 _BUCKET_KEYS = (
@@ -1521,9 +1578,10 @@ def render_html(payload: dict[str, Any]) -> str:
 
     function renderMemoryAggregates() {{
       const mem = DATA.memory || {{}};
+      const index = mem.index || {{}};
       const grid = document.getElementById('memoryGrid');
       const panel = document.getElementById('memoryPanel');
-      if (!mem.candidate_count) {{
+      if (!mem.candidate_count && !index.memory_count) {{
         panel.style.display = 'none';
         return;
       }}
@@ -1538,7 +1596,18 @@ def render_html(payload: dict[str, Any]) -> str:
         <h3>Overview</h3>
         <div class="mem-row"><span class="label">Sessions with mined memory</span><span class="val">${{fmt.format(mem.sessions_with_memory || 0)}}</span></div>
         <div class="mem-row"><span class="label">Total candidates</span><span class="val">${{fmt.format(mem.candidate_count || 0)}}</span></div>
+        <div class="mem-row"><span class="label">Indexed memories</span><span class="val">${{fmt.format(index.memory_count || 0)}}</span></div>
       </div>`);
+
+      if (index.available) {{
+        const statusRows = Object.entries(index.by_status || {{}}).map(([status, n]) => `
+          <div class="mem-row"><span class="label">${{status}}</span><span class="val">${{fmt.format(n)}}</span></div>
+        `).join('');
+        const scopeRows = Object.entries(index.by_scope || {{}}).map(([scope, n]) => `
+          <div class="mem-row"><span class="label">${{scope}}</span><span class="val">${{fmt.format(n)}}</span></div>
+        `).join('');
+        blocks.push(`<div class="mem-block"><h3>SQLite index</h3>${{statusRows || '<div class="mem-meta">no statuses</div>'}}<div style="height:8px"></div>${{scopeRows}}</div>`);
+      }}
 
       // Block 2: by method.
       const methodRows = Object.entries(byMethod).map(([name, n]) => `
@@ -1575,6 +1644,23 @@ def render_html(payload: dict[str, Any]) -> str:
         </div>
       `).join('');
       blocks.push(`<div class="mem-block" style="grid-column: span 2;"><h3>Top candidates</h3>${{topRows || '<div class="mem-meta">none</div>'}}</div>`);
+
+      if (index.available) {{
+        const utilityRows = (index.top_utility || []).slice(0, 6).map(c => `
+          <div style="margin-top:6px; padding:6px 0; border-top: 1px solid var(--line);">
+            <div class="mem-row">
+              <span class="label"><span class="mem-kind ${{c.kind}}">${{c.kind}}</span> ${{escapeHtml(c.id)}}</span>
+              <span class="mem-meta">q=${{Number(c.q_value || 0).toFixed(2)}} · hits=${{c.hits || 0}}</span>
+            </div>
+            <div class="mem-meta" style="margin-top:3px">${{escapeHtml(c.text).slice(0, 140)}}</div>
+          </div>
+        `).join('');
+        const lifecycleRows = (index.lifecycle || []).map(e => `
+          <div class="mem-row"><span class="label">${{e.event}}</span><span class="val">${{fmt.format(e.count || 0)}}</span></div>
+        `).join('');
+        blocks.push(`<div class="mem-block" style="grid-column: span 2;"><h3>Top utility</h3>${{utilityRows || '<div class="mem-meta">none</div>'}}</div>`);
+        blocks.push(`<div class="mem-block"><h3>Lifecycle</h3>${{lifecycleRows || '<div class="mem-meta">no events</div>'}}</div>`);
+      }}
 
       grid.innerHTML = blocks.join('');
     }}

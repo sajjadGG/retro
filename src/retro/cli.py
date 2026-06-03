@@ -55,6 +55,12 @@ dashboard_app = typer.Typer(
 )
 app.add_typer(dashboard_app, name="dashboard")
 
+memory_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and query the local memory index.",
+)
+app.add_typer(memory_app, name="memory")
+
 console = Console()
 
 
@@ -671,6 +677,187 @@ def analyze(
     generate_report(stats, report_path)
     console.print()
     console.print(f"[green]Wrote analysis report to:[/green] [bold]{report_path}[/bold]")
+
+
+# ---- memory -----------------------------------------------------------------
+
+
+@memory_app.command("init")
+def memory_init(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Create the memory directory and empty SQLite index."""
+    from .memory_store import init
+
+    lay = _layout(root)
+    init(lay)
+    console.print(f"[green]memory index ready:[/green] {lay.memory_index_path()}")
+
+
+@memory_app.command("reindex")
+def memory_reindex(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Rebuild index.sqlite from flat-file memory sources."""
+    from .memory_store import reindex
+
+    lay = _layout(root)
+    report = reindex(lay)
+    console.print(f"[green]indexed {report.indexed} memories[/green]")
+    console.print(f"  items.jsonl records: {report.source_records}")
+    console.print(f"  mined artifacts:     {report.mined_records}")
+    console.print(f"  evidence refs:       {report.evidence_refs}")
+    console.print(f"  wiki links:          {report.links}")
+    console.print(f"  sqlite:              {lay.memory_index_path()}")
+
+
+@memory_app.command("doctor")
+def memory_doctor(
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Report memory index health and counts."""
+    from .memory_store import doctor
+
+    lay = _layout(root)
+    report = doctor(lay)
+    console.print(f"[bold]Memory index[/bold] {lay.memory_index_path()}")
+    console.print(f"  memories:       {report.memory_count}")
+    console.print(f"  statuses:       {_fmt_counts(report.counts_by_status)}")
+    console.print(f"  scopes:         {_fmt_counts(report.counts_by_scope)}")
+    console.print(f"  kinds:          {_fmt_counts(report.counts_by_kind)}")
+    console.print(f"  dangling links: {report.dangling_links}")
+    console.print(f"  sqlite-vec:     {'available' if report.sqlite_vec else 'not loaded'}")
+
+
+@memory_app.command("import-authored")
+def memory_import_authored(
+    directory: Path = typer.Argument(..., help="Directory of markdown memory files"),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Import authored markdown memories into the flat-file memory log."""
+    from .memory_store import import_authored
+
+    lay = _layout(root)
+    report = import_authored(lay, directory)
+    console.print(f"[green]imported {report.imported} authored memories[/green]")
+    if report.skipped:
+        console.print(f"  skipped: {report.skipped}")
+    console.print(f"  source:  {lay.memory_items_path()}")
+    console.print(f"  sqlite:  {lay.memory_index_path()}")
+
+
+@memory_app.command("retrieve")
+def memory_retrieve(
+    query: str = typer.Option(..., "--query", "-q", help="Search query"),
+    cwd: Path | None = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
+    limit: int = typer.Option(10, "--limit", "-n", help="Maximum memories to return"),
+    include_candidates: bool = typer.Option(
+        True,
+        "--include-candidates/--accepted-only",
+        help="Include candidate memories while the promotion workflow is being built.",
+    ),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Retrieve ranked memories from FTS5 keyword recall."""
+    from .memory_store import retrieve
+
+    lay = _layout(root)
+    rows = retrieve(
+        lay,
+        query,
+        cwd=str(cwd.resolve()) if cwd else None,
+        limit=limit,
+        include_candidates=include_candidates,
+    )
+    if not rows:
+        console.print("[yellow]No matching memories.[/yellow]")
+        raise typer.Exit(0)
+
+    table = Table(title=f"Memory recall: {query!r}")
+    table.add_column("#", justify="right")
+    table.add_column("score")
+    table.add_column("kind")
+    table.add_column("scope")
+    table.add_column("status")
+    table.add_column("memory")
+    for row in rows:
+        table.add_row(
+            str(row.rank),
+            f"{row.score:.3f}",
+            row.kind,
+            row.scope,
+            row.status,
+            row.text,
+        )
+    console.print(table)
+
+
+@memory_app.command("weave")
+def memory_weave(
+    query: str = typer.Option(..., "--query", "-q", help="Search query"),
+    cwd: Path | None = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
+    limit: int = typer.Option(6, "--limit", "-n", help="Maximum memories to include"),
+    include_candidates: bool = typer.Option(
+        True,
+        "--include-candidates/--accepted-only",
+        help="Include candidate memories while the promotion workflow is being built.",
+    ),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Emit a compact prompt-time memory block."""
+    from .memory_store import weave
+
+    lay = _layout(root)
+    result = weave(
+        lay,
+        query,
+        cwd=str(cwd.resolve()) if cwd else None,
+        limit=limit,
+        include_candidates=include_candidates,
+    )
+    block = result.to_markdown()
+    if not block:
+        console.print("[yellow]No matching memories.[/yellow]")
+        raise typer.Exit(0)
+    console.print(block)
+
+
+@memory_app.command("update-utility")
+def memory_update_utility(
+    memory_id: str = typer.Option(..., "--memory-id", help="Memory id to update"),
+    reward: float = typer.Option(..., "--reward", help="Reward in [0, 1]"),
+    session_id: str | None = typer.Option(None, "--session-id", help="Session that used the memory"),
+    reason: str | None = typer.Option(None, "--reason", help="Optional update reason"),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Append a utility event and update q_value."""
+    from .memory_store import update_utility
+
+    lay = _layout(root)
+    try:
+        report = update_utility(
+            lay,
+            memory_id,
+            reward,
+            session_id=session_id,
+            reason=reason,
+        )
+    except KeyError:
+        console.print(f"[red]No memory found with id {memory_id!r}[/red]")
+        raise typer.Exit(1) from None
+    console.print(
+        f"[green]updated {report.memory_id}[/green] "
+        f"q={report.old_q_value:.3f} → {report.new_q_value:.3f}"
+    )
+    console.print(
+        f"  hits={report.hits} successes={report.successes} failures={report.failures}"
+    )
+
+
+def _fmt_counts(counts: dict[str, int]) -> str:
+    if not counts:
+        return "-"
+    return ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
 
 
 if __name__ == "__main__":

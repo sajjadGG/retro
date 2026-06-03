@@ -14,6 +14,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [`full_rollout_capture_feature_spec.md`](specs/full_rollout_capture_feature_spec.md) — the capture contract.
 - [`rollout_signals_spec.md`](specs/rollout_signals_spec.md) — what signals are and how they aggregate.
 - [`rollout_mining_methods.md`](specs/rollout_mining_methods.md) — the catalog of mining methods.
+- [`memory_storage_backend_spec.md`](specs/memory_storage_backend_spec.md) — SQLite memory index over flat files.
 - [`rollout_dashboard_spec.md`](specs/rollout_dashboard_spec.md) — the dashboard.
 - [`ccusage_comparison_spec.md`](specs/ccusage_comparison_spec.md) — gap analysis vs. ccusage.
 
@@ -27,6 +28,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Capture](#capture)
 - [Signals](#signals)
 - [Mining](#mining)
+- [Memory backend](#memory-backend)
 - [Dashboard](#dashboard)
 - [Pricing snapshot](#pricing-snapshot)
 - [Release and publishing](#release-and-publishing)
@@ -62,15 +64,15 @@ The PyPI distribution is named `retro-agent-memory` because `retro` is already o
 
 ```
                   ┌──────────────────────────────────────────────────────────┐
-                  │                  retro CLI                │
-                  ├──────────────┬─────────────┬──────────────┬───────────────┤
-   ~/.claude  ──▶ │  importers   │   signals   │    mining    │   storage     │
-   ~/.codex   ──▶ │  (claude,    │  (heuristic │  (4 methods, │   layout      │
-                  │   codex)     │  + external)│  + filters)  │               │
-                  └──────┬───────┴──────┬──────┴───────┬──────┴──────┬────────┘
-                         ▼              ▼              ▼             ▼
-                       raw/        normalized/      mined/         signals/
-                  (immutable)    (events.jsonl)   (per method)   (readings)
+                  │                       retro CLI                       │
+                  ├──────────────┬─────────────┬──────────────┬───────────┤
+   ~/.claude  ──▶ │  importers   │   signals   │    mining    │  memory   │
+   ~/.codex   ──▶ │  (claude,    │  (heuristic │  (4 methods, │  index    │
+                  │   codex)     │  + external)│  + filters)  │  + weave  │
+                  └──────┬───────┴──────┬──────┴───────┬──────┴─────┬─────┘
+                         ▼              ▼              ▼            ▼
+                       raw/        normalized/      mined/      memories/
+                  (immutable)    (events.jsonl)   (per method) (files + SQLite)
                          │
                          ▼
                      rendered/   ← markdown view (any time)
@@ -80,7 +82,7 @@ The PyPI distribution is named `retro-agent-memory` because `retro` is already o
                   (static HTML + KPIs + per-model cost + signals + drill-down)
 ```
 
-Each stage is independent — you can re-render markdown, recompute signals, re-mine, or rebuild the dashboard from whatever `rollout-memory/` already has on disk.
+Each stage is independent — you can re-render markdown, recompute signals, re-mine, rebuild the memory index, or rebuild the dashboard from whatever `rollout-memory/` already has on disk.
 
 ---
 
@@ -108,6 +110,11 @@ rollout-memory/
     readings.jsonl                            # one row per (session, signal)
     aggregates.json                           # rolled-up stats per signal
     summary.md                                # human view
+
+  memories/
+    items.jsonl                               # canonical appended memory records
+    events.jsonl                              # memory lifecycle / utility log
+    index.sqlite                              # derived SQLite + FTS index, rebuildable
 ```
 
 `raw/` is treated as **immutable**: re-importing the same session refuses unless `--force` is passed.
@@ -335,6 +342,69 @@ Import it in `mining/methods/__init__.py`. `retro methods` and `--method` pick i
 
 ---
 
+## Memory backend
+
+The memory backend turns mined and authored memories into a local SQLite index. Flat files remain the source of truth; `index.sqlite` is a derived cache that can be deleted and rebuilt.
+
+The index currently supports:
+
+- SQLite schema bootstrap with FTS5 keyword recall.
+- Reindexing from `rollout-memory/memories/items.jsonl` and existing mined artifacts.
+- `[[wiki-link]]` edge extraction and one-hop linked-memory expansion.
+- Authored markdown import with simple frontmatter.
+- Keyword retrieval with scope/repo filtering and value-aware reranking.
+- Utility updates through `memories/events.jsonl`.
+- Prompt-time context weaving.
+- Dashboard counts for indexed memory, status/scope/kind, top utility, and lifecycle events.
+
+### Commands
+
+```bash
+# Create rollout-memory/memories/ and an empty index
+retro memory init
+
+# Rebuild index.sqlite from files and mined artifacts
+retro memory reindex
+
+# Inspect index counts and dangling wiki-links
+retro memory doctor
+
+# Import hand-authored markdown memories
+retro memory import-authored ~/path/to/memory-notes
+
+# Retrieve ranked memories; include candidates by default while promotion matures
+retro memory retrieve --query "pytest retrieval" --cwd /path/to/repo
+retro memory retrieve --query "pytest retrieval" --cwd /path/to/repo --accepted-only
+
+# Emit a compact prompt block
+retro memory weave --query "pytest retrieval" --cwd /path/to/repo
+
+# Update observed utility after a memory is used
+retro memory update-utility --memory-id <id> --reward 0.8 --session-id <session-id>
+```
+
+### Authored markdown
+
+Authored memories are normal markdown files. Frontmatter is optional; missing fields get conservative defaults.
+
+```markdown
+---
+id: pytest-policy
+kind: tool_lesson
+scope: global
+status: accepted
+risk: low
+when_to_use: Use when editing tests.
+---
+Run pytest after changing retrieval. Link to [[debugging-policy]] when relevant.
+```
+
+Accepted memories that contain prompt-injection markers, credential-looking strings, or invisible control characters are downgraded to `needs_review` on write.
+
+Optional embeddings are still intentionally out of the core path for now; keyword retrieval works with no native dependencies.
+
+---
+
 ## Dashboard
 
 A static, local HTML dashboard reads everything under `rollout-memory/` and produces:
@@ -344,6 +414,7 @@ A static, local HTML dashboard reads everything under `rollout-memory/` and prod
 - Activity-by-day bars.
 - Searchable / filterable session table.
 - Per-session drill-down with tabs: **Summary**, **Models**, **Signals**, **Transcript**, **Memory**.
+- Indexed memory sections for counts, top utility, lifecycle events, and source-session drill-downs when `retro memory reindex` has been run.
 
 The **Models** tab shows the per-model token + cost breakdown (input / cache_create / cache_read / output / total / cost) for each session.
 

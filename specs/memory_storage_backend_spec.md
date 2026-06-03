@@ -1,6 +1,6 @@
 # Memory Storage & Retrieval Backend Spec
 
-Status: proposed
+Status: partially implemented
 Author: drafted with Claude Code. The Hermes row in the comparative section is
 web-verified (sources linked inline); the remaining systems are from model
 knowledge (Jan 2026 cutoff) plus the repo's own `agent_rollout_memory_landscape.md`
@@ -10,9 +10,9 @@ and are not all individually re-fetched.
 
 `self_evolving_memory_generation_spec.md` defines *what* a memory is (procedure,
 skill, case, failure_trigger, …), its lifecycle (build → retrieve → evaluate →
-update → prune → export), and a flat-file store (`memories/items.jsonl` +
-`indexes/*.json`). It explicitly leaves the query engine as "lexical overlap or
-SQLite FTS when available, optional embedding search later."
+update → prune → export), and a flat-file store (`memories/items.jsonl` plus
+`memories/events.jsonl`). This spec supplies the derived SQLite query engine for
+that source of truth.
 
 This spec fills that gap. It answers the open question directly: **is the
 flat-file design scalable, or do we need a database — and if so, which one?**
@@ -345,23 +345,25 @@ machines where it differs.
 
 ## Implementation Plan
 
-Phase 1 — `src/retro/memory_store.py`: schema bootstrap, `init`, upsert-by-hash,
+Phase 1 — **implemented** in `src/retro/memory_store.py`: schema bootstrap, `init`, upsert-by-hash,
 file-then-DB write helper, `reindex`. Tests on a temp `rollout-memory/`.
 
-Phase 2 — FTS + recall: populate `memory_fts`, Phase-A recall queries, RRF fusion,
+Phase 2 — **implemented**: populate `memory_fts`, Phase-A recall queries, RRF fusion,
 `retro memory retrieve` (keyword-only first; correct without embeddings).
 
-Phase 3 — link graph + authored import: `memory_link`, one-hop expansion,
+Phase 3 — **implemented**: `memory_link`, one-hop expansion,
 `import-authored`, dangling-link reporting in `doctor`.
 
-Phase 4 — embeddings: provider abstraction, `memory_vec`, sqlite-vec path +
+Phase 4 — **future**: embeddings: provider abstraction, `memory_vec`, sqlite-vec path +
 pure-Python brute-force fallback, incremental re-embed in `reindex`.
 
-Phase 5 — value rerank + utility writes: Phase-B `ORDER BY`, `update-utility`,
-fold lifecycle events; wire `reward` from `experimental_trajectory_signals_spec.md`.
+Phase 5 — **partially implemented**: value rerank, `update-utility`, lifecycle event replay,
+and security scan before `accepted`. The remaining work is the optional vector score and deeper
+reward wiring from `experimental_trajectory_signals_spec.md`.
 
-Phase 6 — dashboard: counts by kind/status/scope, top-utility, deprecated,
-skills-needing-review, lifecycle timeline (the parent spec's Phase 6, now SQL).
+Phase 6 — **partially implemented**: dashboard counts by kind/status/scope, top utility,
+lifecycle counts, and `retro memory weave`. Remaining work is exported-skill progressive
+disclosure.
 
 ## Acceptance Criteria
 
@@ -375,9 +377,9 @@ skills-needing-review, lifecycle timeline (the parent spec's Phase 6, now SQL).
   `doctor` reports the degraded mode.
 - `memory_link` resolves `[[wiki-links]]`; a retrieved memory pulls in its one-hop
   linked cluster.
-- Value rerank reproduces the parent spec's weighted score as a single SQL
-  `ORDER BY`; `update-utility` changes `q_value` per `q_new = q_old + 0.2*(reward
-  - q_old)` and is reflected on next retrieve.
+- Value rerank uses the parent spec's weighted score; `update-utility` changes
+  `q_value` per `q_new = q_old + 0.2*(reward - q_old)` and is reflected on next
+  retrieve.
 - No secret-flagged memory is promoted to `accepted` (unchanged guard from parent
   spec; enforced at write time, not just at mine time).
 - Installs and runs with **no native dependencies** (numpy, sqlite-vec both

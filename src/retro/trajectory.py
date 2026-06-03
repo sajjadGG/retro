@@ -329,9 +329,16 @@ def _looks_locate(hay: str) -> bool:
 
 
 def _looks_test(text: str) -> bool:
+    test_commands = (
+        r"\b("
+        r"pytest|npm (?:run )?test|pnpm (?:run )?test|yarn (?:run )?test|"
+        r"go test|cargo test|mvn test|gradle test|tox|tsc|mypy|ruff|eslint|"
+        r"pre-commit|make (?:check|test)"
+        r")\b"
+    )
     return bool(
         re.search(
-            r"\b(pytest|npm (?:run )?test|pnpm (?:run )?test|yarn (?:run )?test|go test|cargo test|mvn test|gradle test|tox|tsc|mypy|ruff|eslint|pre-commit|make (?:check|test))\b",
+            test_commands,
             text,
             re.IGNORECASE,
         )

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from retro.analyzer import (
-    get_base_command,
-    extract_command_line,
     _is_failed,
     analyze_sessions,
+    extract_command_line,
     generate_report,
+    get_base_command,
 )
 from retro.schema import NormalizedEvent, RawRef
 
