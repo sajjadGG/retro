@@ -1,5 +1,7 @@
 # retro Project Wiki
 
+![retro logo](assets/retro_logo.png)
+
 `retro` captures Codex and Claude Code agent sessions, normalizes them into durable local artifacts, scores them with signals, mines reusable memory, and builds a static dashboard.
 
 This site is the onboarding hub for users and contributors.
@@ -22,6 +24,12 @@ raw/ -> normalized/ -> signals/ -> mined/ -> memories/ -> dashboard/
 ```
 
 Each stage reads from disk and can be re-run independently. Flat files remain canonical; SQLite and dashboard data are derived rebuildable artifacts.
+
+## Dashboard Preview
+
+![Retro dashboard overview](assets/dashboard-top.png)
+
+![Retro dashboard session drill-down](assets/dashboard-bottom.png)
 
 ## Source Documents
 
