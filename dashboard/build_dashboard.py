@@ -306,6 +306,41 @@ def analyze_session(
     mined = find_mined_artifacts(host, session_id)
     title = infer_title(events, raw_meta)
 
+    project_slug = raw_meta.get("project_slug")
+    cwd = raw_meta.get("cwd")
+    project_name = "unknown"
+    project_path = ""
+
+    if project_slug:
+        project_name = project_slug
+        abs_paths = []
+        for e in events:
+            payload = e.get("payload") or {}
+            paths = []
+            if "file_path" in payload:
+                paths.append(payload["file_path"])
+            elif "input" in payload and isinstance(payload["input"], dict) and "file_path" in payload["input"]:
+                paths.append(payload["input"]["file_path"])
+
+            for p in paths:
+                if isinstance(p, str) and p.startswith("/"):
+                    abs_paths.append(p)
+
+        if abs_paths:
+            found_path = ""
+            for p in abs_paths:
+                parts = p.split("/")
+                if project_slug in parts:
+                    idx = parts.index(project_slug)
+                    found_path = "/".join(parts[:idx + 1])
+                    break
+            if not found_path and abs_paths:
+                found_path = str(Path(abs_paths[0]).parent)
+            project_path = found_path
+    elif cwd:
+        project_path = cwd
+        project_name = Path(cwd).name or cwd
+
     return {
         "host": host,
         "session_id": session_id,
@@ -352,6 +387,8 @@ def analyze_session(
         "rendered_markdown": read_text(rendered_path, limit=1_000_000) if rendered_path.exists() else "",
         "raw_dir": rel(ARTIFACT_ROOT / "raw" / host / session_id),
         "mined": mined,
+        "project_name": project_name,
+        "project_path": project_path,
     }
 
 
@@ -430,6 +467,37 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         metrics["cost_output"] = round(metrics["cost_output"], 6)
         sorted_by_day[day] = metrics
 
+    proj_map: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "sessions": 0,
+            "tokens": 0,
+            "cost": 0.0,
+            "path": "",
+            "hosts": set(),
+        }
+    )
+    for session in sessions:
+        p_name = session.get("project_name") or "unknown"
+        p_path = session.get("project_path") or ""
+        proj_map[p_name]["sessions"] += 1
+        proj_map[p_name]["tokens"] += session["tokens"].get("total_tokens", 0)
+        proj_map[p_name]["cost"] += session.get("estimated_cost_usd") or 0.0
+        proj_map[p_name]["hosts"].add(session["host"])
+        if p_path:
+            proj_map[p_name]["path"] = p_path
+
+    projects_list = []
+    for name, p_data in proj_map.items():
+        projects_list.append({
+            "name": name,
+            "path": p_data["path"],
+            "sessions": p_data["sessions"],
+            "tokens": p_data["tokens"],
+            "cost": round(p_data["cost"], 6),
+            "hosts": sorted(list(p_data["hosts"])),
+        })
+    projects_list.sort(key=lambda p: p["sessions"], reverse=True)
+
     return {
         "session_count": len(sessions),
         "sessions_used_for_stats": len(sessions),
@@ -449,6 +517,8 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "avg_duration_seconds": int(sum(durations) / len(durations)) if durations else None,
         "avg_events_per_session": round(totals["events"] / len(sessions), 1) if sessions else 0,
         "avg_tool_calls_per_session": round(totals["tool_calls"] / len(sessions), 1) if sessions else 0,
+        "projects": projects_list,
+        "projects_count": len([p for p in projects_list if p["name"] != "unknown"]),
     }
 
 
@@ -1440,6 +1510,24 @@ def render_html(payload: dict[str, Any]) -> str:
         </table>
       </div>
     </section>
+    <section class="panel" id="projectsPanel">
+      <h2>Projects Grouping</h2>
+      <div class="scroll" style="max-height: 400px; padding: 0 12px 12px;">
+        <table id="projectsTable">
+          <thead>
+            <tr>
+              <th style="width: 200px;">Project Name</th>
+              <th>Path / Source</th>
+              <th style="width: 80px; text-align: right;">Sessions</th>
+              <th style="width: 120px; text-align: right;">Hosts</th>
+              <th style="width: 120px; text-align: right;">Total Tokens</th>
+              <th style="width: 100px; text-align: right;">Total Cost</th>
+            </tr>
+          </thead>
+          <tbody id="projectsRows"></tbody>
+        </table>
+      </div>
+    </section>
     <section class="panel" id="ceilingPanel">
       <h2>Ceiling Maximization &amp; Daily Quotas</h2>
       <div style="display: grid; grid-template-columns: 280px 1fr; gap: 20px; padding: 16px; flex-wrap: wrap;">
@@ -1493,6 +1581,9 @@ def render_html(payload: dict[str, Any]) -> str:
         <option value="all">All hosts</option>
         <option value="codex">Codex</option>
         <option value="claude-code">Claude Code</option>
+      </select>
+      <select id="projectFilter">
+        <option value="all">All projects</option>
       </select>
     </section>
     <section class="grid">
@@ -1549,6 +1640,7 @@ def render_html(payload: dict[str, Any]) -> str:
         kpi('With cost estimate', fmt.format(DATA.summary.sessions_with_cost_estimate || 0)),
         kpi('Secret-risk sessions', fmt.format(secretAgg.true_count || 0)),
         kpi('Active days', fmt.format(DATA.summary.active_days)),
+        kpi('Active projects', fmt.format(DATA.summary.projects?.length || 0)),
         kpi('Events', fmt.format(t.events || 0)),
         kpi('Tool calls', fmt.format(t.tool_calls || 0)),
         kpi('File edits', fmt.format(t.file_edits || 0)),
@@ -1706,9 +1798,11 @@ def render_html(payload: dict[str, Any]) -> str:
     function filteredSessions() {{
       const q = document.getElementById('search').value.toLowerCase();
       const host = document.getElementById('hostFilter').value;
+      const proj = document.getElementById('projectFilter').value;
       return DATA.sessions.filter(s => {{
         if (host !== 'all' && s.host !== host) return false;
-        const hay = [s.host, s.session_id, s.title, ...(s.files_touched || [])].join(' ').toLowerCase();
+        if (proj !== 'all' && (s.project_name || 'unknown') !== proj) return false;
+        const hay = [s.host, s.session_id, s.title, s.project_name || '', ...(s.files_touched || [])].join(' ').toLowerCase();
         return hay.includes(q);
       }});
     }}
@@ -2158,10 +2252,61 @@ def render_html(payload: dict[str, Any]) -> str:
       `;
     }}
 
-    function renderAll() {{ renderKpis(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
+    function renderProjects() {{
+      const projects = DATA.summary.projects || [];
+      document.getElementById('projectsRows').innerHTML = projects.map(p => {{
+        const pathSpan = p.path ? `<span class="path" title="${{escapeHtml(p.path)}}" style="font-family:monospace; font-size:11px;">${{escapeHtml(p.path)}}</span>` : '<span class="mem-meta">—</span>';
+        const hostsBadges = p.hosts.map(h => `<span class="badge ${{h}}">${{h}}</span>`).join(' ');
+        return `
+          <tr data-name="${{escapeHtml(p.name)}}" style="cursor: pointer;">
+            <td><b>${{escapeHtml(p.name)}}</b></td>
+            <td>${{pathSpan}}</td>
+            <td style="text-align: right;">${{fmt.format(p.sessions)}}</td>
+            <td style="text-align: right;">${{hostsBadges}}</td>
+            <td style="text-align: right;">${{fmt.format(p.tokens)}}</td>
+            <td style="text-align: right;">${{money(p.cost)}}</td>
+          </tr>
+        `;
+      }}).join('');
+      
+      document.querySelectorAll('#projectsRows tr').forEach(tr => tr.addEventListener('click', () => {{
+        const name = tr.dataset.name;
+        document.getElementById('projectFilter').value = name;
+        renderRows();
+      }}));
+    }}
+
+    function populateProjects() {{
+      const select = document.getElementById('projectFilter');
+      if (select.children.length > 1) return;
+      const projects = new Set();
+      DATA.sessions.forEach(s => {{
+        if (s.project_name && s.project_name !== 'unknown') {{
+          projects.add(s.project_name);
+        }}
+      }});
+      const hasUnknown = DATA.sessions.some(s => !s.project_name || s.project_name === 'unknown');
+      
+      const sorted = Array.from(projects).sort();
+      sorted.forEach(p => {{
+        const opt = document.createElement('option');
+        opt.value = p;
+        opt.textContent = p;
+        select.appendChild(opt);
+      }});
+      if (hasUnknown) {{
+        const opt = document.createElement('option');
+        opt.value = 'unknown';
+        opt.textContent = 'Unknown Project';
+        select.appendChild(opt);
+      }}
+    }}
+
+    function renderAll() {{ populateProjects(); renderKpis(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);
+    document.getElementById('projectFilter').addEventListener('change', renderRows);
     document.getElementById('tabSummary').addEventListener('click', () => {{ activeTab='summary'; renderDetail(); }});
     document.getElementById('tabModels').addEventListener('click', () => {{ activeTab='models'; renderDetail(); }});
     document.getElementById('tabSignals').addEventListener('click', () => {{ activeTab='signals'; renderDetail(); }});

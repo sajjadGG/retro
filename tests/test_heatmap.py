@@ -92,3 +92,75 @@ def test_summarize_portfolio_accumulates_rate_limits():
     assert summary["totals"]["rate_limit_hits"] == 3
     assert summary["by_day"]["2026-06-01"]["rate_limit_hits"] == 3
 
+
+def test_analyze_session_extracts_project_info_codex():
+    from unittest.mock import patch
+    pricing = PricingMap({}, {})
+    events: list[dict[str, Any]] = []
+    
+    with patch("dashboard.build_dashboard.read_raw_meta") as mock_read:
+        mock_read.return_value = {"cwd": "/Users/sajad/Dev/repos/Mem"}
+        res = analyze_session(
+            host="codex",
+            session_id="s1",
+            normalized_path=Path("/tmp/s1.jsonl"),
+            events=events,
+            pricing=pricing,
+        )
+        assert res["project_name"] == "Mem"
+        assert res["project_path"] == "/Users/sajad/Dev/repos/Mem"
+
+
+def test_analyze_session_extracts_project_info_claude():
+    from unittest.mock import patch
+    pricing = PricingMap({}, {})
+    events: list[dict[str, Any]] = [
+        {
+            "event_type": "file_read",
+            "actor": "assistant",
+            "payload": {"file_path": "/Users/sajad/Dev/repos/Mem/src/retro/schema.py"}
+        }
+    ]
+    
+    with patch("dashboard.build_dashboard.read_raw_meta") as mock_read:
+        mock_read.return_value = {"project_slug": "Mem"}
+        res = analyze_session(
+            host="claude-code",
+            session_id="s1",
+            normalized_path=Path("/tmp/s1.jsonl"),
+            events=events,
+            pricing=pricing,
+        )
+        assert res["project_name"] == "Mem"
+        assert res["project_path"] == "/Users/sajad/Dev/repos/Mem"
+
+
+def test_summarize_portfolio_groups_projects():
+    s1 = _make_session("2026-06-01", "codex", "s1", 100, 0)
+    s1["project_name"] = "Mem"
+    s1["project_path"] = "/Users/sajad/Dev/repos/Mem"
+    s1["estimated_cost_usd"] = 0.05
+
+    s2 = _make_session("2026-06-01", "claude-code", "s2", 200, 0)
+    s2["project_name"] = "Mem"
+    s2["project_path"] = "/Users/sajad/Dev/repos/Mem"
+    s2["estimated_cost_usd"] = 0.10
+
+    s3 = _make_session("2026-06-01", "codex", "s3", 50, 0)
+    s3["project_name"] = "other"
+    s3["project_path"] = "/Users/sajad/Dev/repos/other"
+    s3["estimated_cost_usd"] = 0.01
+
+    summary = summarize_portfolio([s1, s2, s3])
+    
+    assert summary["projects_count"] == 2
+    projs = {p["name"]: p for p in summary["projects"]}
+    assert "Mem" in projs
+    assert "other" in projs
+    
+    assert projs["Mem"]["sessions"] == 2
+    assert projs["Mem"]["tokens"] == 300
+    assert projs["Mem"]["cost"] == 0.15
+    assert projs["Mem"]["hosts"] == ["claude-code", "codex"]
+    assert projs["Mem"]["path"] == "/Users/sajad/Dev/repos/Mem"
+

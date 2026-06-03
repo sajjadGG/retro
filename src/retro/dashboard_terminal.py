@@ -218,7 +218,7 @@ def show_portfolio_kpis(data: dict[str, Any]) -> None:
     console.print()
 
 
-def show_session_list(data: dict[str, Any]) -> None:
+def show_session_list(data: dict[str, Any], project_filter: str | None = None) -> None:
     """Interactive loop for browsing sessions list."""
     sessions = data.get("sessions", [])
 
@@ -235,10 +235,13 @@ def show_session_list(data: dict[str, Any]) -> None:
         for s in sessions:
             if host_filter != "all" and s.get("host") != host_filter:
                 continue
+            if project_filter is not None and s.get("project_name") != project_filter:
+                continue
             if q:
                 files_str = " ".join(s.get("files_touched", []))
                 haystack = (
-                    f"{s.get('host', '')} {s.get('session_id', '')} {s.get('title', '')} {files_str}".lower()
+                    f"{s.get('host', '')} {s.get('session_id', '')} {s.get('title', '')} "
+                    f"{s.get('project_name', '')} {files_str}".lower()
                 )
                 if q not in haystack:
                     continue
@@ -253,8 +256,11 @@ def show_session_list(data: dict[str, Any]) -> None:
         page_sessions = filtered[start_idx:end_idx]
 
         # Draw Table
+        title_str = f"Sessions · showing {len(filtered)} of {len(sessions)}"
+        if project_filter:
+            title_str = f"Sessions for Project: {project_filter} · showing {len(filtered)}"
         table = Table(
-            title=f"Sessions · showing {len(filtered)} of {len(sessions)} (Page {page + 1}/{max_page + 1})"
+            title=f"{title_str} (Page {page + 1}/{max_page + 1})"
         )
         table.add_column("#", justify="center")
         table.add_column("Host", justify="center")
@@ -1111,6 +1117,52 @@ def show_accounting_costs(data: dict[str, Any]) -> None:
             break
 
 
+def show_projects_groups(data: dict[str, Any]) -> None:
+    """Interactive projects & groups TUI browser."""
+    summary = data.get("summary", {})
+    projects = summary.get("projects", [])
+
+    while True:
+        clear_screen()
+        # Draw Projects Table
+        table = Table(title=f"Projects Grouping · {len(projects)} active projects")
+        table.add_column("#", justify="center")
+        table.add_column("Project Name", style="bold green")
+        table.add_column("Path / Source", style="dim")
+        table.add_column("Hosts", justify="center")
+        table.add_column("Sessions", justify="right")
+        table.add_column("Total Tokens", justify="right")
+        table.add_column("Total Cost", justify="right")
+
+        for idx, p in enumerate(projects):
+            hosts_str = ", ".join(p.get("hosts", []))
+            table.add_row(
+                str(idx + 1),
+                p.get("name", "unknown"),
+                p.get("path", "") or "—",
+                hosts_str,
+                str(p.get("sessions", 0)),
+                f"{p.get('tokens', 0):,}",
+                format_money(p.get("cost")),
+            )
+
+        console.print(table)
+        console.print()
+        console.print("  [bold][number][/bold] Select a project to view its sessions")
+        console.print("  [bold]b[/bold]        Back to main menu")
+        console.print()
+
+        choice = input("Choice: ").strip().lower()
+        if choice == "b":
+            break
+
+        if choice.isdigit():
+            val = int(choice)
+            if 1 <= val <= len(projects):
+                selected_project = projects[val - 1]
+                show_session_list(data, project_filter=selected_project["name"])
+
+
 def run_terminal_dashboard(mode: str = "auto") -> None:
     """Main runner for the terminal dashboard."""
     data = load_dashboard_data(mode)
@@ -1132,6 +1184,7 @@ def run_terminal_dashboard(mode: str = "auto") -> None:
         # Main menu options
         console.print("Main Menu:")
         console.print("  [bold]s[/bold]  Browse Sessions List")
+        console.print("  [bold]p[/bold]  Browse Projects & Groups")
         console.print("  [bold]c[/bold]  Accounting & Costs")
         console.print("  [bold]m[/bold]  Mined Memory Aggregates")
         console.print("  [bold]a[/bold]  All Memories Browser")
@@ -1145,6 +1198,8 @@ def run_terminal_dashboard(mode: str = "auto") -> None:
             break
         elif choice in ("s", "sessions"):
             show_session_list(data)
+        elif choice in ("p", "projects", "groups"):
+            show_projects_groups(data)
         elif choice in ("c", "costs", "accounting"):
             show_accounting_costs(data)
         elif choice in ("m", "memory", "aggregates"):

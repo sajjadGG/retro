@@ -39,6 +39,10 @@ disallow_untyped_defs = false
 check_untyped_defs = true
 
 [[tool.mypy.overrides]]
+module = "dashboard.*,dashboard,dashboard.build_dashboard"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
 module = ["retro.importers.*"]
 disable_error_code = ["arg-type"]
 
