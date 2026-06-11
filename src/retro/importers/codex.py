@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from ..schema import NormalizedEvent, RawRef, write_events
+from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import iter_jsonl, truncate_summary
 from .base import ImportResult
@@ -34,14 +34,14 @@ LOGS_DB = CODEX_HOME / "logs_2.sqlite"
 RootKind = Literal["sqlite_home", "sessions_dir", "jsonl_dir"]
 
 # Codex tool/function name -> normalized event_type.
-_FUNCTION_TYPE_OVERRIDES: dict[str, str] = {
+_FUNCTION_TYPE_OVERRIDES: dict[str, EventType] = {
     "exec_command": "command",
     "shell": "command",
     "apply_patch": "file_edit",
     "read_file": "file_read",
     "view_image": "file_read",
 }
-_CUSTOM_TOOL_TYPE_OVERRIDES: dict[str, str] = {
+_CUSTOM_TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "apply_patch": "file_edit",
 }
 
@@ -96,7 +96,7 @@ def _classify_root(root: Path) -> RootKind:
 
 
 class CodexImporter:
-    host = "codex"
+    host: Host = "codex"
 
     def __init__(
         self,
@@ -315,7 +315,7 @@ class CodexImporter:
         events: list[NormalizedEvent] = []
         unknown = 0
         gaps: set[str] = set()
-        call_id_to_event_type: dict[str, str] = {}
+        call_id_to_event_type: dict[str, EventType] = {}
         call_id_to_name: dict[str, str] = {}
 
         for line_no, raw in iter_jsonl(rollout_path):
@@ -327,7 +327,7 @@ class CodexImporter:
             ptype = payload.get("type")
             event_id = f"{thread_id}:{line_no}"
             raw_ref = RawRef(path=str(rollout_path), line=line_no)
-            common = dict(
+            common: dict[str, Any] = dict(
                 event_id=event_id,
                 session_id=thread_id,
                 host="codex",
@@ -468,7 +468,7 @@ class CodexImporter:
         ptype: str | None,
         payload: dict[str, Any],
         common: dict[str, Any],
-        call_id_to_event_type: dict[str, str],
+        call_id_to_event_type: dict[str, EventType],
         call_id_to_name: dict[str, str],
     ) -> NormalizedEvent | None:
         if ptype == "message":
@@ -512,7 +512,7 @@ class CodexImporter:
             )
         if ptype == "function_call_output":
             call_id = payload.get("call_id")
-            name = call_id_to_name.get(call_id, "?")
+            name = call_id_to_name.get(call_id or "", "?")
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
@@ -540,7 +540,7 @@ class CodexImporter:
             )
         if ptype == "custom_tool_call_output":
             call_id = payload.get("call_id")
-            name = call_id_to_name.get(call_id, "?")
+            name = call_id_to_name.get(call_id or "", "?")
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",

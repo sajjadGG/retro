@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from dashboard.build_dashboard import (
+from retro.dashboard_build import (
     PricingMap,
     _is_rate_limit_hit,
     analyze_session,
@@ -98,7 +98,7 @@ def test_analyze_session_extracts_project_info_codex():
     pricing = PricingMap({}, {})
     events: list[dict[str, Any]] = []
     
-    with patch("dashboard.build_dashboard.read_raw_meta") as mock_read:
+    with patch("retro.dashboard_build.read_raw_meta") as mock_read:
         mock_read.return_value = {"cwd": "/Users/sajad/Dev/repos/Mem"}
         res = analyze_session(
             host="codex",
@@ -122,7 +122,7 @@ def test_analyze_session_extracts_project_info_claude():
         }
     ]
     
-    with patch("dashboard.build_dashboard.read_raw_meta") as mock_read:
+    with patch("retro.dashboard_build.read_raw_meta") as mock_read:
         mock_read.return_value = {"project_slug": "Mem"}
         res = analyze_session(
             host="claude-code",

@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..schema import NormalizedEvent, RawRef, write_events
+from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import iter_jsonl, truncate_summary
 from .base import ImportResult
@@ -34,7 +34,7 @@ DEFAULT_CLAUDE_ROOTS: tuple[Path, ...] = (
 
 # Tool name -> normalized event_type override for tool_call events.
 # tool_result events inherit the matching tool_call's override via id-pairing.
-_TOOL_TYPE_OVERRIDES: dict[str, str] = {
+_TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "Read": "file_read",
     "Edit": "file_edit",
     "Write": "file_edit",
@@ -77,7 +77,7 @@ def _resolve_claude_roots(explicit: tuple[Path, ...] | None = None) -> list[Path
 
 
 class ClaudeImporter:
-    host = "claude-code"
+    host: Host = "claude-code"
 
     def __init__(
         self,
@@ -239,7 +239,7 @@ class ClaudeImporter:
         events: list[NormalizedEvent] = []
         unknown = 0
         gaps: set[str] = set()
-        tool_use_types: dict[str, str] = {}  # tool_use_id -> event_type
+        tool_use_types: dict[str, EventType] = {}  # tool_use_id -> event_type
         tool_use_names: dict[str, str] = {}
         seq = 0
 
@@ -251,7 +251,7 @@ class ClaudeImporter:
             parent = raw_event.get("parentUuid")
             raw_ref = RawRef(path=str(transcript_path), line=line_no)
 
-            common = dict(
+            common: dict[str, Any] = dict(
                 session_id=session_id,
                 host="claude-code",
                 sequence=seq,
@@ -338,7 +338,7 @@ class ClaudeImporter:
         raw: dict[str, Any],
         uuid: str,
         common: dict[str, Any],
-        tool_use_types: dict[str, str],
+        tool_use_types: dict[str, EventType],
         tool_use_names: dict[str, str],
     ) -> Iterator[NormalizedEvent]:
         msg = raw.get("message") or {}
@@ -411,7 +411,7 @@ class ClaudeImporter:
         raw: dict[str, Any],
         uuid: str,
         common: dict[str, Any],
-        tool_use_types: dict[str, str],
+        tool_use_types: dict[str, EventType],
         tool_use_names: dict[str, str],
     ) -> Iterator[NormalizedEvent]:
         msg = raw.get("message") or {}

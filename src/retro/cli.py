@@ -9,7 +9,6 @@ Commands:
 """
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -30,7 +29,7 @@ from .mining import (
     write_mining_artifacts,
 )
 from .renderer import render_file
-from .schema import read_events
+from .schema import Host, read_events
 from .signals import REGISTRY as SIGNAL_REGISTRY
 from .signals import run_signals, write_signal_artifacts
 from .storage import Layout, default_layout
@@ -177,6 +176,7 @@ def import_claude(
             console.print("[red]No Claude Code sessions found.[/red]")
             raise typer.Exit(1)
         session_id = s.session_id
+    assert session_id is not None  # guaranteed by the --session-id/--latest check above
     _do_import(imp, session_id, force=force, lay=lay, render=not no_render)
 
 
@@ -210,6 +210,7 @@ def import_codex(
             console.print("[red]No Codex threads found.[/red]")
             raise typer.Exit(1)
         thread_id = t.thread_id
+    assert thread_id is not None  # guaranteed by the --thread-id/--latest check above
     _do_import(imp, thread_id, force=force, lay=lay, render=not no_render)
 
 
@@ -390,7 +391,7 @@ def mine_cmd(
 
 def _mine_one(
     lay: Layout,
-    host_full: str,
+    host_full: Host,
     session_id: str,
     method: str,
     filters: list[str],
@@ -435,10 +436,10 @@ def _mine_targets(
     session_id: str,
     *,
     all_sessions: bool,
-) -> list[tuple[str, str]]:
+) -> list[tuple[Host, str]]:
     hosts = _expand_hosts(host)
     if all_sessions or session_id == "*":
-        targets: list[tuple[str, str]] = []
+        targets: list[tuple[Host, str]] = []
         for h in hosts:
             targets.extend((h, sid) for sid in lay.list_normalized(h))
         return targets
@@ -498,7 +499,7 @@ def show_cmd(
             console.print(f"  {k:<14} {v}")
 
 
-def _expand_host(host: str) -> str:
+def _expand_host(host: str) -> Host:
     h = host.lower()
     if h in ("claude", "claude-code", "cc"):
         return "claude-code"
@@ -507,7 +508,7 @@ def _expand_host(host: str) -> str:
     raise typer.BadParameter(f"unknown host {host!r}; use claude|codex")
 
 
-def _expand_hosts(host: str) -> list[str]:
+def _expand_hosts(host: str) -> list[Host]:
     h = host.lower()
     if h in ("*", "all"):
         return ["claude-code", "codex"]
@@ -632,46 +633,28 @@ def dashboard_build(
         help="Cost mode: auto, calculate, or display.",
     ),
     root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
+    out: Path | None = typer.Option(None, help="output directory (default ./dashboard)"),
 ):
     """Build dashboard/data/rollouts.json and dashboard/index.html."""
     if mode not in {"auto", "calculate", "display"}:
         raise typer.BadParameter("mode must be one of: auto, calculate, display")
 
-    # The builder ships in the repo, not the wheel: look next to the package
-    # (source checkout / editable install) first, then under the cwd.
-    candidates = [
-        Path(__file__).resolve().parents[2] / "dashboard" / "build_dashboard.py",
-        Path.cwd() / "dashboard" / "build_dashboard.py",
-    ]
-    builder = next((c for c in candidates if c.exists()), None)
-    if builder is None:
-        console.print(
-            "[red]Dashboard builder not found.[/red] `retro dashboard build` needs "
-            "`dashboard/build_dashboard.py` from a source checkout — run it from a "
-            "clone of the repo (https://github.com/sajjadGG/retro) or use "
-            "`retro dashboard view` for the terminal dashboard."
-        )
-        raise typer.Exit(1)
-    repo_root = builder.parents[1]
+    from .dashboard_build import build as build_dashboard_html
 
-    cmd = [sys.executable, str(builder), "--mode", mode]
-    if root is not None:
-        cmd.extend(["--artifact-root", str(root.expanduser().resolve())])
-    proc = subprocess.run(
-        cmd,
-        cwd=repo_root,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if proc.stdout:
-        console.print(proc.stdout.rstrip())
-    if proc.stderr:
-        console.print(f"[yellow]{proc.stderr.rstrip()}[/yellow]")
-    if proc.returncode != 0:
-        raise typer.Exit(proc.returncode)
+    index_path = build_dashboard_html(mode=mode, artifact_root=root, out_dir=out)
+    console.print(f"[green]dashboard ready:[/green] {index_path}")
 
-    console.print(f"[green]dashboard ready:[/green] {repo_root / 'dashboard' / 'index.html'}")
+
+@dashboard_app.command("experiments")
+def dashboard_experiments(
+    root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
+    out: Path | None = typer.Option(None, help="output directory (default ./dashboard)"),
+):
+    """Build the experimental trajectory-signals page (trajectory_experiments.html)."""
+    from .dashboard_experiments import build as build_experiments_html
+
+    html_path = build_experiments_html(artifact_root=root, out_dir=out)
+    console.print(f"[green]experiments page ready:[/green] {html_path}")
 
 
 @dashboard_app.command("view")

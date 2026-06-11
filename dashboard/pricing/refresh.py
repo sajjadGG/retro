@@ -4,8 +4,8 @@
 LiteLLM's `model_prices_and_context_window.json` is the canonical model
 pricing source. We don't ship the whole file (~megabytes of models we will
 never see); instead we keep a curated snapshot at
-`dashboard/pricing/litellm-pricing.json` that contains only the models we
-expect to encounter from Claude Code and Codex.
+`src/retro/pricing/litellm-pricing.json` (bundled with the package) that
+contains only the models we expect to encounter from Claude Code and Codex.
 
 Usage:
     python dashboard/pricing/refresh.py
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -33,7 +34,9 @@ UPSTREAM_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/main/"
     "model_prices_and_context_window.json"
 )
-SNAPSHOT_PATH = Path(__file__).resolve().parent / "litellm-pricing.json"
+SNAPSHOT_PATH = (
+    Path(__file__).resolve().parents[2] / "src" / "retro" / "pricing" / "litellm-pricing.json"
+)
 
 PRICING_FIELDS = (
     "input_cost_per_token",
@@ -80,11 +83,26 @@ def main() -> int:
     meta["models_missing_upstream"] = missing
 
     out = {"_meta": meta, **snapshot}
-    SNAPSHOT_PATH.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+    SNAPSHOT_PATH.write_text(_dumps_fixed_point(out) + "\n", encoding="utf-8")
     print(f"updated {updated}/{len(targets)} models")
     if missing:
         print(f"  no upstream entry for: {', '.join(missing)}")
     return 0
+
+
+def _dumps_fixed_point(obj: dict) -> str:
+    """json.dumps, but per-token rates stay fixed-point (0.000000125, not 1.25e-07).
+
+    Upstream values arrive as scientific notation, which makes every refresh
+    diff noisy against the hand-curated decimals.
+    """
+    text = json.dumps(obj, indent=2)
+
+    def fixed(match: re.Match[str]) -> str:
+        rendered = format(float(match.group(0)), ".15f").rstrip("0")
+        return rendered + "0" if rendered.endswith(".") else rendered
+
+    return re.sub(r"-?\d+(?:\.\d+)?[eE][-+]?\d+", fixed, text)
 
 
 if __name__ == "__main__":

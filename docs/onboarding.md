@@ -99,7 +99,7 @@ Open `dashboard/index.html` from disk. The dashboard reads rollouts, signals, mi
 From a clone:
 
 ```bash
-.venv/bin/ruff check src/retro/ tests/ dashboard/build_dashboard.py
+.venv/bin/ruff check .
 .venv/bin/pytest tests/ -q
 .venv/bin/mypy src/retro/
 .venv/bin/retro dashboard build

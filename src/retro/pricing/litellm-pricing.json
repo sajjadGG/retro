@@ -1,0 +1,157 @@
+{
+  "_meta": {
+    "source": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "schema": "LiteLLM model_prices_and_context_window subset",
+    "note": "USD per token. Refresh via: python dashboard/pricing/refresh.py",
+    "snapshot_taken": "2026-06-11",
+    "snapshot_kind": "litellm-upstream",
+    "models_updated": 15,
+    "models_missing_upstream": [
+      "claude-sonnet-4",
+      "claude-3-5-haiku",
+      "claude-3-opus",
+      "claude-3-sonnet",
+      "claude-3-haiku"
+    ]
+  },
+  "gpt-5": {
+    "input_cost_per_token": 0.00000125,
+    "output_cost_per_token": 0.00001,
+    "cache_read_input_token_cost": 0.000000125,
+    "cache_creation_input_token_cost": 0.00000125,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.1": {
+    "input_cost_per_token": 0.00000125,
+    "output_cost_per_token": 0.00001,
+    "cache_read_input_token_cost": 0.000000125,
+    "cache_creation_input_token_cost": 0.00000125,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.1-codex": {
+    "input_cost_per_token": 0.00000125,
+    "output_cost_per_token": 0.00001,
+    "cache_read_input_token_cost": 0.000000125,
+    "cache_creation_input_token_cost": 0.00000125,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.2": {
+    "input_cost_per_token": 0.00000175,
+    "output_cost_per_token": 0.000014,
+    "cache_read_input_token_cost": 0.000000175,
+    "cache_creation_input_token_cost": 0.00000175,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.2-codex": {
+    "input_cost_per_token": 0.00000175,
+    "output_cost_per_token": 0.000014,
+    "cache_read_input_token_cost": 0.000000175,
+    "cache_creation_input_token_cost": 0.00000175,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.3-codex": {
+    "input_cost_per_token": 0.00000175,
+    "output_cost_per_token": 0.000014,
+    "cache_read_input_token_cost": 0.000000175,
+    "cache_creation_input_token_cost": 0.00000175,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.4": {
+    "input_cost_per_token": 0.0000025,
+    "output_cost_per_token": 0.000015,
+    "cache_read_input_token_cost": 0.00000025,
+    "cache_creation_input_token_cost": 0.0000025,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.4-mini": {
+    "input_cost_per_token": 0.00000075,
+    "output_cost_per_token": 0.0000045,
+    "cache_read_input_token_cost": 0.000000075,
+    "cache_creation_input_token_cost": 0.00000075,
+    "litellm_provider": "openai"
+  },
+  "gpt-5.5": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.00003,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.000005,
+    "litellm_provider": "openai"
+  },
+  "claude-fable-5": {
+    "input_cost_per_token": 0.00001,
+    "output_cost_per_token": 0.00005,
+    "cache_read_input_token_cost": 0.000001,
+    "cache_creation_input_token_cost": 0.0000125,
+    "litellm_provider": "anthropic"
+  },
+  "claude-opus-4-7": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic"
+  },
+  "claude-opus-4-6": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic"
+  },
+  "claude-opus-4-5": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic"
+  },
+  "claude-sonnet-4-6": {
+    "input_cost_per_token": 0.000003,
+    "output_cost_per_token": 0.000015,
+    "cache_read_input_token_cost": 0.0000003,
+    "cache_creation_input_token_cost": 0.00000375,
+    "litellm_provider": "anthropic"
+  },
+  "claude-sonnet-4": {
+    "input_cost_per_token": 0.000003,
+    "output_cost_per_token": 0.000015,
+    "cache_read_input_token_cost": 0.0000003,
+    "cache_creation_input_token_cost": 0.00000375,
+    "litellm_provider": "anthropic"
+  },
+  "claude-haiku-4-5": {
+    "input_cost_per_token": 0.000001,
+    "output_cost_per_token": 0.000005,
+    "cache_read_input_token_cost": 0.0000001,
+    "cache_creation_input_token_cost": 0.00000125,
+    "litellm_provider": "anthropic"
+  },
+  "claude-3-5-haiku": {
+    "input_cost_per_token": 0.0000008,
+    "output_cost_per_token": 0.000004,
+    "cache_read_input_token_cost": 0.00000008,
+    "cache_creation_input_token_cost": 0.000001,
+    "litellm_provider": "anthropic"
+  },
+  "claude-3-opus": {
+    "input_cost_per_token": 0.000015,
+    "output_cost_per_token": 0.000075,
+    "cache_read_input_token_cost": 0.0000015,
+    "cache_creation_input_token_cost": 0.00001875,
+    "litellm_provider": "anthropic"
+  },
+  "claude-3-sonnet": {
+    "input_cost_per_token": 0.000003,
+    "output_cost_per_token": 0.000015,
+    "cache_read_input_token_cost": 0.0000003,
+    "cache_creation_input_token_cost": 0.00000375,
+    "litellm_provider": "anthropic"
+  },
+  "claude-3-haiku": {
+    "input_cost_per_token": 0.00000025,
+    "output_cost_per_token": 0.00000125,
+    "cache_read_input_token_cost": 0.000000025,
+    "cache_creation_input_token_cost": 0.0000003,
+    "litellm_provider": "anthropic"
+  }
+}

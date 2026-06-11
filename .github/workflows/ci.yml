@@ -56,10 +56,13 @@ jobs:
 
       - name: Smoke build dashboard
         run: |
-          mkdir -p /tmp/empty-rollout-memory
-          python dashboard/build_dashboard.py --artifact-root /tmp/empty-rollout-memory
+          mkdir -p /tmp/dash-smoke/rollout-memory
+          cd /tmp/dash-smoke
+          retro dashboard build
+          retro dashboard experiments
           test -f dashboard/index.html
           test -f dashboard/data/rollouts.json
+          test -f dashboard/trajectory_experiments.html
 
       - name: Build distributions
         run: python -m build

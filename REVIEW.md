@@ -49,9 +49,10 @@ a static dashboard. Local-first, evidence-linked, spec-driven (`specs/`).
    builder as `Path(__file__).parents[2]/dashboard/build_dashboard.py`, which only
    exists in a source checkout — `dashboard/` is not in the wheel. An advertised
    top-level command fails for anyone who installed from PyPI.
-   **[fixed — falls back to cwd lookup and prints an actionable error]** The real fix is
-   to ship the builder inside the package (`retro/dashboard_build/`); tracked as a
-   recommendation, not done here.
+   **[fixed — the builder now ships inside the package as `retro.dashboard_build`
+   (pricing snapshot bundled as package data), the CLI imports it directly instead of
+   shelling out, and `dashboard/build_dashboard.py` is a back-compat shim; verified
+   end-to-end from a wheel install in a clean venv]**
 5. **The dashboard ignored `--root`.** Every pipeline command takes `--root` for the
    artifact store except the dashboard, which hardcoded `<repo>/rollout-memory`.
    **[fixed — `--artifact-root` / `RETRO_ARTIFACT_ROOT` on the builder, `--root`
@@ -59,22 +60,25 @@ a static dashboard. Local-first, evidence-linked, spec-driven (`specs/`).
 6. **`build_dashboard.py` is a 2,581-line monolith with the least scrutiny in the
    repo.** HTML/CSS/JS generated inside a Python f-string (`{{` escaping throughout),
    exempt from E501, exempt from mypy, zero tests, not built in CI. The most complex
-   file has the weakest safety net. **[partially fixed — CI now smoke-builds the
-   dashboard against an empty artifact root]** Longer term: extract the template to a
-   `.html` file with a placeholder-substitution step, and split data collection
-   (testable, pure) from rendering.
+   file has the weakest safety net. **[partially fixed — CI smoke-builds both dashboard
+   pages on every run, and `tests/test_dashboard_build.py` exercises `build()`
+   end-to-end including the bundled pricing snapshot]** Longer term: extract the
+   template to a `.html` file with a placeholder-substitution step, and split data
+   collection (testable, pure) from rendering.
 7. **Stale claim in the builder docstring**: "intentionally separate from the CLI
    package" — it imports `retro.analyzer`, so it requires the package on `sys.path`.
    **[fixed — docstring updated]**
 8. **Repo-wide ruff fails (17 × E501) in `dashboard/build_trajectory_experiments.py`**,
    an orphaned script referenced by nothing (no CLI command, no docs). CI passed anyway
    because it lints only `src/retro tests`. **[fixed — per-file ignore added, CI lints
-   the whole repo]** Recommendation: either wire the script into the CLI/docs or delete
-   it (its generated `trajectory_experiments.html` is committed too).
+   the whole repo, and the script is no longer orphaned: it moved into the package as
+   `retro.dashboard_experiments`, wired up as `retro dashboard experiments`]**
 9. **mypy config debt**: an unused `dashboard` override written as a comma-joined string
    (wrong form — mypy wants a list), flagged "unused section" on every run
    **[fixed — removed]**; blanket `disable_error_code = ["arg-type"]` for `retro.cli`
-   and `retro.importers.*` masks real type errors — worth burning down.
+   and `retro.importers.*` masks real type errors. **[fixed — exemptions removed and
+   all 66 surfaced errors resolved with real types: `Host`/`EventType` literals on the
+   importer maps and CLI host helpers, typed kwargs dicts, narrowed optionals]**
 10. **HTML injection in the dashboard.** The committed session table interpolated
     transcript-derived titles into `innerHTML` unescaped; titles come from user prompts,
     so a captured rollout containing markup executes when the dashboard opens. The
@@ -95,8 +99,8 @@ a static dashboard. Local-first, evidence-linked, spec-driven (`specs/`).
     finished and good — they should be committed. Left untouched here; review and
     commit them.
 13. The pricing refresh rewrites decimals to scientific notation (`1.25e-06`), making
-    every future refresh diff noisy. Harmless, but `refresh.py` could serialize with
-    fixed-point formatting.
+    every future refresh diff noisy. **[fixed — `refresh.py` serializes fixed-point and
+    the bundled snapshot was normalized]**
 
 ## Docs
 
@@ -116,13 +120,14 @@ right pattern to extend.
 
 ## Recommended next steps (not done in this pass)
 
-- Ship the dashboard builder inside the package so `retro dashboard build` works from
-  PyPI installs without a checkout.
+- ~~Ship the dashboard builder inside the package~~ **done** (`retro.dashboard_build`).
 - Split `build_dashboard.py`: pure data-collection module (unit-testable, mypy-checked)
   + template file.
-- Close the memory utility loop: a `retro memory weave` → session → signal → 
+- Close the memory utility loop: a `retro memory weave` → session → signal →
   `update-utility` round-trip, so reranking learns from real outcomes.
-- Decide the fate of `build_trajectory_experiments.py` (wire in or delete).
-- Burn down the `arg-type` mypy exemptions.
+- ~~Decide the fate of `build_trajectory_experiments.py`~~ **done** (wired in as
+  `retro dashboard experiments`).
+- ~~Burn down the `arg-type` mypy exemptions~~ **done** (zero mypy overrides for
+  application code remain; only the two HTML-template modules are exempt).
 - Move quests / operator diagnostics / terminal dashboard behind an "experimental"
-  boundary in docs and code layout.
+  boundary in code layout (docs now label them experimental).

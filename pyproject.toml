@@ -39,12 +39,9 @@ disallow_untyped_defs = false
 check_untyped_defs = true
 
 [[tool.mypy.overrides]]
-module = ["retro.importers.*"]
-disable_error_code = ["arg-type"]
-
-[[tool.mypy.overrides]]
-module = ["retro.cli"]
-disable_error_code = ["arg-type"]
+# HTML-template modules moved in from dashboard/; never type-checked before.
+module = ["retro.dashboard_build", "retro.dashboard_experiments"]
+ignore_errors = true
 
 [tool.ruff]
 target-version = "py310"
@@ -55,8 +52,9 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
-"dashboard/build_dashboard.py" = ["E501"]
-"dashboard/build_trajectory_experiments.py" = ["E501"]
+# Generated-HTML modules: long template lines are deliberate.
+"src/retro/dashboard_build.py" = ["E501"]
+"src/retro/dashboard_experiments.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

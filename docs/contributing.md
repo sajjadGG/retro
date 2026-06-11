@@ -10,7 +10,7 @@ python3 -m venv .venv
 ## Checks
 
 ```bash
-.venv/bin/ruff check src/retro/ tests/ dashboard/build_dashboard.py
+.venv/bin/ruff check .
 .venv/bin/pytest tests/ -q
 .venv/bin/mypy src/retro/
 .venv/bin/retro dashboard build

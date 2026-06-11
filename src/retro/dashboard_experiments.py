@@ -1,30 +1,63 @@
-#!/usr/bin/env python3
-"""Build an experimental dashboard for trajectory signals only."""
+"""Build an experimental dashboard for trajectory signals only.
+
+CLI:
+    retro dashboard experiments [--root PATH] [--out PATH]
+    python -m retro.dashboard_experiments
+"""
 from __future__ import annotations
 
+import argparse
 import json
+import os
 from collections import defaultdict
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[1]
-ARTIFACT_ROOT = ROOT / "rollout-memory"
-DASHBOARD_DIR = ROOT / "dashboard"
-DATA_DIR = DASHBOARD_DIR / "data"
+# Defaults are cwd-relative; build() rebinds these from its arguments.
+ARTIFACT_ROOT = Path.cwd() / "rollout-memory"
+OUT_DIR = Path.cwd() / "dashboard"
+DATA_DIR = OUT_DIR / "data"
 TRAJECTORY_PREFIX = "trajectory_"
 
 
-def main() -> None:
+def build(artifact_root: Path | None = None, out_dir: Path | None = None) -> Path:
+    """Build the trajectory-experiments page; returns the generated HTML path."""
+    global ARTIFACT_ROOT, OUT_DIR, DATA_DIR
+    if artifact_root is not None:
+        ARTIFACT_ROOT = Path(artifact_root).expanduser().resolve()
+    if out_dir is not None:
+        OUT_DIR = Path(out_dir).expanduser().resolve()
+        DATA_DIR = OUT_DIR / "data"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = build_payload()
     data_path = DATA_DIR / "trajectory_experiments.json"
-    html_path = DASHBOARD_DIR / "trajectory_experiments.html"
+    html_path = OUT_DIR / "trajectory_experiments.html"
     data_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     html_path.write_text(render_html(payload), encoding="utf-8")
     print(f"wrote {data_path}")
     print(f"wrote {html_path}")
+    return html_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--artifact-root",
+        default=os.environ.get("RETRO_ARTIFACT_ROOT"),
+        help="rollout-memory artifact root (default: ./rollout-memory)",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="output directory (default: ./dashboard)",
+    )
+    args = parser.parse_args()
+    build(
+        artifact_root=Path(args.artifact_root) if args.artifact_root else None,
+        out_dir=Path(args.out) if args.out else None,
+    )
 
 
 def build_payload() -> dict[str, Any]:
@@ -88,7 +121,7 @@ def load_trajectory_aggregates() -> dict[str, dict]:
 
 
 def load_session_meta() -> dict[tuple[str, str], dict]:
-    path = DASHBOARD_DIR / "data" / "rollouts.json"
+    path = DATA_DIR / "rollouts.json"
     if not path.exists():
         return {}
     try:

@@ -80,7 +80,7 @@ The PyPI distribution is named `retro-agent-memory` because `retro` is already o
                      rendered/   ← markdown view (any time)
                          │
                          ▼
-                    dashboard/build_dashboard.py
+                    retro dashboard build
                   (static HTML + KPIs + per-model cost + signals + drill-down)
 ```
 
@@ -438,19 +438,24 @@ retro dashboard build --mode calculate
 # Show only provider-embedded costUSD; None when missing
 retro dashboard build --mode display
 
-# Build from a non-default artifact root
-retro dashboard build --root /path/to/rollout-memory
+# Build from a non-default artifact root / to a non-default output directory
+retro dashboard build --root /path/to/rollout-memory --out /path/to/output
 
-# Direct script still works, including via env var
-RETRO_COST_MODE=calculate python dashboard/build_dashboard.py
-python dashboard/build_dashboard.py --artifact-root /path/to/rollout-memory
+# Module form (the builder ships inside the package; works from any install)
+RETRO_COST_MODE=calculate python -m retro.dashboard_build
+python -m retro.dashboard_build --artifact-root /path/to/rollout-memory
+
+# Experimental: trajectory-signals page (trajectory_experiments.html)
+retro dashboard experiments
 ```
+
+The artifact root defaults to `./rollout-memory` and output to `./dashboard`, both relative to the current directory.
 
 Then open `dashboard/index.html` directly from disk.
 
 ### Cost computation
 
-- **LiteLLM pricing snapshot** at `dashboard/pricing/litellm-pricing.json` is the authoritative source for per-model rates (USD per token). The hardcoded `DEFAULT_RATES` table is the fallback for any model not in the snapshot.
+- **LiteLLM pricing snapshot** bundled at `src/retro/pricing/litellm-pricing.json` is the authoritative source for per-model rates (USD per token). The hardcoded `DEFAULT_RATES` table is the fallback for any model not in the snapshot.
 - **Per-model attribution**: each token delta is tagged with the active model (`turn_context.model` for Codex, per-message `model` for Claude). Multi-model sessions produce per-model rows.
 - **Codex token deltas** prefer the explicit `info.last_token_usage` per-turn delta when present, falling back to cumulative subtraction for older Codex builds.
 - **Cached-input handling** follows ccusage's behavior: subtract for Codex (its `input_tokens` is cumulative including cache), don't subtract for Anthropic (its `input_tokens` is already fresh non-cached).
@@ -462,7 +467,7 @@ Numbers are always estimates, never billing truth.
 
 ## Pricing snapshot
 
-The dashboard pulls rates from `dashboard/pricing/litellm-pricing.json` — a curated subset of [LiteLLM's `model_prices_and_context_window.json`](https://github.com/BerriAI/litellm). Refresh it with:
+The dashboard pulls rates from the bundled `src/retro/pricing/litellm-pricing.json` — a curated subset of [LiteLLM's `model_prices_and_context_window.json`](https://github.com/BerriAI/litellm). Refresh it with:
 
 ```bash
 python dashboard/pricing/refresh.py
@@ -535,9 +540,13 @@ src/retro/
   analyzer.py            # command/tool pattern analysis + operator diagnostics
   memory_store.py        # SQLite memory index (FTS5, wiki-links, weave)
   llm.py                 # headless `codex exec` helper
-  quest.py               # daily quests / streak progression
+  quest.py               # daily quests / streak progression (experimental)
   trajectory.py          # trajectory extraction for experimental signals
+  dashboard_build.py     # static HTML + rollouts.json builder (`retro dashboard build`)
+  dashboard_experiments.py  # trajectory-signals page (experimental)
   dashboard_terminal.py  # interactive terminal dashboard (`retro dashboard view`)
+  pricing/
+    litellm-pricing.json # bundled LiteLLM rates snapshot
   importers/
     base.py              # ImportResult
     claude.py            # Claude Code transcript reader (multi-root + env override)
@@ -557,11 +566,8 @@ src/retro/
       risk_aware.py      # prune high-risk / low-confidence / near-duplicates
 
 dashboard/
-  build_dashboard.py     # static HTML + rollouts.json builder
-  build_trajectory_experiments.py  # experimental trajectory-signal report (standalone)
-  pricing/
-    litellm-pricing.json # vendored LiteLLM rates
-    refresh.py           # refresh the snapshot from upstream
+  build_dashboard.py     # back-compat shim → retro.dashboard_build
+  pricing/refresh.py     # refresh the bundled snapshot from upstream LiteLLM
   README.md
   index.html             # generated
   data/rollouts.json     # generated
