@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Build a static dashboard from rollout-memory artifacts.
 
-This script is intentionally separate from the CLI package. It treats
-rollout-memory/ as an artifact store and emits a self-contained dashboard.
+This script lives outside the CLI package but imports `retro` for the operator
+diagnostics profile, so the package must be importable (e.g. `pip install -e .`).
+It treats rollout-memory/ as an artifact store and emits a self-contained dashboard.
 
 CLI:
     python dashboard/build_dashboard.py [--mode auto|calculate|display]
+                                        [--artifact-root PATH]
+
+The artifact root defaults to `<repo>/rollout-memory`; override with
+`--artifact-root` or the `RETRO_ARTIFACT_ROOT` env var.
 
 Cost modes mirror ccusage:
   - auto:      use embedded costUSD when an event provides it, else compute.
@@ -149,6 +154,7 @@ def _rates_from_litellm(entry: dict[str, Any]) -> dict[str, float]:
 
 
 def main() -> None:
+    global ARTIFACT_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
@@ -156,7 +162,14 @@ def main() -> None:
         default=os.environ.get("RETRO_COST_MODE", COST_MODE_AUTO),
         help="Cost calculation mode (default: %(default)s)",
     )
+    parser.add_argument(
+        "--artifact-root",
+        default=os.environ.get("RETRO_ARTIFACT_ROOT"),
+        help="rollout-memory artifact root (default: <repo>/rollout-memory)",
+    )
     args = parser.parse_args()
+    if args.artifact_root:
+        ARTIFACT_ROOT = Path(args.artifact_root).expanduser().resolve()
     pricing = PricingMap.load()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1344,12 +1357,30 @@ def render_html(payload: dict[str, Any]) -> str:
     h1 {{ margin: 0 0 4px; font-size: 24px; font-weight: 720; letter-spacing: 0; }}
     .subtle {{ color: var(--muted); font-size: 13px; }}
     main {{ padding: 20px 28px 32px; display: grid; gap: 18px; }}
+    .overview {{ display: grid; grid-template-columns: minmax(280px, 0.85fr) minmax(0, 1.15fr); gap: 14px; align-items: start; }}
+    .insight-panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }}
+    .insight-panel h2 {{ margin: 0; padding: 13px 14px; font-size: 15px; border-bottom: 1px solid var(--line); background: #fbfbf8; }}
+    .insights {{ padding: 12px; display: grid; gap: 8px; }}
+    .insight {{ border: 1px solid var(--line); border-radius: 6px; padding: 10px 11px; background: #fff; }}
+    .insight.attention {{ border-left: 3px solid var(--bad); }}
+    .insight.good {{ border-left: 3px solid var(--accent); }}
+    .insight.warn {{ border-left: 3px solid var(--warn); }}
+    .insight .name {{ color: var(--muted); font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.03em; }}
+    .insight .value {{ margin-top: 4px; font-size: 18px; font-weight: 760; }}
+    .insight .meta {{ margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.35; }}
     .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }}
     .kpi, .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }}
     .kpi {{ padding: 12px; min-height: 78px; }}
     .kpi .label {{ font-size: 12px; color: var(--muted); }}
     .kpi .value {{ margin-top: 6px; font-size: 23px; font-weight: 720; }}
-    .controls {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }}
+    .kpi.sessions-total {{ border-top: 3px solid var(--accent); }}
+    .session-split {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }}
+    .session-split .item {{ border-radius: 6px; padding: 6px 7px; border: 1px solid var(--line); background: #fbfbf8; }}
+    .session-split .item.claude-code {{ background: var(--host-claude-soft); border-color: var(--host-claude-line); }}
+    .session-split .item.codex {{ background: var(--host-codex-soft); border-color: var(--host-codex-line); }}
+    .session-split .name {{ display: block; color: var(--muted); font-size: 11px; }}
+    .session-split .count {{ display: block; margin-top: 2px; font-weight: 760; }}
+    .controls {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; background: #fbfbf8; border: 1px solid var(--line); border-radius: 8px; padding: 10px; position: sticky; top: 0; z-index: 20; }}
     input, select {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px 10px; background: white; color: var(--ink); min-height: 38px; }}
     input {{ min-width: min(420px, 100%); flex: 1; }}
     .grid {{ display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(360px, .9fr); gap: 16px; align-items: start; }}
@@ -1358,6 +1389,10 @@ def render_html(payload: dict[str, Any]) -> str:
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }}
     th {{ color: var(--muted); font-weight: 650; background: #fbfbf8; position: sticky; top: 0; }}
+    td.num, th.num {{ text-align: right; }}
+    td.title-cell {{ min-width: 220px; }}
+    .title-main {{ font-weight: 650; line-height: 1.25; }}
+    .title-sub {{ margin-top: 3px; color: var(--muted); font-size: 11px; }}
     tr {{ cursor: pointer; }}
     tr:hover, tr.selected {{ background: var(--accent-soft); }}
     .scroll {{ max-height: 560px; overflow: auto; }}
@@ -1429,6 +1464,9 @@ def render_html(payload: dict[str, Any]) -> str:
     .pill.scope-repo {{ background: #ddd6fe; color: #5b21b6; }}
     .pill.scope-task {{ background: #cffafe; color: #155e75; }}
     .pill.scope-global {{ background: #fce7f3; color: #9f1239; }}
+    .pill.warn {{ background: #fef3c7; color: #92400e; }}
+    .pill.bad {{ background: #fee2e2; color: #991b1b; }}
+    .pill.good {{ background: #dcfce7; color: #14532d; }}
     .all-mem-controls {{ display: flex; gap: 8px; flex-wrap: wrap; padding: 0 12px 10px; align-items: center; }}
     .all-mem-controls .count {{ margin-left: auto; color: var(--muted); font-size: 12px; }}
     .all-mem-list {{ padding: 0 12px 12px; max-height: 720px; overflow: auto; }}
@@ -1440,7 +1478,13 @@ def render_html(payload: dict[str, Any]) -> str:
     .group-risk     {{ border-left: 3px solid #b91c1c; }}
     .signal-table table {{ width: 100%; }}
     .signal-table td.value {{ font-weight: 720; }}
-    @media (max-width: 960px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 960px) {{ .grid, .overview {{ grid-template-columns: 1fr; }} }}
+    @media (max-width: 680px) {{
+      header {{ padding: 18px 16px 12px; }}
+      main {{ padding: 14px 16px 24px; }}
+      .controls {{ position: static; }}
+      input {{ min-width: 100%; }}
+    }}
   </style>
 </head>
 <body>
@@ -1449,13 +1493,19 @@ def render_html(payload: dict[str, Any]) -> str:
     <div class="subtle">Generated {escape(payload["generated_at"])}. cost_mode=<code>{escape(payload.get("cost_mode", "auto"))}</code>. {escape(payload["rate_note"])}.</div>
   </header>
   <main>
-    <section class="kpis" id="kpis"></section>
+    <section class="overview">
+      <section class="insight-panel">
+        <h2>At A Glance</h2>
+        <div class="insights" id="insights"></div>
+      </section>
+      <section class="kpis" id="kpis"></section>
+    </section>
 
     <!-- Operator Quests & Streaks Section (Issue 8) -->
     <section class="panel" id="questsPanel" style="display:none; margin-bottom: 18px;">
       <h2>Operator Quests &amp; Progression Loop</h2>
-      <div style="padding: 16px; display: grid; grid-template-columns: minmax(240px, 300px) 1fr; gap: 20px; flex-wrap: wrap;">
-        <div style="background: linear-gradient(135deg, #0f766e 0%, #115e59 100%); color: white; border-radius: 8px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; min-height: 160px; box-shadow: 0 4px 10px rgba(15, 118, 110, 0.25);">
+      <div style="padding: 16px; display: grid; grid-template-columns: minmax(240px, 300px) 1fr; gap: 20px; flex-wrap: wrap; align-items: start;">
+        <div style="background: linear-gradient(135deg, #0f766e 0%, #115e59 100%); color: white; border-radius: 8px; padding: 18px; display: flex; flex-direction: column; justify-content: space-between; min-height: 160px; box-shadow: 0 4px 10px rgba(15, 118, 110, 0.25); align-self: start;">
           <div>
             <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.85;">Current Rank</div>
             <div id="questUserLevel" style="font-size: 18px; font-weight: 800; margin: 4px 0 10px 0;">Novice Prompt Mechanic</div>
@@ -1649,13 +1699,24 @@ def render_html(payload: dict[str, Any]) -> str:
       <select id="projectFilter">
         <option value="all">All projects</option>
       </select>
+      <select id="riskFilter">
+        <option value="all">All risk levels</option>
+        <option value="secret">Secret risk</option>
+        <option value="failed">Has failures</option>
+        <option value="expensive">High cost</option>
+      </select>
+      <select id="memoryFilter">
+        <option value="all">All memory states</option>
+        <option value="with">Has mined memory</option>
+        <option value="without">No mined memory</option>
+      </select>
     </section>
     <section class="grid">
       <div class="panel">
         <h2 id="sessionsTitle">Sessions</h2>
         <div class="scroll">
           <table>
-            <thead><tr><th>Host</th><th>Date</th><th>Title</th><th>Events</th><th>Tools</th><th>Edits</th><th>Tokens</th><th>Cost</th><th>Memory</th><th>Risk</th></tr></thead>
+            <thead><tr><th>Host</th><th>Date</th><th>Project / Title</th><th class="num">Events</th><th class="num">Tools</th><th class="num">Edits</th><th class="num">Tokens</th><th class="num">Cost</th><th>Memory</th><th>Flags</th></tr></thead>
             <tbody id="sessionRows"></tbody>
           </table>
         </div>
@@ -1688,6 +1749,85 @@ def render_html(payload: dict[str, Any]) -> str:
     function kpi(label, value, klass='') {{
       return `<div class="kpi ${{klass}}"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`;
     }}
+
+    function sessionKpi(total, claudeCount, codexCount) {{
+      return `<div class="kpi sessions-total">
+        <div class="label">Sessions</div>
+        <div class="value">${{fmt.format(total)}}</div>
+        <div class="session-split">
+          <div class="item claude-code"><span class="name">Claude</span><span class="count">${{fmt.format(claudeCount)}}</span></div>
+          <div class="item codex"><span class="name">Codex</span><span class="count">${{fmt.format(codexCount)}}</span></div>
+        </div>
+      </div>`;
+    }}
+
+    function hasMemory(s) {{
+      return (s.mined || []).some(m => (m.candidate_count || 0) > 0);
+    }}
+
+    function highCostCutoff() {{
+      const costs = DATA.sessions
+        .map(s => s.estimated_cost_usd || 0)
+        .filter(v => v > 0)
+        .sort((a, b) => a - b);
+      if (!costs.length) return 0;
+      return costs[Math.max(0, Math.floor(costs.length * 0.8) - 1)];
+    }}
+
+    function renderInsights() {{
+      const sessions = DATA.sessions || [];
+      const cutoff = highCostCutoff();
+      const risky = sessions.filter(s => s.signals_index?.secret_exposure_signal);
+      const failed = sessions.filter(s => (s.failed_events || 0) > 0);
+      const noMemory = sessions.filter(s => !hasMemory(s));
+      const expensive = sessions
+        .filter(s => (s.estimated_cost_usd || 0) >= cutoff && cutoff > 0)
+        .sort((a, b) => (b.estimated_cost_usd || 0) - (a.estimated_cost_usd || 0));
+      const recentDay = Object.entries(DATA.summary.by_day || {{}}).slice(-1)[0];
+      const topProject = (DATA.summary.projects || [])[0];
+      const insight = (name, value, meta, klass='') => `
+        <div class="insight ${{klass}}">
+          <div class="name">${{name}}</div>
+          <div class="value">${{value}}</div>
+          <div class="meta">${{meta}}</div>
+        </div>`;
+
+      document.getElementById('insights').innerHTML = [
+        insight(
+          'Needs review',
+          `${{fmt.format(risky.length)}} secret-risk · ${{fmt.format(failed.length)}} failed`,
+          risky.length || failed.length
+            ? 'Use the risk filter below to inspect the sessions most likely to contain sensitive output, broken commands, or missing follow-up.'
+            : 'No secret-risk or failed-event sessions in the current artifact set.',
+          risky.length || failed.length ? 'attention' : 'good'
+        ),
+        insight(
+          'Memory coverage',
+          `${{fmt.format(sessions.length - noMemory.length)}} / ${{fmt.format(sessions.length)}} sessions`,
+          noMemory.length
+            ? `${{fmt.format(noMemory.length)}} sessions have no mined memory yet; filter for them when deciding what to mine next.`
+            : 'Every imported session has mined memory candidates.',
+          noMemory.length ? 'warn' : 'good'
+        ),
+        insight(
+          'Cost focus',
+          expensive.length ? `${{money(expensive[0].estimated_cost_usd)}} top session` : 'No cost data',
+          expensive.length
+            ? `${{escapeHtml(expensive[0].title || expensive[0].session_id).slice(0, 110)}}`
+            : 'Rebuild after token usage is available to see the expensive tail.',
+          expensive.length ? 'warn' : ''
+        ),
+        insight(
+          'Latest activity',
+          recentDay ? `${{recentDay[0]}} · ${{fmt.format(recentDay[1].sessions)}} sessions` : 'No activity',
+          topProject
+            ? `Most active project: ${{escapeHtml(topProject.name)}} (${{fmt.format(topProject.sessions)}} sessions).`
+            : 'No project grouping detected yet.',
+          ''
+        ),
+      ].join('');
+    }}
+
     function renderKpis() {{
       const t = DATA.summary.totals;
       const byHost = DATA.summary.by_host || {{}};
@@ -1696,17 +1836,13 @@ def render_html(payload: dict[str, Any]) -> str:
       const secretAgg = DATA.signals?.by_signal?.secret_exposure_signal || {{}};
       const mem = DATA.memory || {{}};
       document.getElementById('kpis').innerHTML = [
-        kpi('Sessions used', fmt.format(DATA.summary.sessions_used_for_stats || DATA.summary.session_count)),
-        kpi('Claude sessions', fmt.format(claudeCount), 'host-claude-code'),
-        kpi('Codex sessions', fmt.format(codexCount), 'host-codex'),
+        sessionKpi(DATA.summary.sessions_used_for_stats || DATA.summary.session_count, claudeCount, codexCount),
         kpi('Memory candidates', fmt.format(mem.candidate_count || 0)),
         kpi('With token data', fmt.format(DATA.summary.sessions_with_token_usage || 0)),
         kpi('With cost estimate', fmt.format(DATA.summary.sessions_with_cost_estimate || 0)),
         kpi('Secret-risk sessions', fmt.format(secretAgg.true_count || 0)),
         kpi('Active days', fmt.format(DATA.summary.active_days)),
         kpi('Active projects', fmt.format(DATA.summary.projects?.length || 0)),
-        kpi('Events', fmt.format(t.events || 0)),
-        kpi('Tool calls', fmt.format(t.tool_calls || 0)),
         kpi('File edits', fmt.format(t.file_edits || 0)),
         kpi('Tokens', fmt.format(t.tokens || 0)),
         kpi('Est. cost', money(DATA.summary.estimated_cost_usd)),
@@ -1863,9 +1999,17 @@ def render_html(payload: dict[str, Any]) -> str:
       const q = document.getElementById('search').value.toLowerCase();
       const host = document.getElementById('hostFilter').value;
       const proj = document.getElementById('projectFilter').value;
+      const risk = document.getElementById('riskFilter').value;
+      const memory = document.getElementById('memoryFilter').value;
+      const cutoff = highCostCutoff();
       return DATA.sessions.filter(s => {{
         if (host !== 'all' && s.host !== host) return false;
         if (proj !== 'all' && (s.project_name || 'unknown') !== proj) return false;
+        if (risk === 'secret' && !s.signals_index?.secret_exposure_signal) return false;
+        if (risk === 'failed' && !(s.failed_events > 0)) return false;
+        if (risk === 'expensive' && !((s.estimated_cost_usd || 0) >= cutoff && cutoff > 0)) return false;
+        if (memory === 'with' && !hasMemory(s)) return false;
+        if (memory === 'without' && hasMemory(s)) return false;
         const hay = [s.host, s.session_id, s.title, s.project_name || '', ...(s.files_touched || [])].join(' ').toLowerCase();
         return hay.includes(q);
       }});
@@ -1879,6 +2023,15 @@ def render_html(payload: dict[str, Any]) -> str:
       return `<span class="mem-meta">${{fmt.format(totalCands)}}c / ${{methods}}m</span>`;
     }}
 
+    function sessionFlags(s) {{
+      const flags = [];
+      if (s.signals_index?.secret_exposure_signal) flags.push('<span class="pill bad">secret</span>');
+      if ((s.failed_events || 0) > 0) flags.push(`<span class="pill warn">${{fmt.format(s.failed_events)}} fail</span>`);
+      if (!hasMemory(s)) flags.push('<span class="pill">no memory</span>');
+      if ((s.rate_limit_hits || 0) > 0) flags.push('<span class="pill warn">limit</span>');
+      return flags.join(' ') || '<span class="mem-meta">—</span>';
+    }}
+
     function renderRows() {{
       const rows = filteredSessions();
       document.getElementById('sessionsTitle').textContent =
@@ -1890,14 +2043,17 @@ def render_html(payload: dict[str, Any]) -> str:
         <tr data-id="${{s.host}}/${{s.session_id}}" class="${{hostClass}} ${{isSelected ? 'selected' : ''}}">
           <td><span class="badge ${{s.host}}">${{s.host}}</span></td>
           <td>${{s.date}}</td>
-          <td>${{s.title || s.session_id}}</td>
-          <td>${{fmt.format(s.event_count)}}</td>
-          <td>${{fmt.format(s.tool_call_events + s.tool_result_events)}}</td>
-          <td>${{fmt.format(s.file_edit_events)}}</td>
-          <td>${{fmt.format(s.tokens.total_tokens || 0)}}</td>
-          <td>${{money(s.estimated_cost_usd)}}</td>
+          <td class="title-cell">
+            <div class="title-main">${{escapeHtml(s.title || s.session_id)}}</div>
+            <div class="title-sub">${{escapeHtml(s.project_name || 'unknown')}} · <code>${{escapeHtml(String(s.session_id).slice(0, 12))}}</code></div>
+          </td>
+          <td class="num">${{fmt.format(s.event_count)}}</td>
+          <td class="num">${{fmt.format(s.tool_call_events + s.tool_result_events)}}</td>
+          <td class="num">${{fmt.format(s.file_edit_events)}}</td>
+          <td class="num">${{fmt.format(s.tokens.total_tokens || 0)}}</td>
+          <td class="num">${{money(s.estimated_cost_usd)}}</td>
           <td>${{memorySummary(s)}}</td>
-          <td>${{s.signals_index?.secret_exposure_signal ? '<span class="badge" style="background:#fee2e2;color:#991b1b">secret</span>' : ''}}</td>
+          <td>${{sessionFlags(s)}}</td>
         </tr>
       `;}}).join('');
       document.querySelectorAll('#sessionRows tr').forEach(tr => tr.addEventListener('click', () => {{
@@ -1955,7 +2111,7 @@ def render_html(payload: dict[str, Any]) -> str:
       }}
       const sections = mined.map(entry => {{
         const cards = (entry.candidates || []).map(c => renderMemCard(c, {{showMethod: false, showSession: false}})).join('');
-        const filters = (entry.filters_applied || []).length ? `<span class="mem-meta">filters: ${{entry.filters_applied.join(', ')}}</span>` : '';
+        const filters = (entry.filters_applied || []).length ? `<span class="mem-meta">filters: ${{escapeHtml(entry.filters_applied.join(', '))}}</span>` : '';
         return `<div class="mem-block" style="margin-bottom:12px">
           <h3 style="display:flex; gap:8px; align-items:center;">
             <span class="pill method-${{entry.method}}">${{entry.method}}</span>
@@ -2415,11 +2571,13 @@ def render_html(payload: dict[str, Any]) -> str:
       `).join('');
     }}
 
-    function renderAll() {{ populateProjects(); renderKpis(); renderQuests(); renderOperatorProfile(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
+    function renderAll() {{ populateProjects(); renderInsights(); renderKpis(); renderQuests(); renderOperatorProfile(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);
     document.getElementById('projectFilter').addEventListener('change', renderRows);
+    document.getElementById('riskFilter').addEventListener('change', renderRows);
+    document.getElementById('memoryFilter').addEventListener('change', renderRows);
     document.getElementById('tabSummary').addEventListener('click', () => {{ activeTab='summary'; renderDetail(); }});
     document.getElementById('tabModels').addEventListener('click', () => {{ activeTab='models'; renderDetail(); }});
     document.getElementById('tabSignals').addEventListener('click', () => {{ activeTab='signals'; renderDetail(); }});
