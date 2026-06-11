@@ -631,18 +631,32 @@ def dashboard_build(
         "--mode",
         help="Cost mode: auto, calculate, or display.",
     ),
+    root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
 ):
     """Build dashboard/data/rollouts.json and dashboard/index.html."""
     if mode not in {"auto", "calculate", "display"}:
         raise typer.BadParameter("mode must be one of: auto, calculate, display")
 
-    repo_root = Path(__file__).resolve().parents[2]
-    builder = repo_root / "dashboard" / "build_dashboard.py"
-    if not builder.exists():
-        console.print(f"[red]Dashboard builder not found at {builder}[/red]")
+    # The builder ships in the repo, not the wheel: look next to the package
+    # (source checkout / editable install) first, then under the cwd.
+    candidates = [
+        Path(__file__).resolve().parents[2] / "dashboard" / "build_dashboard.py",
+        Path.cwd() / "dashboard" / "build_dashboard.py",
+    ]
+    builder = next((c for c in candidates if c.exists()), None)
+    if builder is None:
+        console.print(
+            "[red]Dashboard builder not found.[/red] `retro dashboard build` needs "
+            "`dashboard/build_dashboard.py` from a source checkout — run it from a "
+            "clone of the repo (https://github.com/sajjadGG/retro) or use "
+            "`retro dashboard view` for the terminal dashboard."
+        )
         raise typer.Exit(1)
+    repo_root = builder.parents[1]
 
     cmd = [sys.executable, str(builder), "--mode", mode]
+    if root is not None:
+        cmd.extend(["--artifact-root", str(root.expanduser().resolve())])
     proc = subprocess.run(
         cmd,
         cwd=repo_root,

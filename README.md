@@ -438,8 +438,12 @@ retro dashboard build --mode calculate
 # Show only provider-embedded costUSD; None when missing
 retro dashboard build --mode display
 
+# Build from a non-default artifact root
+retro dashboard build --root /path/to/rollout-memory
+
 # Direct script still works, including via env var
 RETRO_COST_MODE=calculate python dashboard/build_dashboard.py
+python dashboard/build_dashboard.py --artifact-root /path/to/rollout-memory
 ```
 
 Then open `dashboard/index.html` directly from disk.
@@ -507,6 +511,7 @@ Then publish a GitHub release for that tag. The release event triggers the PyPI 
 | `CLAUDE_CONFIG_DIR`  | Override Claude data roots (comma-separated). Wins over the default `~/.claude` + `~/.config/claude`.   |
 | `CODEX_HOME`         | Override Codex roots (comma-separated). Each root is classified into `sqlite_home`/`sessions_dir`/`jsonl_dir`. |
 | `RETRO_COST_MODE`     | Default `--mode` for the dashboard builder. One of `auto`, `calculate`, `display`.                       |
+| `RETRO_ARTIFACT_ROOT` | Default `--artifact-root` for the dashboard builder (the `rollout-memory/` directory to read).          |
 
 ---
 
@@ -527,11 +532,19 @@ src/retro/
   storage.py             # artifact layout
   cli.py                 # Typer CLI (`retro`)
   renderer.py            # Markdown view
+  analyzer.py            # command/tool pattern analysis + operator diagnostics
+  memory_store.py        # SQLite memory index (FTS5, wiki-links, weave)
+  llm.py                 # headless `codex exec` helper
+  quest.py               # daily quests / streak progression
+  trajectory.py          # trajectory extraction for experimental signals
+  dashboard_terminal.py  # interactive terminal dashboard (`retro dashboard view`)
   importers/
+    base.py              # ImportResult
     claude.py            # Claude Code transcript reader (multi-root + env override)
     codex.py             # Codex SQLite + JSONL reader (multi-root)
   signals/
     base.py, runner.py, heuristics.py, external.py
+    trajectory.py        # experimental trajectory signals
   mining/
     base.py              # MemoryCandidate, MiningResult, registries
     render.py            # prompt-block markdown rendering + write helpers
@@ -539,11 +552,13 @@ src/retro/
       reme_refine.py     # success patterns + failure triggers + risk rules
       skill_pro.py       # reusable skill blocks
       memp_procedural.py # whole-session procedural memory
+      codex_headless.py  # LLM-backed extraction via `codex exec --json`
     filters/
       risk_aware.py      # prune high-risk / low-confidence / near-duplicates
 
 dashboard/
   build_dashboard.py     # static HTML + rollouts.json builder
+  build_trajectory_experiments.py  # experimental trajectory-signal report (standalone)
   pricing/
     litellm-pricing.json # vendored LiteLLM rates
     refresh.py           # refresh the snapshot from upstream

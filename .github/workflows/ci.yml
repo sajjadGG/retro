@@ -48,11 +48,18 @@ jobs:
         run: python -m pytest tests/ -v
 
       - name: Lint with ruff
-        run: python -m ruff check src/retro/ tests/
+        run: python -m ruff check .
 
       - name: Type check with mypy
         if: matrix.python-version == '3.13'
         run: python -m mypy src/retro/
+
+      - name: Smoke build dashboard
+        run: |
+          mkdir -p /tmp/empty-rollout-memory
+          python dashboard/build_dashboard.py --artifact-root /tmp/empty-rollout-memory
+          test -f dashboard/index.html
+          test -f dashboard/data/rollouts.json
 
       - name: Build distributions
         run: python -m build
