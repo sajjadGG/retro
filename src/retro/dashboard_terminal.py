@@ -6,7 +6,7 @@ Provides a feature-parity terminal view of the static HTML dashboard.
 from __future__ import annotations
 
 import json
-import subprocess
+import os
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -17,34 +17,30 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
+from .dashboard_build import build as build_dashboard_data
+
 console = Console()
 
 
 def load_dashboard_data(mode: str = "auto") -> dict[str, Any]:
     """Load dashboard data from rollouts.json, building it if missing."""
-    repo_root = Path(__file__).resolve().parents[2]
-    json_path = repo_root / "dashboard" / "data" / "rollouts.json"
+    artifact_root = os.environ.get("RETRO_ARTIFACT_ROOT")
+    out_dir = Path.cwd() / "dashboard"
+    json_path = out_dir / "data" / "rollouts.json"
 
     if not json_path.exists():
         console.print(
             "[yellow]dashboard/data/rollouts.json not found. Building dashboard data first...[/yellow]"
         )
-        builder = repo_root / "dashboard" / "build_dashboard.py"
-        if not builder.exists():
-            console.print(f"[red]Dashboard builder not found at {builder}[/red]")
+        try:
+            build_dashboard_data(
+                mode=mode,
+                artifact_root=Path(artifact_root) if artifact_root else None,
+                out_dir=out_dir,
+            )
+        except Exception as exc:  # pragma: no cover - defensive path
+            console.print(f"[red]Failed to build dashboard: {exc}[/red]")
             sys.exit(1)
-
-        cmd = [sys.executable, str(builder), "--mode", mode]
-        proc = subprocess.run(
-            cmd,
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            console.print(f"[red]Failed to build dashboard: {proc.stderr}[/red]")
-            sys.exit(proc.returncode)
 
     try:
         with json_path.open("r", encoding="utf-8") as fh:
