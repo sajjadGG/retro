@@ -38,8 +38,41 @@ class Layout:
     def memory_index_path(self) -> Path:
         return self.memories_dir() / "index.sqlite"
 
+    def sft_dir(self) -> Path:
+        return self.root / "sft"
+
+    def sft_dataset_dir(self, dataset_name: str) -> Path:
+        return self.sft_dir() / "datasets" / dataset_name
+
+    def sft_dataset_path(self, dataset_name: str, split: str) -> Path:
+        return self.sft_dataset_dir(dataset_name) / f"{split}.jsonl"
+
+    def sft_manifest_path(self, dataset_name: str) -> Path:
+        return self.sft_dataset_dir(dataset_name) / "manifest.json"
+
+    def sft_run_dir(self, run_name: str) -> Path:
+        return self.sft_dir() / "runs" / run_name
+
+    def sft_training_config_path(self, run_name: str) -> Path:
+        return self.sft_run_dir(run_name) / "training-config.json"
+
+    def sft_modal_script_path(self, run_name: str) -> Path:
+        return self.sft_run_dir(run_name) / "modal_train.py"
+
+    def sft_weights_dir(self, run_name: str) -> Path:
+        return self.sft_run_dir(run_name) / "weights"
+
+    def sft_eval_dir(self, run_name: str) -> Path:
+        return self.sft_run_dir(run_name) / "eval"
+
+    def sft_eval_plan_path(self, run_name: str) -> Path:
+        return self.sft_eval_dir(run_name) / "plan.json"
+
+    def sft_eval_report_path(self, run_name: str) -> Path:
+        return self.sft_eval_dir(run_name) / "comparison.json"
+
     def ensure(self) -> None:
-        for sub in ("raw", "normalized", "rendered", "mined", "memories"):
+        for sub in ("raw", "normalized", "rendered", "mined", "memories", "sft"):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_imported(self, host: Host) -> list[str]:
