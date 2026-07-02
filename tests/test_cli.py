@@ -73,3 +73,15 @@ def test_analyze_command(tmp_path):
     assert "Wrote analysis report to:" in result.output
 
 
+
+
+def test_sft_export_help():
+    result = runner.invoke(app, ["sft", "export", "--help"])
+    assert result.exit_code == 0
+    assert "ShareGPT-like SFT dataset" in result.output
+
+
+def test_sft_eval_help():
+    result = runner.invoke(app, ["sft", "eval", "--help"])
+    assert result.exit_code == 0
+    assert "benchmark outputs" in result.output

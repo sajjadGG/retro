@@ -45,3 +45,11 @@ def test_list_imported(tmp_path: Path):
 def test_default_layout():
     lay = default_layout("/tmp/test-rm")
     assert lay.root == Path("/tmp/test-rm").resolve()
+
+
+def test_sft_layout_paths():
+    lay = Layout(Path("/tmp/rm"))
+    assert lay.sft_dataset_path("distill", "train") == Path("/tmp/rm/sft/datasets/distill/train.jsonl")
+    assert lay.sft_manifest_path("distill") == Path("/tmp/rm/sft/datasets/distill/manifest.json")
+    assert lay.sft_modal_script_path("run-1") == Path("/tmp/rm/sft/runs/run-1/modal_train.py")
+    assert lay.sft_eval_report_path("run-1") == Path("/tmp/rm/sft/runs/run-1/eval/comparison.json")
