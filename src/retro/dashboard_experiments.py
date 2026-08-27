@@ -213,6 +213,7 @@ def render_html(payload: dict[str, Any]) -> str:
     tr:hover,tr.selected {{ background:#ffedd5; }}
     .badge {{ display:inline-flex; align-items:center; border-radius:999px; padding:2px 8px; font-size:12px; font-weight:650; background:#ecebe4; color:#363831; margin:1px 2px 1px 0; }}
     .badge.codex {{ background:#dbeafe; color:#1d4ed8; }}
+    .badge.vscode-copilot {{ background:#f0e7ff; color:#6f42c1; }}
     .badge.claude-code {{ background:#ffedd5; color:#c2410c; }}
     .badge.warn {{ background:#fef3c7; color:#92400e; }}
     .badge.bad {{ background:#fee2e2; color:#991b1b; }}

@@ -49,6 +49,11 @@ def test_import_codex_no_args():
     assert result.exit_code != 0
 
 
+def test_import_copilot_no_args():
+    result = runner.invoke(app, ["import", "copilot"])
+    assert result.exit_code != 0
+
+
 def test_show_unknown_host():
     result = runner.invoke(app, ["show", "foobar", "some-id"])
     assert result.exit_code != 0
@@ -71,5 +76,4 @@ def test_analyze_command(tmp_path):
     assert result.exit_code == 0
     assert "Retro Command & Tool Call Analysis" in result.output
     assert "Wrote analysis report to:" in result.output
-
 

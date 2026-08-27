@@ -18,8 +18,8 @@ python3 -m venv .venv
 
 ## Conventions
 
-- Python 3.10+.
-- Prefer `X | None` over `Optional[X]`.
+- Python 3.9+.
+- Prefer `X | None` over `Optional[X]` except in runtime-reflected APIs such as Typer command callbacks.
 - Keep raw captures immutable.
 - Preserve unknown events as `event_type="unknown"` rather than dropping them.
 - Use shared helpers from `src/retro/utils.py`.

@@ -2,7 +2,7 @@
 
 ## Problem
 
-Codex and Claude Code session storage is a source cache, not a durable research archive.
+Codex, Claude Code, and VS Code Copilot session storage is a source cache, not a durable research archive.
 
 Claude Code stores transcripts under `~/.claude/projects/`, but local transcript files are automatically swept after `cleanupPeriodDays` days. Codex stores rollout JSONL under `~/.codex/sessions/`, but those files are still local application state and can be affected by cleanup, app migrations, profile changes, or accidental deletion.
 
@@ -10,7 +10,7 @@ For this project, losing those files means losing the highest-value data: user m
 
 ## Goal
 
-Make `rollout-memory/` the durable archive of every available Codex and Claude Code rollout.
+Make `rollout-memory/` the durable archive of every available Codex, Claude Code, and VS Code Copilot rollout.
 
 The archive should be populated continuously, before upstream tools can delete or move their source files, and should expose capture coverage and secret-risk signals in the dashboard.
 
@@ -39,6 +39,17 @@ Codex:
 
 `state_5.sqlite` helps discover Codex threads and metadata, but the rollout JSONL is the durable content to copy.
 
+VS Code Copilot:
+
+```text
+<VS Code User>/workspaceStorage/*/chatSessions/<session-id>.json[l]
+<VS Code User>/workspaceStorage/*/GitHub.copilot-chat/transcripts/<session-id>.jsonl
+<VS Code User>/workspaceStorage/*/chatEditingSessions/<session-id>/
+<VS Code User>/workspaceStorage/*/GitHub.copilot-chat/chat-session-resources/<session-id>/
+```
+
+The core chat file is copied verbatim and its JSONL mutation log is reconstructed. The direct Copilot transcript and matching editing/resource sidecars are captured when available.
+
 ## Capture Strategy
 
 ### Manual Backfill
@@ -49,7 +60,7 @@ Run:
 retro import all
 ```
 
-This imports all currently discoverable Claude Code sessions and Codex threads into:
+This imports all currently discoverable sessions from every supported host into:
 
 ```text
 rollout-memory/raw/<host>/<id>/
@@ -63,9 +74,9 @@ Existing raw captures are skipped unless `--force` is passed.
 
 Run `retro import all` on a schedule. Recommended minimum:
 
-- hourly while actively using Codex or Claude Code,
+- hourly while actively using Codex, Claude Code, or VS Code Copilot,
 - daily on machines where the tools are used occasionally,
-- immediately before upgrading Codex, Claude Code, or their desktop apps.
+- immediately before upgrading Codex, Claude Code, VS Code, or Copilot Chat.
 
 The scheduled command should be idempotent. It must skip already-imported sessions and keep going when one source session fails.
 
@@ -156,7 +167,7 @@ For long-term use, this should become a scheduled job or app automation.
 
 ## Acceptance Criteria
 
-- `retro import all` imports every currently discoverable Codex and Claude Code session.
+- `retro import all` imports every currently discoverable Codex, Claude Code, and VS Code Copilot session.
 - Re-running `retro import all` is safe and skips existing raw captures.
 - A scheduled run can preserve sessions before upstream cleanup.
 - `retro signal run` emits secret-risk readings.

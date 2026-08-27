@@ -1,13 +1,20 @@
-"""Tests for Claude and Codex importers."""
+"""Tests for Claude, Codex, and VS Code Copilot importers."""
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 
 from retro.importers.claude import ClaudeImporter
 from retro.importers.codex import CodexImporter
+from retro.importers.vscode_copilot import (
+    VscodeCopilotImporter,
+    _load_core_session,
+)
 from retro.schema import read_events
 from retro.storage import Layout
 
@@ -180,4 +187,193 @@ class TestCodexImporter:
 
         # Should be allowed to re-import without force
         result = imp.import_session(identifier="thread-001")
+        assert result.event_count > 0
+
+
+# ---- VS Code Copilot importer -----------------------------------------------
+
+
+class TestVscodeCopilotImporter:
+    def _make_importer(
+        self,
+        tmp_path: Path,
+        user_data: Path,
+    ) -> tuple[VscodeCopilotImporter, Layout]:
+        layout = Layout(tmp_path / "rollout-memory")
+        layout.ensure()
+        return VscodeCopilotImporter(layout, user_data_dir=user_data), layout
+
+    def test_discover(self, tmp_path: Path, vscode_copilot_user_data: Path):
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+
+        sessions = imp.discover()
+
+        assert len(sessions) == 1
+        session = sessions[0]
+        assert session.session_id == "copilot-session-001"
+        assert session.workspace_name == "demo"
+        assert session.cwd == "/workspace/demo"
+        assert session.title == "Update app and test"
+        assert session.models == ("copilot/gpt-5.4",)
+        assert session.request_count == 1
+        assert session.transcript_path is not None
+
+    def test_import_captures_all_available_artifacts(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+
+        result = imp.import_session(identifier="copilot-session-001")
+
+        assert result.host == "vscode-copilot"
+        assert result.event_count > 0
+        assert (result.raw_dir / "session.jsonl").exists()
+        assert (result.raw_dir / "session.snapshot.json").exists()
+        assert (result.raw_dir / "transcript.jsonl").exists()
+        assert (result.raw_dir / "import_meta.json").exists()
+        assert (result.raw_dir / "sidecars" / "workspace.json").exists()
+        assert (result.raw_dir / "sidecars" / "chatEditingSession" / "state.json").exists()
+        assert (
+            result.raw_dir
+            / "sidecars"
+            / "chat-session-resources"
+            / "call-read"
+            / "content.txt"
+        ).exists()
+        store = json.loads(
+            (result.raw_dir / "sidecars" / "session-store.json").read_text(encoding="utf-8")
+        )
+        assert store["sessions"][0]["id"] == "copilot-session-001"
+        assert store["turns"][0]["turn_index"] == 0
+
+    def test_transcript_normalization_preserves_tools_reasoning_and_parents(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+
+        result = imp.import_session(identifier="copilot-session-001")
+        events = list(read_events(result.normalized_path))
+
+        assert result.unknown_event_count == 0
+        assert {event.event_type for event in events} >= {
+            "session_start",
+            "message",
+            "reasoning",
+            "file_read",
+            "command",
+            "attachment",
+        }
+        read_call = next(
+            event
+            for event in events
+            if event.actor == "assistant"
+            and event.event_type == "file_read"
+            and event.payload.get("call_id") == "call-read"
+        )
+        assert read_call.payload["input"]["filePath"] == "/workspace/demo/app.py"
+        assert read_call.payload["vscode_chat_raw_ref"]["line"] == 3
+        assert read_call.raw_ref.line == 5
+        assistant_message = next(
+            event
+            for event in events
+            if event.event_id == "copilot-session-001:transcript:event-004"
+        )
+        assert assistant_message.event_type == "message"
+        assert read_call.parent_event_id == assistant_message.event_id
+
+        command_start = next(
+            event
+            for event in events
+            if event.actor == "assistant"
+            and event.event_type == "command"
+            and event.payload.get("call_id") == "call-command"
+        )
+        command_result = next(
+            event
+            for event in events
+            if event.actor == "tool"
+            and event.event_type == "command"
+            and event.payload.get("call_id") == "call-command"
+        )
+        assert command_result.payload["success"] is False
+        assert command_result.parent_event_id == command_start.event_id
+        assert command_result.payload["result"]["exitCode"] == 1
+
+    def test_core_snapshot_fallback_normalizes_edits_and_permissions(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        transcript = (
+            vscode_copilot_user_data
+            / "workspaceStorage"
+            / "workspace-001"
+            / "GitHub.copilot-chat"
+            / "transcripts"
+            / "copilot-session-001.jsonl"
+        )
+        transcript.unlink()
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+
+        result = imp.import_session(identifier="copilot-session-001")
+        events = list(read_events(result.normalized_path))
+
+        assert result.unknown_event_count == 0
+        assert any(event.event_type == "file_edit" for event in events)
+        assert any(event.event_type == "permission" for event in events)
+        assert any(
+            event.event_type == "command"
+            and event.actor == "tool"
+            and event.payload["is_error"] is True
+            for event in events
+        )
+
+    def test_jsonl_mutation_log_reconstruction(
+        self,
+        vscode_copilot_session: Path,
+    ):
+        core = _load_core_session(vscode_copilot_session)
+
+        assert core.data["customTitle"] == "Update app and test"
+        assert core.data["requests"][0]["promptTokens"] == 120
+        assert "inputText" not in core.data["inputState"]
+        assert core.line_for(("requests", 0, "response", 0)) == 3
+        assert core.line_for(("requests", 0, "promptTokens")) == 4
+
+    def test_reimport_blocked_without_force(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+        imp.import_session(identifier="copilot-session-001")
+
+        with pytest.raises(FileExistsError):
+            imp.import_session(identifier="copilot-session-001")
+
+    def test_reimport_allowed_when_source_is_newer(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        imp, _ = self._make_importer(tmp_path, vscode_copilot_user_data)
+        imp.import_session(identifier="copilot-session-001")
+        source = (
+            vscode_copilot_user_data
+            / "workspaceStorage"
+            / "workspace-001"
+            / "chatSessions"
+            / "copilot-session-001.jsonl"
+        )
+        with source.open("a", encoding="utf-8") as handle:
+            handle.write("\n")
+        changed = time.time() + 10
+        os.utime(source, (changed, changed))
+
+        result = imp.import_session(identifier="copilot-session-001")
+
         assert result.event_count > 0

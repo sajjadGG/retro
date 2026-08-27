@@ -460,6 +460,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             "edits": 0,
             "sessions_claude": 0,
             "sessions_codex": 0,
+            "sessions_copilot": 0,
             "cost_input": 0.0,
             "cost_cache_create": 0.0,
             "cost_cache_read": 0.0,
@@ -479,6 +480,8 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             by_day[day]["sessions_claude"] += 1
         elif session["host"] == "codex":
             by_day[day]["sessions_codex"] += 1
+        elif session["host"] == "vscode-copilot":
+            by_day[day]["sessions_copilot"] += 1
         by_day[day]["tokens"] += session["tokens"].get("total_tokens", 0)
         by_day[day]["cost"] += session.get("estimated_cost_usd") or 0.0
         by_day[day]["tool_calls"] += session.get("tool_call_events", 0)
@@ -503,6 +506,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         totals["errors"] += session["failed_events"]
         totals["unknown_events"] += session["unknown_events"]
         totals["tokens"] += session["tokens"].get("total_tokens", 0)
+        totals["copilot_credits"] += session["tokens"].get("copilot_credits", 0)
         total_cost += session.get("estimated_cost_usd") or 0.0
         totals["rate_limit_hits"] += session.get("rate_limit_hits", 0)
 
@@ -769,6 +773,8 @@ def extract_token_stats(events: list[dict[str, Any]], host: str, session_id: str
         return _extract_claude_token_stats(events, session_id)
     if host == "codex":
         return _extract_codex_token_stats(events, session_id)
+    if host == "vscode-copilot":
+        return _extract_copilot_token_stats(session_id)
     return {**_empty_bucket(), "by_model": {}, "embedded_cost_usd": None}
 
 
@@ -884,6 +890,77 @@ def _extract_codex_token_stats(events: list[dict[str, Any]], session_id: str) ->
 
     _finalize_totals(totals, by_model)
     return {**totals, "by_model": by_model, "embedded_cost_usd": None, "embedded_cost_events": 0}
+
+
+def _extract_copilot_token_stats(session_id: str) -> dict[str, Any]:
+    """Sum request-level token usage from VS Code's reconstructed chat snapshot."""
+    snapshot_path = (
+        ARTIFACT_ROOT
+        / "raw"
+        / "vscode-copilot"
+        / session_id
+        / "session.snapshot.json"
+    )
+    totals = _empty_bucket()
+    by_model: dict[str, dict[str, int]] = {}
+    copilot_credits = 0.0
+    credit_events = 0
+    if snapshot_path.exists():
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        requests = data.get("requests") if isinstance(data, dict) else None
+        for request in requests if isinstance(requests, list) else []:
+            if not isinstance(request, dict):
+                continue
+            model = request.get("modelId")
+            model_key = model if isinstance(model, str) and model else "unknown"
+            detailed = request.get("modelTotals")
+            used_detailed = False
+            if isinstance(detailed, dict):
+                for detailed_model, usage in detailed.items():
+                    if not isinstance(usage, dict):
+                        continue
+                    normalized = _normalize_copilot_usage(usage)
+                    if not any(normalized.values()):
+                        continue
+                    used_detailed = True
+                    _add_to_bucket(totals, normalized)
+                    bucket = by_model.setdefault(str(detailed_model), _empty_bucket())
+                    _add_to_bucket(bucket, normalized)
+            if not used_detailed:
+                normalized = _normalize_copilot_usage(request)
+                if any(normalized.values()):
+                    _add_to_bucket(totals, normalized)
+                    bucket = by_model.setdefault(model_key, _empty_bucket())
+                    _add_to_bucket(bucket, normalized)
+
+            credits = request.get("copilotCredits")
+            if isinstance(credits, (int, float)):
+                copilot_credits += float(credits)
+                credit_events += 1
+
+    _finalize_totals(totals, by_model)
+    return {
+        **totals,
+        "by_model": by_model,
+        "embedded_cost_usd": None,
+        "embedded_cost_events": 0,
+        "copilot_credits": round(copilot_credits, 4),
+        "copilot_credit_events": credit_events,
+    }
+
+
+def _normalize_copilot_usage(usage: dict[str, Any]) -> dict[str, int]:
+    prompt = usage.get("promptTokens")
+    completion = usage.get("completionTokens")
+    total = usage.get("totalTokens")
+    out = _empty_bucket()
+    if isinstance(prompt, (int, float)):
+        out["input_tokens"] = int(prompt)
+    if isinstance(completion, (int, float)):
+        out["output_tokens"] = int(completion)
+    if isinstance(total, (int, float)):
+        out["total_tokens"] = int(total)
+    return out
 
 
 def _finalize_totals(totals: dict[str, int], by_model: dict[str, dict[str, int]]) -> None:
@@ -1099,6 +1176,11 @@ def infer_models(host: str, session_id: str, raw_meta: dict[str, Any], events: l
         value = raw_meta.get(key)
         if isinstance(value, str) and value:
             models[value] += 1
+    raw_models = raw_meta.get("models")
+    if isinstance(raw_models, list):
+        for model in raw_models:
+            if isinstance(model, str) and model:
+                models[model] += 1
 
     raw_dir = ARTIFACT_ROOT / "raw" / host / session_id
     raw_path = raw_dir / ("transcript.jsonl" if host == "claude-code" else "rollout.jsonl")
@@ -1118,6 +1200,17 @@ def infer_models(host: str, session_id: str, raw_meta: dict[str, Any], events: l
                 payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else {}
                 model = codex_model_from_payload(payload)
                 if model:
+                    models[model] += 1
+    elif host == "vscode-copilot":
+        snapshot_path = raw_dir / "session.snapshot.json"
+        if snapshot_path.exists():
+            data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            requests = data.get("requests") if isinstance(data, dict) else None
+            for request in requests if isinstance(requests, list) else []:
+                if not isinstance(request, dict):
+                    continue
+                model = request.get("modelId")
+                if isinstance(model, str) and model:
                     models[model] += 1
     return [model for model, _ in models.most_common()]
 
@@ -1149,6 +1242,8 @@ def infer_provider(host: str, raw_meta: dict[str, Any], events: list[dict[str, A
         return "anthropic"
     if host == "codex":
         return "openai"
+    if host == "vscode-copilot":
+        return "github-copilot"
     return "unknown"
 
 
@@ -1365,13 +1460,16 @@ def render_html(payload: dict[str, Any]) -> str:
       --muted: #686b63;
       --accent: #0f766e;
       --accent-soft: #d9efeb;
-      /* Host colors: Claude = orange, Codex = blue. */
+      /* Host colors: Claude = orange, Codex = blue, Copilot = purple. */
       --host-claude: #ea580c;
       --host-claude-soft: #ffedd5;
       --host-claude-line: #fdba74;
       --host-codex: #2563eb;
       --host-codex-soft: #dbeafe;
       --host-codex-line: #93c5fd;
+      --host-copilot: #8250df;
+      --host-copilot-soft: #f0e7ff;
+      --host-copilot-line: #c4a7ff;
       --warn: #b45309;
       --bad: #b91c1c;
       --cost-input: #2563eb;
@@ -1403,10 +1501,11 @@ def render_html(payload: dict[str, Any]) -> str:
     .kpi .label {{ font-size: 12px; color: var(--muted); }}
     .kpi .value {{ margin-top: 6px; font-size: 23px; font-weight: 720; }}
     .kpi.sessions-total {{ border-top: 3px solid var(--accent); }}
-    .session-split {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }}
+    .session-split {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }}
     .session-split .item {{ border-radius: 6px; padding: 6px 7px; border: 1px solid var(--line); background: #fbfbf8; }}
     .session-split .item.claude-code {{ background: var(--host-claude-soft); border-color: var(--host-claude-line); }}
     .session-split .item.codex {{ background: var(--host-codex-soft); border-color: var(--host-codex-line); }}
+    .session-split .item.vscode-copilot {{ background: var(--host-copilot-soft); border-color: var(--host-copilot-line); }}
     .session-split .name {{ display: block; color: var(--muted); font-size: 11px; }}
     .session-split .count {{ display: block; margin-top: 2px; font-weight: 760; }}
     .controls {{ display: flex; gap: 10px; flex-wrap: wrap; align-items: center; background: #fbfbf8; border: 1px solid var(--line); border-radius: 8px; padding: 10px; position: sticky; top: 0; z-index: 20; }}
@@ -1428,16 +1527,21 @@ def render_html(payload: dict[str, Any]) -> str:
     .badge {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 8px; font-size: 12px; font-weight: 600; background: #ecebe4; color: #353731; }}
     .badge.codex {{ background: var(--host-codex-soft); color: var(--host-codex); border: 1px solid var(--host-codex-line); }}
     .badge.claude-code {{ background: var(--host-claude-soft); color: var(--host-claude); border: 1px solid var(--host-claude-line); }}
+    .badge.vscode-copilot {{ background: var(--host-copilot-soft); color: var(--host-copilot); border: 1px solid var(--host-copilot-line); }}
     tr.host-codex td:first-child {{ box-shadow: inset 3px 0 0 var(--host-codex); }}
     tr.host-claude-code td:first-child {{ box-shadow: inset 3px 0 0 var(--host-claude); }}
+    tr.host-vscode-copilot td:first-child {{ box-shadow: inset 3px 0 0 var(--host-copilot); }}
     .kpi.host-codex {{ border-top: 3px solid var(--host-codex); }}
     .kpi.host-claude-code {{ border-top: 3px solid var(--host-claude); }}
+    .kpi.host-vscode-copilot {{ border-top: 3px solid var(--host-copilot); }}
     .dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }}
     .dot.codex {{ background: var(--host-codex); }}
     .dot.claude-code {{ background: var(--host-claude); }}
+    .dot.vscode-copilot {{ background: var(--host-copilot); }}
     .stacked-bar {{ display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: #e5e4dc; }}
     .stacked-bar .seg.codex {{ background: var(--host-codex); }}
     .stacked-bar .seg.claude-code {{ background: var(--host-claude); }}
+    .stacked-bar .seg.vscode-copilot {{ background: var(--host-copilot); }}
     .legend {{ display: flex; gap: 14px; padding: 0 12px 8px; font-size: 12px; color: var(--muted); align-items: center; }}
     .metrics {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; padding: 12px; }}
     .metric {{ border: 1px solid var(--line); border-radius: 6px; padding: 9px; background: #fff; }}
@@ -1582,6 +1686,7 @@ def render_html(payload: dict[str, Any]) -> str:
       <div class="legend">
         <span><span class="dot claude-code"></span> Claude Code</span>
         <span><span class="dot codex"></span> Codex</span>
+        <span><span class="dot vscode-copilot"></span> VS Code Copilot</span>
       </div>
       <div class="mem-grid" id="memoryGrid"></div>
     </section>
@@ -1593,6 +1698,7 @@ def render_html(payload: dict[str, Any]) -> str:
           <option value="all">All hosts</option>
           <option value="claude-code">Claude Code</option>
           <option value="codex">Codex</option>
+          <option value="vscode-copilot">VS Code Copilot</option>
         </select>
         <select id="amScope">
           <option value="all">All scopes</option>
@@ -1623,7 +1729,7 @@ def render_html(payload: dict[str, Any]) -> str:
       <div class="signal-aggs" id="signalAggs"></div>
     </section>
     <section class="panel">
-      <h2>Activity By Day · <span style="color:var(--host-claude)">Claude</span> + <span style="color:var(--host-codex)">Codex</span></h2>
+      <h2>Activity By Day · <span style="color:var(--host-claude)">Claude</span> + <span style="color:var(--host-codex)">Codex</span> + <span style="color:var(--host-copilot)">Copilot</span></h2>
       <div class="bars" id="dayBars"></div>
     </section>
     <section class="panel" id="accountingPanel">
@@ -1724,6 +1830,7 @@ def render_html(payload: dict[str, Any]) -> str:
         <option value="all">All hosts</option>
         <option value="codex">Codex</option>
         <option value="claude-code">Claude Code</option>
+        <option value="vscode-copilot">VS Code Copilot</option>
       </select>
       <select id="projectFilter">
         <option value="all">All projects</option>
@@ -1779,13 +1886,14 @@ def render_html(payload: dict[str, Any]) -> str:
       return `<div class="kpi ${{klass}}"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`;
     }}
 
-    function sessionKpi(total, claudeCount, codexCount) {{
+    function sessionKpi(total, claudeCount, codexCount, copilotCount) {{
       return `<div class="kpi sessions-total">
         <div class="label">Sessions</div>
         <div class="value">${{fmt.format(total)}}</div>
         <div class="session-split">
           <div class="item claude-code"><span class="name">Claude</span><span class="count">${{fmt.format(claudeCount)}}</span></div>
           <div class="item codex"><span class="name">Codex</span><span class="count">${{fmt.format(codexCount)}}</span></div>
+          <div class="item vscode-copilot"><span class="name">Copilot</span><span class="count">${{fmt.format(copilotCount)}}</span></div>
         </div>
       </div>`;
     }}
@@ -1862,10 +1970,11 @@ def render_html(payload: dict[str, Any]) -> str:
       const byHost = DATA.summary.by_host || {{}};
       const claudeCount = byHost['claude-code'] || 0;
       const codexCount = byHost['codex'] || 0;
+      const copilotCount = byHost['vscode-copilot'] || 0;
       const secretAgg = DATA.signals?.by_signal?.secret_exposure_signal || {{}};
       const mem = DATA.memory || {{}};
       document.getElementById('kpis').innerHTML = [
-        sessionKpi(DATA.summary.sessions_used_for_stats || DATA.summary.session_count, claudeCount, codexCount),
+        sessionKpi(DATA.summary.sessions_used_for_stats || DATA.summary.session_count, claudeCount, codexCount, copilotCount),
         kpi('Memory candidates', fmt.format(mem.candidate_count || 0)),
         kpi('With token data', fmt.format(DATA.summary.sessions_with_token_usage || 0)),
         kpi('With cost estimate', fmt.format(DATA.summary.sessions_with_cost_estimate || 0)),
@@ -1874,6 +1983,7 @@ def render_html(payload: dict[str, Any]) -> str:
         kpi('Active projects', fmt.format(DATA.summary.projects?.length || 0)),
         kpi('File edits', fmt.format(t.file_edits || 0)),
         kpi('Tokens', fmt.format(t.tokens || 0)),
+        kpi('Copilot credits', Number(t.copilot_credits || 0).toFixed(2)),
         kpi('Est. cost', money(DATA.summary.estimated_cost_usd)),
       ].join('');
     }}
@@ -1884,15 +1994,18 @@ def render_html(payload: dict[str, Any]) -> str:
       document.getElementById('dayBars').innerHTML = days.map(([day,d]) => {{
         const claude = d.sessions_claude || 0;
         const codex = d.sessions_codex || 0;
+        const copilot = d.sessions_copilot || 0;
         const claudePct = 100 * claude / max;
         const codexPct = 100 * codex / max;
+        const copilotPct = 100 * copilot / max;
         return `<div class="barrow">
           <span>${{day}}</span>
           <div class="stacked-bar">
             <span class="seg claude-code" style="width:${{claudePct}}%"></span>
             <span class="seg codex" style="width:${{codexPct}}%"></span>
+            <span class="seg vscode-copilot" style="width:${{copilotPct}}%"></span>
           </div>
-          <span title="claude / codex">${{claude}}+${{codex}}</span>
+          <span title="claude / codex / copilot">${{claude}}+${{codex}}+${{copilot}}</span>
         </div>`;
       }}).join('');
     }}

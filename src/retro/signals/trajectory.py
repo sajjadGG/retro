@@ -198,7 +198,7 @@ def _trajectory_action_redundancy(ctx: SessionContext):
 def _trajectory_consecutive_repetition_count(ctx: SessionContext):
     steps = _steps(ctx)
     hits = []
-    for prev, cur in zip(steps, steps[1:], strict=False):
+    for prev, cur in zip(steps, steps[1:]):
         if (
             prev.action_fingerprint_key == cur.action_fingerprint_key
             or prev.action_category == cur.action_category
@@ -303,7 +303,7 @@ def _trajectory_sequence_entropy(ctx: SessionContext):
 def _trajectory_phase_transition_count(ctx: SessionContext):
     steps = _steps(ctx)
     value = sum(
-        1 for a, b in zip(steps, steps[1:], strict=False) if a.action_category != b.action_category
+        1 for a, b in zip(steps, steps[1:]) if a.action_category != b.action_category
     )
     return reading(ctx, _trajectory_phase_transition_count, value)
 
@@ -424,7 +424,7 @@ def _trajectory_test_fix_loop_count(ctx: SessionContext):
     steps = _steps(ctx)
     count = 0
     evidence_steps = []
-    for a, b, c, d in zip(steps, steps[1:], steps[2:], steps[3:], strict=False):
+    for a, b, c, d in zip(steps, steps[1:], steps[2:], steps[3:]):
         if (
             a.action_category == "generate_fix"
             and b.action_category == "run_tests"
@@ -483,7 +483,7 @@ def _trajectory_failed_result_recovery_steps(ctx: SessionContext):
 def _trajectory_failure_ignored_count(ctx: SessionContext):
     steps = _steps(ctx)
     hits = []
-    for step, later in zip(steps, steps[1:], strict=False):
+    for step, later in zip(steps, steps[1:]):
         if not result_is_failed_text(step.result_text):
             continue
         if (
@@ -512,7 +512,7 @@ def _trajectory_result_token_reuse_ratio(ctx: SessionContext):
     eligible = 0
     reused = 0
     examples = []
-    for step, later in zip(steps, steps[1:], strict=False):
+    for step, later in zip(steps, steps[1:]):
         terms = _salient_terms(step.result_text)
         if not terms:
             continue
@@ -542,7 +542,7 @@ def _trajectory_error_to_search_or_edit_ratio(ctx: SessionContext):
     steps = _steps(ctx)
     failures = 0
     recovered = 0
-    for step, later in zip(steps, steps[1:], strict=False):
+    for step, later in zip(steps, steps[1:]):
         if not result_is_failed_text(step.result_text):
             continue
         failures += 1

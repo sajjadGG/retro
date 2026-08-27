@@ -31,7 +31,8 @@ EventType = Literal[
     "reasoning",
     "unknown",
 ]
-Host = Literal["claude-code", "codex"]
+Host = Literal["claude-code", "codex", "vscode-copilot"]
+HOSTS: tuple[Host, ...] = ("claude-code", "codex", "vscode-copilot")
 
 
 @dataclass

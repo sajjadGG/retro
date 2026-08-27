@@ -2,7 +2,7 @@
 
 ![Retro logo](assets/retro_logo.png)
 
-Capture **Codex** and **Claude Code** rollouts into durable local artifacts, evaluate them with signals, mine them into prompt-time memory, and report on cost and behavior via a static dashboard. Local-first, no cloud, evidence-linked.
+Capture **Codex**, **Claude Code**, and **VS Code GitHub Copilot Chat** rollouts into durable local artifacts, evaluate them with signals, mine them into prompt-time memory, and report on cost and behavior via a static dashboard. Local-first, no cloud, evidence-linked.
 
 Project wiki and onboarding guides: <https://sajjadgg.github.io/retro/>
 
@@ -41,7 +41,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 
 ## Install
 
-Requires Python ≥ 3.10.
+Requires Python ≥ 3.9.
 
 From PyPI:
 
@@ -54,7 +54,7 @@ That installs the `retro` CLI.
 From a clone:
 
 ```bash
-python3.13 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
@@ -70,7 +70,8 @@ The PyPI distribution is named `retro-agent-memory` because `retro` is already o
                   ├──────────────┬─────────────┬──────────────┬───────────┤
    ~/.claude  ──▶ │  importers   │   signals   │    mining    │  memory   │
    ~/.codex   ──▶ │  (claude,    │  (heuristic │  (4 methods, │  index    │
-                  │   codex)     │  + external)│  + filters)  │  + weave  │
+ VS Code User ──▶ │ codex,       │  + external)│  + filters)  │  + weave  │
+                  │ copilot)     │             │              │           │
                   └──────┬───────┴──────┬──────┴───────┬──────┴─────┬─────┘
                          ▼              ▼              ▼            ▼
                        raw/        normalized/      mined/      memories/
@@ -97,9 +98,13 @@ rollout-memory/
   raw/<host>/<session-id>/                   # immutable copies of source jsonl + metadata + sidecars
     transcript.jsonl        (claude)
     rollout.jsonl           (codex)
+    session.jsonl|json       (vscode-copilot) # verbatim VS Code chat persistence
+    session.snapshot.json    (vscode-copilot) # reconstructed JSONL mutation state
+    transcript.jsonl         (vscode-copilot) # direct Copilot event log, when available
     import_meta.json        (claude)         # source path, project_slug, claude_home, …
+    import_meta.json        (vscode-copilot) # workspace, models, sources, capture fingerprint
     thread.json             (codex)          # cwd, model_provider, source_kind, spawn_edges, …
-    sidecars/               (claude todos/tasks if present)
+    sidecars/               # Claude todos/tasks or Copilot edits/resources/session-store rows
 
   normalized/<host>/<session-id>.events.jsonl  # one normalized event per line
 
@@ -125,12 +130,13 @@ rollout-memory/
 
 ## Capture
 
-Discovery merges both Claude default roots and honors comma-separated overrides — same behavior as ccusage.
+Discovery merges each host's default roots and honors comma-separated overrides.
 
-| Host       | Default roots                                       | Env override          |
-| ---------- | --------------------------------------------------- | --------------------- |
-| Claude Code| `~/.claude/projects/` and `~/.config/claude/projects/` | `CLAUDE_CONFIG_DIR` |
-| Codex      | `~/.codex` (uses `state_5.sqlite.threads.rollout_path`) | `CODEX_HOME`      |
+| Host | Default roots | Env override |
+| --- | --- | --- |
+| Claude Code | `~/.claude/projects/` and `~/.config/claude/projects/` | `CLAUDE_CONFIG_DIR` |
+| Codex | `~/.codex` (uses `state_5.sqlite.threads.rollout_path`) | `CODEX_HOME` |
+| VS Code Copilot | Platform VS Code/Insiders `User` directories plus `~/.vscode-server*/data/User` | `VSCODE_COPILOT_USER_DIRS` |
 
 Codex roots are auto-classified:
 - **sqlite_home**: has `state_5.sqlite` → discovery via SQLite (preserves spawn-edge graph).
@@ -141,21 +147,25 @@ Codex roots are auto-classified:
 
 ```bash
 # Discover what's available on this machine
-retro list                           # both hosts, with retention warning for old Claude logs
+retro list                           # all hosts, with retention warning for old Claude logs
 retro list --host claude
 retro list --host codex
+retro list --host copilot
 retro list --limit 50
 
 # Import a single session
 retro import claude --session-id <session-id>
 retro import codex  --thread-id  <thread-id>
+retro import copilot --session-id <session-id>
 retro import claude --latest         # most-recent
 retro import codex  --latest
+retro import copilot --latest
 
 # Import every discoverable session
-retro import all                     # both hosts
+retro import all                     # all supported hosts
 retro import claude --all
 retro import codex  --all
+retro import copilot --all
 retro import all --limit-per-host 20
 
 # Force overwrite an existing capture
@@ -167,10 +177,12 @@ retro import codex --latest --no-render
 # Re-render markdown from an already-imported normalized stream
 retro render claude <session-id>
 retro render codex  <thread-id>
+retro render copilot <session-id>
 
 # Inspect what got captured
 retro show claude <session-id>
 retro show codex  <thread-id>
+retro show copilot <session-id>
 ```
 
 ### Multi-root example
@@ -181,11 +193,16 @@ CLAUDE_CONFIG_DIR="$HOME/.claude,$HOME/.config/claude,/backup/claude-archive" re
 
 # Codex saved via `codex exec --json` (no SQLite present):
 CODEX_HOME="$HOME/.codex,$HOME/codex-exec-logs" retro import codex --all
+
+# VS Code profiles or remote User roots outside the platform defaults:
+VSCODE_COPILOT_USER_DIRS="$HOME/custom-code/User,$HOME/.vscode-server/data/User" retro import copilot --all
 ```
 
 ### Retention warning
 
 When the oldest discoverable Claude transcript is **more than 25 days old**, `retro list` prints a yellow warning. Claude Code retains logs for ~30 days by default — capture older sessions before they age out, or raise `cleanupPeriodDays` in Claude settings.
+
+VS Code Copilot discovery reads both legacy full-session `.json` files and current append-only `.jsonl` mutation logs under `workspaceStorage/*/chatSessions/`. When present, it also captures Copilot's direct event transcript, editing-session snapshots, tool-result resources, workspace metadata, and the matching rows from `github.copilot-chat/session-store.db`. Empty and non-Copilot chat sessions are excluded.
 
 ---
 
@@ -457,6 +474,7 @@ Then open `dashboard/index.html` directly from disk.
 
 - **LiteLLM pricing snapshot** bundled at `src/retro/pricing/litellm-pricing.json` is the authoritative source for per-model rates (USD per token). The hardcoded `DEFAULT_RATES` table is the fallback for any model not in the snapshot.
 - **Per-model attribution**: each token delta is tagged with the active model (`turn_context.model` for Codex, per-message `model` for Claude). Multi-model sessions produce per-model rows.
+- **Copilot usage**: VS Code request-level `promptTokens`, `completionTokens`, model IDs, and Copilot credits are read from the reconstructed core chat snapshot.
 - **Codex token deltas** prefer the explicit `info.last_token_usage` per-turn delta when present, falling back to cumulative subtraction for older Codex builds.
 - **Cached-input handling** follows ccusage's behavior: subtract for Codex (its `input_tokens` is cumulative including cache), don't subtract for Anthropic (its `input_tokens` is already fresh non-cached).
 - **Cost source labeling**: each session records whether its cost was `embedded` (provider-supplied) or `calculated` (token math).
@@ -486,7 +504,7 @@ To add a model: add an empty entry under its name in the snapshot, then re-run `
 
 ## Release and publishing
 
-CI lives in `.github/workflows/ci.yml`. It runs on pushes and pull requests to `main`, installs the package across Python 3.10-3.13, compiles `src/retro`, smoke-tests the CLI, builds the wheel/sdist, and validates them with `twine check`.
+CI lives in `.github/workflows/ci.yml`. It runs on pushes and pull requests to `main`, installs the package across Python 3.9-3.13, compiles `src/retro`, smoke-tests the CLI, builds the wheel/sdist, and validates them with `twine check`.
 
 Publishing lives in `.github/workflows/publish.yml`. It runs when a GitHub release is published, builds the package, publishes it to PyPI with trusted publishing, and attaches the wheel/sdist to the GitHub release.
 
