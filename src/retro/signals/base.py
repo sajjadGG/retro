@@ -24,6 +24,7 @@ class SessionContext:
     events: Sequence[NormalizedEvent]
     raw_dir: Path
     raw_meta: dict[str, Any] = field(default_factory=dict)
+    cache: dict[str, Any] = field(default_factory=dict)
 
     @property
     def cwd(self) -> str | None:

@@ -6,6 +6,7 @@ from pathlib import Path
 from retro.schema import Actor, EventType, NormalizedEvent, RawRef
 from retro.signals import REGISTRY
 from retro.signals.base import SessionContext
+from retro.signals.trajectory import _steps
 from retro.trajectory import build_trajectory
 
 
@@ -33,6 +34,21 @@ def _ev(
 
 def _ctx(events):
     return SessionContext(host="codex", session_id="s", events=events, raw_dir=Path("/tmp/raw"))
+
+
+def test_trajectory_steps_are_cached_per_session_context():
+    context = _ctx(
+        [
+            _ev("u1", "user", "message", payload={"text": "test"}),
+            _ev("a1", "assistant", "command", payload={"command": "pytest"}),
+        ]
+    )
+
+    first = _steps(context)
+    second = _steps(context)
+
+    assert first is second
+    assert context.cache["trajectory.steps"] is first
 
 
 def test_build_trajectory_categorizes_search_edit_test():

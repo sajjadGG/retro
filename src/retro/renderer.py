@@ -198,12 +198,49 @@ def _block_quote(text: str) -> str:
 
 def _short_json(value, indent: int | None = None, limit: int = 600) -> str:
     try:
-        s = json.dumps(value, ensure_ascii=False, indent=indent)
+        s = json.dumps(
+            _bounded_json(value, [max(limit * 2, 1024)], depth=0),
+            ensure_ascii=False,
+            indent=indent,
+        )
     except (TypeError, ValueError):
         s = repr(value)
     if len(s) > limit:
         s = s[: limit - 1] + "…"
     return s
+
+
+def _bounded_json(value, remaining: list[int], *, depth: int):
+    if remaining[0] <= 0:
+        return "... [truncated]"
+    if depth >= 8:
+        return "... [max depth]"
+    if isinstance(value, str):
+        if len(value) <= remaining[0]:
+            remaining[0] -= len(value)
+            return value
+        keep = max(0, remaining[0])
+        remaining[0] = 0
+        return value[:keep] + "... [truncated]"
+    if isinstance(value, dict):
+        dict_out = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= 100 or remaining[0] <= 0:
+                dict_out["..."] = "[truncated]"
+                break
+            remaining[0] -= min(len(str(key)), remaining[0])
+            dict_out[key] = _bounded_json(child, remaining, depth=depth + 1)
+        return dict_out
+    if isinstance(value, (list, tuple)):
+        list_out = []
+        for index, child in enumerate(value):
+            if index >= 100 or remaining[0] <= 0:
+                list_out.append("... [truncated]")
+                break
+            list_out.append(_bounded_json(child, remaining, depth=depth + 1))
+        return list_out
+    remaining[0] -= min(len(repr(value)), remaining[0])
+    return value
 
 
 def _truncate_keep_lines(text: str, limit: int) -> str:

@@ -18,7 +18,13 @@ from .base import REGISTRY, SessionContext, reading, register
 
 
 def _steps(ctx: SessionContext) -> list[TrajectoryStep]:
-    return build_trajectory(ctx.events)
+    key = "trajectory.steps"
+    cached = ctx.cache.get(key)
+    if isinstance(cached, list):
+        return cached
+    steps = build_trajectory(ctx.events)
+    ctx.cache[key] = steps
+    return steps
 
 
 def _evidence(steps: list[TrajectoryStep], *, limit: int = 8) -> list[str]:
