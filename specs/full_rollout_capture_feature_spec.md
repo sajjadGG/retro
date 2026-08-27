@@ -132,7 +132,17 @@ globalStorage/github.copilot-chat/session-store.db
 
 The direct Copilot transcript records session/user/assistant/turn/tool lifecycle events with stable ids, parent ids, timestamps, reasoning, tool arguments, and execution outcomes. The core VS Code chat snapshot supplies model ids, token counts, Copilot credits, edit groups, confirmations, and final tool metadata.
 
-Implication: prefer the direct Copilot event transcript for normalization when present, enrich it from the reconstructed core chat state, and retain core-only normalization as a fallback for older sessions.
+Copilot CLI and VS Code Agent Host sessions persist separately:
+
+```text
+~/.copilot/session-state/<session-id>/events.jsonl
+~/.copilot/session-state/<session-id>/workspace.yaml
+~/.copilot/session-store.db
+```
+
+These logs contain the current CLI-based sessions shown in VS Code's Agent Sessions UI, including hooks, permissions, external tools, subagents, model changes, usage checkpoints, errors, shutdown/resume events, and active sessions. The SQLite store adds per-model input/output/cache/reasoning accounting.
+
+Implication: combine core VS Code chat discovery with Agent Host session-state discovery. Prefer direct event logs for normalization, preserve each source verbatim, and label the source so the dashboard can distinguish `vscode-chat` from `copilot-cli`.
 
 ## Capture Strategy
 
@@ -186,6 +196,9 @@ V0 should support:
 4. Prefer the direct Copilot event transcript when present and preserve its event ids and parent links.
 5. Snapshot the matching editing session, tool-result resources, workspace metadata, and session-store rows.
 6. Preserve request-level model, token, and Copilot-credit fields for dashboard accounting.
+7. Discover Copilot CLI and Agent Host rollouts from `~/.copilot/session-state`.
+8. Capture active logs as point-in-time snapshots and allow automatic re-import when they grow.
+9. Join detailed usage rows from `~/.copilot/session-store.db`.
 
 ## Storage Model
 
@@ -210,6 +223,7 @@ rollout-memory/
         session.jsonl
         session.snapshot.json
         transcript.jsonl
+        events.jsonl
         import_meta.json
         sidecars/
   normalized/

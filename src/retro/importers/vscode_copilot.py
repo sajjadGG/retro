@@ -40,9 +40,12 @@ _FILE_READ_TOOLS = {
     "copilot_listDirectory",
     "copilot_readFile",
     "file_search",
+    "glob",
     "grep_search",
     "list_dir",
     "read_file",
+    "rg",
+    "view",
 }
 _FILE_EDIT_TOOLS = {
     "apply_patch",
@@ -51,15 +54,18 @@ _FILE_EDIT_TOOLS = {
     "copilot_multiReplaceString",
     "copilot_replaceString",
     "create_file",
+    "edit_file",
     "multi_replace_string_in_file",
     "replace_string_in_file",
+    "write_file",
 }
 _COMMAND_TOOLS = {
+    "bash",
     "kill_terminal",
     "run_in_terminal",
     "terminal_last_command",
 }
-_SUBAGENT_TOOLS = {"runSubagent", "run_subagent"}
+_SUBAGENT_TOOLS = {"runSubagent", "run_subagent", "task"}
 
 
 @dataclass
@@ -96,6 +102,7 @@ class CopilotSession:
     transcript_path: Path | None
     editing_session_dir: Path | None
     resources_dir: Path | None
+    source_kind: str = "vscode-chat"
 
     @property
     def display_title(self) -> str:
@@ -163,8 +170,11 @@ class VscodeCopilotImporter:
             if user_data_dir is not None
             else _resolve_vscode_user_dirs(roots)
         )
+        self._discover_cache: list[CopilotSession] | None = None
 
     def discover(self) -> list[CopilotSession]:
+        if self._discover_cache is not None:
+            return list(self._discover_cache)
         by_id: dict[str, CopilotSession] = {}
         for user_dir in self.user_dirs:
             if not user_dir.is_dir():
@@ -180,7 +190,12 @@ class VscodeCopilotImporter:
                     previous = by_id.get(session.session_id)
                     if previous is None or self._session_rank(session) > self._session_rank(previous):
                         by_id[session.session_id] = session
-        return sorted(by_id.values(), key=lambda session: session.mtime, reverse=True)
+        self._discover_cache = sorted(
+            by_id.values(),
+            key=lambda session: session.mtime,
+            reverse=True,
+        )
+        return list(self._discover_cache)
 
     def _session_files(self, profile_root: Path) -> list[tuple[Path, Path | None]]:
         found: list[tuple[Path, Path | None]] = []
@@ -340,6 +355,7 @@ class VscodeCopilotImporter:
         meta = {
             "host": self.host,
             "session_id": session.session_id,
+            "source_kind": session.source_kind,
             "title": session.title,
             "cwd": session.cwd,
             "workspace_id": session.workspace_id,
@@ -1445,6 +1461,8 @@ def _export_session_store(db_path: Path, session_id: str) -> dict[str, Any] | No
             "checkpoints": "session_id",
             "session_files": "session_id",
             "session_refs": "session_id",
+            "assistant_usage_events": "session_id",
+            "forge_trajectory_events": "session_id",
         }
         exported: dict[str, Any] = {}
         for table, key in tables.items():

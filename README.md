@@ -101,6 +101,7 @@ rollout-memory/
     session.jsonl|json       (vscode-copilot) # verbatim VS Code chat persistence
     session.snapshot.json    (vscode-copilot) # reconstructed JSONL mutation state
     transcript.jsonl         (vscode-copilot) # direct Copilot event log, when available
+    events.jsonl             (vscode-copilot) # Copilot CLI / Agent Host rollout
     import_meta.json        (claude)         # source path, project_slug, claude_home, …
     import_meta.json        (vscode-copilot) # workspace, models, sources, capture fingerprint
     thread.json             (codex)          # cwd, model_provider, source_kind, spawn_edges, …
@@ -136,7 +137,7 @@ Discovery merges each host's default roots and honors comma-separated overrides.
 | --- | --- | --- |
 | Claude Code | `~/.claude/projects/` and `~/.config/claude/projects/` | `CLAUDE_CONFIG_DIR` |
 | Codex | `~/.codex` (uses `state_5.sqlite.threads.rollout_path`) | `CODEX_HOME` |
-| VS Code Copilot | Platform VS Code/Insiders `User` directories plus `~/.vscode-server*/data/User` | `VSCODE_COPILOT_USER_DIRS` |
+| VS Code Copilot | Platform VS Code/Insiders `User` directories, `~/.vscode-server*/data/User`, and `~/.copilot/session-state` | `VSCODE_COPILOT_USER_DIRS`, `COPILOT_HOME`, `COPILOT_SESSION_STATE_DIRS` |
 
 Codex roots are auto-classified:
 - **sqlite_home**: has `state_5.sqlite` → discovery via SQLite (preserves spawn-edge graph).
@@ -196,13 +197,20 @@ CODEX_HOME="$HOME/.codex,$HOME/codex-exec-logs" retro import codex --all
 
 # VS Code profiles or remote User roots outside the platform defaults:
 VSCODE_COPILOT_USER_DIRS="$HOME/custom-code/User,$HOME/.vscode-server/data/User" retro import copilot --all
+
+# Copilot CLI / Agent Host state outside ~/.copilot/session-state:
+COPILOT_SESSION_STATE_DIRS="/archive/copilot/session-state" retro import copilot --all
 ```
 
-### Retention warning
+### Capture coverage and retention
 
 When the oldest discoverable Claude transcript is **more than 25 days old**, `retro list` prints a yellow warning. Claude Code retains logs for ~30 days by default — capture older sessions before they age out, or raise `cleanupPeriodDays` in Claude settings.
 
 VS Code Copilot discovery reads both legacy full-session `.json` files and current append-only `.jsonl` mutation logs under `workspaceStorage/*/chatSessions/`. When present, it also captures Copilot's direct event transcript, editing-session snapshots, tool-result resources, workspace metadata, and the matching rows from `github.copilot-chat/session-store.db`. Empty and non-Copilot chat sessions are excluded.
+
+Copilot CLI and VS Code Agent Host sessions are captured from `~/.copilot/session-state/<session-id>/events.jsonl`, including active sessions. The matching rows from `~/.copilot/session-store.db` provide titles, workspace metadata, model usage, cache/reasoning tokens, and Copilot request units. Active sessions are point-in-time snapshots; rerun `retro import copilot --all` after more activity to append the newer source state.
+
+`retro` can only archive rollout content that exists on the local machine. Account or cloud sessions that have never been downloaded, or whose local event logs were already removed, cannot be reconstructed from VS Code's small telemetry/index entries alone.
 
 ---
 
@@ -474,7 +482,7 @@ Then open `dashboard/index.html` directly from disk.
 
 - **LiteLLM pricing snapshot** bundled at `src/retro/pricing/litellm-pricing.json` is the authoritative source for per-model rates (USD per token). The hardcoded `DEFAULT_RATES` table is the fallback for any model not in the snapshot.
 - **Per-model attribution**: each token delta is tagged with the active model (`turn_context.model` for Codex, per-message `model` for Claude). Multi-model sessions produce per-model rows.
-- **Copilot usage**: VS Code request-level `promptTokens`, `completionTokens`, model IDs, and Copilot credits are read from the reconstructed core chat snapshot.
+- **Copilot usage**: VS Code request snapshots provide prompt/completion totals; Copilot CLI and Agent Host sessions add per-model input, output, cache read/write, reasoning tokens, and Copilot request units from the local session database.
 - **Codex token deltas** prefer the explicit `info.last_token_usage` per-turn delta when present, falling back to cumulative subtraction for older Codex builds.
 - **Cached-input handling** follows ccusage's behavior: subtract for Codex (its `input_tokens` is cumulative including cache), don't subtract for Anthropic (its `input_tokens` is already fresh non-cached).
 - **Cost source labeling**: each session records whether its cost was `embedded` (provider-supplied) or `calculated` (token math).

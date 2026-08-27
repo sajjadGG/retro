@@ -46,9 +46,11 @@ VS Code Copilot:
 <VS Code User>/workspaceStorage/*/GitHub.copilot-chat/transcripts/<session-id>.jsonl
 <VS Code User>/workspaceStorage/*/chatEditingSessions/<session-id>/
 <VS Code User>/workspaceStorage/*/GitHub.copilot-chat/chat-session-resources/<session-id>/
+~/.copilot/session-state/<session-id>/events.jsonl
+~/.copilot/session-store.db
 ```
 
-The core chat file is copied verbatim and its JSONL mutation log is reconstructed. The direct Copilot transcript and matching editing/resource sidecars are captured when available.
+The core chat file is copied verbatim and its JSONL mutation log is reconstructed. The direct Copilot transcript and matching editing/resource sidecars are captured when available. Copilot CLI and Agent Host event logs are separate sources and must also be archived, including active point-in-time snapshots.
 
 ## Capture Strategy
 

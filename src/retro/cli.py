@@ -19,7 +19,7 @@ from rich.table import Table
 
 from .importers.claude import ClaudeImporter
 from .importers.codex import CodexImporter
-from .importers.vscode_copilot import VscodeCopilotImporter
+from .importers.copilot import CopilotImporter
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -97,7 +97,7 @@ def list_cmd(
     if host_full in (None, "codex"):
         _print_codex_table(CodexImporter(lay), limit, lay)
     if host_full in (None, "vscode-copilot"):
-        _print_copilot_table(VscodeCopilotImporter(lay), limit, lay)
+        _print_copilot_table(CopilotImporter(lay), limit, lay)
 
 
 def _print_claude_table(imp: ClaudeImporter, limit: int, lay: Layout) -> None:
@@ -151,12 +151,14 @@ def _print_codex_table(imp: CodexImporter, limit: int, lay: Layout) -> None:
     console.print(table)
 
 
-def _print_copilot_table(imp: VscodeCopilotImporter, limit: int, lay: Layout) -> None:
-    sessions = imp.discover()[:limit]
+def _print_copilot_table(imp: CopilotImporter, limit: int, lay: Layout) -> None:
+    all_sessions = imp.discover()
+    sessions = all_sessions[:limit]
     imported = set(lay.list_imported("vscode-copilot"))
-    table = Table(title=f"VS Code Copilot  ({len(sessions)} shown)")
+    table = Table(title=f"VS Code Copilot  ({len(sessions)}/{len(all_sessions)} shown)")
     table.add_column("imported", justify="center")
     table.add_column("session_id")
+    table.add_column("source")
     table.add_column("workspace")
     table.add_column("model")
     table.add_column("title")
@@ -165,6 +167,7 @@ def _print_copilot_table(imp: VscodeCopilotImporter, limit: int, lay: Layout) ->
         table.add_row(
             mark,
             session.session_id,
+            session.source_kind + (" (active)" if getattr(session, "active", False) else ""),
             session.workspace_name,
             session.display_model,
             session.display_title,
@@ -260,11 +263,20 @@ def import_copilot(
         "--user-data-dir",
         help="Explicit VS Code User data directory",
     ),
+    session_state_dir: Optional[Path] = typer.Option(
+        None,
+        "--session-state-dir",
+        help="Explicit Copilot Agent Host session-state directory",
+    ),
     no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
 ):
-    """Import a VS Code GitHub Copilot Chat session."""
+    """Import a VS Code GitHub Copilot or Agent Host session."""
     lay = _layout(root)
-    imp = VscodeCopilotImporter(lay, user_data_dir=user_data_dir)
+    imp = CopilotImporter(
+        lay,
+        user_data_dir=user_data_dir,
+        session_state_dir=session_state_dir,
+    )
     if all_sessions:
         _import_many(
             imp,
@@ -279,7 +291,7 @@ def import_copilot(
     if latest:
         session = imp.latest()
         if session is None:
-            console.print("[red]No VS Code Copilot chat sessions found.[/red]")
+            console.print("[red]No local VS Code Copilot sessions found.[/red]")
             raise typer.Exit(1)
         session_id = session.session_id
     assert session_id is not None
@@ -299,7 +311,7 @@ def import_all(
     lay = _layout(root)
     claude = ClaudeImporter(lay)
     codex = CodexImporter(lay)
-    copilot = VscodeCopilotImporter(lay)
+    copilot = CopilotImporter(lay)
     failures = []
     failures.extend(
         _import_many(

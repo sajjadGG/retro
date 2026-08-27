@@ -111,6 +111,7 @@ The dashboard should follow the conventions used by existing usage dashboards:
 - Codex `input_tokens` includes cached input. Cost should charge `input_tokens - cached_input_tokens` at the normal input rate and `cached_input_tokens` at the cache-read rate.
 - Codex reasoning tokens are useful to show, but the current ccusage implementation does not charge them as a separate line item.
 - VS Code Copilot request snapshots expose prompt/completion tokens, model ids, and Copilot credits. Credits should be shown separately from estimated provider token cost.
+- Copilot CLI and Agent Host session-store rows expose per-model input, output, cache read/write, reasoning tokens, request multipliers, and nano-AIU usage. The dashboard should label these sessions by source and mark active snapshots.
 
 The dashboard should show:
 

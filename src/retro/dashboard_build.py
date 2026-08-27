@@ -349,6 +349,7 @@ def analyze_session(
     duration_seconds = int((max(timestamps) - min(timestamps)).total_seconds()) if len(timestamps) >= 2 else None
 
     raw_meta = read_raw_meta(host, session_id)
+    source_kind = infer_source_kind(host, session_id, raw_meta)
     token_stats = extract_token_stats(events, host, session_id)
     provider = infer_provider(host, raw_meta, events)
     models = infer_models(host, session_id, raw_meta, events)
@@ -447,6 +448,8 @@ def analyze_session(
         "mined": mined,
         "project_name": project_name,
         "project_path": project_path,
+        "source_kind": source_kind,
+        "active": bool(raw_meta.get("active")),
     }
 
 
@@ -469,6 +472,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         }
     )
     by_host = Counter(s["host"] for s in sessions)
+    by_source = Counter(s.get("source_kind") or s["host"] for s in sessions)
     totals = Counter()
     total_cost = 0.0
     durations = []
@@ -567,6 +571,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "sessions_with_cost_estimate": sum(1 for s in sessions if s.get("estimated_cost_usd") is not None),
         "active_days": len([d for d in by_day if d != "unknown"]),
         "by_host": dict(by_host),
+        "by_source": dict(by_source),
         "by_day": sorted_by_day,
         "totals": dict(totals),
         "estimated_cost_usd": round(total_cost, 6),
@@ -893,13 +898,17 @@ def _extract_codex_token_stats(events: list[dict[str, Any]], session_id: str) ->
 
 
 def _extract_copilot_token_stats(session_id: str) -> dict[str, Any]:
-    """Sum request-level token usage from VS Code's reconstructed chat snapshot."""
+    """Sum Copilot usage from Agent Host accounting or the core chat snapshot."""
+    raw_dir = ARTIFACT_ROOT / "raw" / "vscode-copilot" / session_id
+    store_path = raw_dir / "sidecars" / "session-store.json"
+    if store_path.exists():
+        store = json.loads(store_path.read_text(encoding="utf-8"))
+        usage_events = store.get("assistant_usage_events") if isinstance(store, dict) else None
+        if isinstance(usage_events, list) and usage_events:
+            return _extract_copilot_agent_usage(usage_events)
+
     snapshot_path = (
-        ARTIFACT_ROOT
-        / "raw"
-        / "vscode-copilot"
-        / session_id
-        / "session.snapshot.json"
+        raw_dir / "session.snapshot.json"
     )
     totals = _empty_bucket()
     by_model: dict[str, dict[str, int]] = {}
@@ -947,6 +956,65 @@ def _extract_copilot_token_stats(session_id: str) -> dict[str, Any]:
         "copilot_credits": round(copilot_credits, 4),
         "copilot_credit_events": credit_events,
     }
+
+
+def _extract_copilot_agent_usage(usage_events: list[Any]) -> dict[str, Any]:
+    totals = _empty_bucket()
+    by_model: dict[str, dict[str, int]] = {}
+    copilot_credits = 0.0
+    credit_events = 0
+    total_nano_aiu = 0
+    for event in usage_events:
+        if not isinstance(event, dict):
+            continue
+        model = event.get("model")
+        model_key = model if isinstance(model, str) and model else "unknown"
+        normalized = _normalize_copilot_agent_usage(event)
+        if any(normalized.values()):
+            _add_to_bucket(totals, normalized)
+            bucket = by_model.setdefault(model_key, _empty_bucket())
+            _add_to_bucket(bucket, normalized)
+        multiplier = event.get("request_multiplier")
+        if isinstance(multiplier, (int, float)):
+            copilot_credits += float(multiplier)
+            credit_events += 1
+        nano_aiu = event.get("total_nano_aiu")
+        if isinstance(nano_aiu, (int, float)):
+            total_nano_aiu += int(nano_aiu)
+    _finalize_totals(totals, by_model)
+    return {
+        **totals,
+        "by_model": by_model,
+        "embedded_cost_usd": None,
+        "embedded_cost_events": 0,
+        "copilot_credits": round(copilot_credits, 4),
+        "copilot_credit_events": credit_events,
+        "total_nano_aiu": total_nano_aiu,
+    }
+
+
+def _normalize_copilot_agent_usage(usage: dict[str, Any]) -> dict[str, int]:
+    out = _empty_bucket()
+    mapping = {
+        "output_tokens": "output_tokens",
+        "cache_read_tokens": "cached_input_tokens",
+        "cache_write_tokens": "cache_creation_tokens",
+        "reasoning_tokens": "reasoning_output_tokens",
+    }
+    for source, destination in mapping.items():
+        value = usage.get(source)
+        if isinstance(value, (int, float)):
+            out[destination] = int(value)
+    raw_input = usage.get("input_tokens")
+    total_input = int(raw_input) if isinstance(raw_input, (int, float)) else 0
+    out["input_tokens"] = max(
+        0,
+        total_input
+        - out["cached_input_tokens"]
+        - out["cache_creation_tokens"],
+    )
+    out["total_tokens"] = total_input + out["output_tokens"]
+    return out
 
 
 def _normalize_copilot_usage(usage: dict[str, Any]) -> dict[str, int]:
@@ -1245,6 +1313,20 @@ def infer_provider(host: str, raw_meta: dict[str, Any], events: list[dict[str, A
     if host == "vscode-copilot":
         return "github-copilot"
     return "unknown"
+
+
+def infer_source_kind(host: str, session_id: str, raw_meta: dict[str, Any]) -> str:
+    source_kind = raw_meta.get("source_kind")
+    if isinstance(source_kind, str) and source_kind:
+        return source_kind
+    if host != "vscode-copilot":
+        return host
+    raw_dir = ARTIFACT_ROOT / "raw" / host / session_id
+    if (raw_dir / "events.jsonl").exists():
+        return "copilot-cli"
+    if (raw_dir / "session.snapshot.json").exists():
+        return "vscode-chat"
+    return host
 
 
 def read_raw_meta(host: str, session_id: str) -> dict[str, Any]:
@@ -2187,7 +2269,7 @@ def render_html(payload: dict[str, Any]) -> str:
           <td>${{s.date}}</td>
           <td class="title-cell">
             <div class="title-main">${{escapeHtml(s.title || s.session_id)}}</div>
-            <div class="title-sub">${{escapeHtml(s.project_name || 'unknown')}} · <code>${{escapeHtml(String(s.session_id).slice(0, 12))}}</code></div>
+            <div class="title-sub">${{escapeHtml(s.project_name || 'unknown')}} · ${{escapeHtml(s.source_kind || s.host)}}${{s.active ? ' · active snapshot' : ''}} · <code>${{escapeHtml(String(s.session_id).slice(0, 12))}}</code></div>
           </td>
           <td class="num">${{fmt.format(s.event_count)}}</td>
           <td class="num">${{fmt.format(s.tool_call_events + s.tool_result_events)}}</td>
@@ -2218,6 +2300,8 @@ def render_html(payload: dict[str, Any]) -> str:
         : selected.cost_source === 'calculated' ? 'calculated' : 'n/a';
       document.getElementById('detailMetrics').innerHTML = [
         metric('Host', selected.host),
+        metric('Source', selected.source_kind || selected.host),
+        metric('Capture state', selected.active ? 'active snapshot' : 'saved'),
         metric('Duration', dur(selected.duration_seconds)),
         metric('Events', fmt.format(selected.event_count)),
         metric('Commands', fmt.format(selected.command_events)),
