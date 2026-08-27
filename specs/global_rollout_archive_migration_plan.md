@@ -7,14 +7,15 @@ Implemented and executed on 2026-08-27.
 - Migration ID: `20260827T064109Z`
 - Initial verified merge: 727 sessions, 184,554 events, zero invalid JSONL,
   zero unresolved raw references
-- First machine-wide sync: 989 sessions (903 Codex, 33 Claude Code, 53 VS Code
-  Copilot)
+- First machine-wide sync: 989 sessions. Final verification after subsequent
+  periodic captures: 1,019 sessions (933 Codex, 33 Claude Code, 53 VS Code
+  Copilot), 221,764 normalized events
 - Mem compatibility path now links to the global archive
 - Original Mem archive retained at
   `~/Library/Application Support/retro/source-backups/20260827T064109Z/rollout-memory.pre-migration`
 - Copilot source worktree remains locked and retained
-- Scheduler installation is performed only after the implementation is merged
-  and installed into a stable per-user runtime
+- Scheduler installed from a stable Python 3.9 per-user runtime with 15-minute
+  capture and a coalesced 6-hour derived-artifact cadence
 
 ## Goal
 
