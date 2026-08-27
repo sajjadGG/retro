@@ -21,6 +21,7 @@ class RetroConfig:
     archive_root: str
     dashboard_dir: str
     sync_interval_seconds: int = 900
+    derived_interval_seconds: int = 21600
     sync_on_login: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,6 +92,12 @@ def load_config() -> RetroConfig:
     interval = raw.get("sync_interval_seconds", defaults.sync_interval_seconds)
     if not isinstance(interval, int) or interval < 60:
         raise ValueError("sync_interval_seconds must be an integer of at least 60")
+    derived_interval = raw.get(
+        "derived_interval_seconds",
+        defaults.derived_interval_seconds,
+    )
+    if not isinstance(derived_interval, int) or derived_interval < 60:
+        raise ValueError("derived_interval_seconds must be an integer of at least 60")
     sync_on_login = raw.get("sync_on_login", defaults.sync_on_login)
     if not isinstance(sync_on_login, bool):
         raise ValueError("sync_on_login must be boolean")
@@ -98,6 +105,7 @@ def load_config() -> RetroConfig:
         archive_root=archive_root,
         dashboard_dir=dashboard_dir,
         sync_interval_seconds=interval,
+        derived_interval_seconds=derived_interval,
         sync_on_login=sync_on_login,
     )
 
@@ -121,6 +129,9 @@ def update_config(**updates: Any) -> RetroConfig:
             default_config().dashboard_dir,
         ),
         sync_interval_seconds=int(current.get("sync_interval_seconds", 900)),
+        derived_interval_seconds=int(
+            current.get("derived_interval_seconds", 21600)
+        ),
         sync_on_login=bool(current.get("sync_on_login", True)),
     )
     save_config(config)

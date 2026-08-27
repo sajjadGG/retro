@@ -652,7 +652,7 @@ def config_show() -> None:
 def config_set(
     key: str = typer.Argument(
         ...,
-        help="archive-root|dashboard-dir|sync-interval|sync-on-login",
+        help="archive-root|dashboard-dir|sync-interval|derived-interval|sync-on-login",
     ),
     value: str = typer.Argument(...),
 ) -> None:
@@ -668,6 +668,10 @@ def config_set(
         from .schedule import parse_interval
 
         values["sync_interval_seconds"] = parse_interval(value)
+    elif normalized == "derived-interval":
+        from .schedule import parse_interval
+
+        values["derived_interval_seconds"] = parse_interval(value)
     elif normalized == "sync-on-login":
         lowered = value.lower()
         if lowered not in {"true", "false", "yes", "no", "1", "0"}:
@@ -675,7 +679,8 @@ def config_set(
         values["sync_on_login"] = lowered in {"true", "yes", "1"}
     else:
         raise typer.BadParameter(
-            "key must be archive-root, dashboard-dir, sync-interval, or sync-on-login"
+            "key must be archive-root, dashboard-dir, sync-interval, "
+            "derived-interval, or sync-on-login"
         )
     updated = RetroConfig(**values)
     path = save_config(updated)
@@ -695,6 +700,11 @@ def setup_cmd(
         help="Generated dashboard directory",
     ),
     periodic: str = typer.Option("15m", "--periodic", help="Capture interval, e.g. 15m or 1h"),
+    derived_every: str = typer.Option(
+        "6h",
+        "--derived-every",
+        help="Minimum interval between scheduled signal/dashboard rebuilds",
+    ),
     no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
 ) -> None:
     """Configure global storage and optionally install periodic capture."""
@@ -702,6 +712,7 @@ def setup_cmd(
 
     current = load_config()
     interval = parse_interval(periodic)
+    derived_interval = parse_interval(derived_every)
     config = RetroConfig(
         archive_root=str(
             (archive_root or Path(current.archive_root)).expanduser().resolve()
@@ -710,6 +721,7 @@ def setup_cmd(
             (dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()
         ),
         sync_interval_seconds=interval,
+        derived_interval_seconds=derived_interval,
         sync_on_login=True,
     )
     path = save_config(config)
@@ -842,6 +854,7 @@ def schedule_install(
             archive_root=config.archive_root,
             dashboard_dir=config.dashboard_dir,
             sync_interval_seconds=interval,
+            derived_interval_seconds=config.derived_interval_seconds,
             sync_on_login=config.sync_on_login,
         )
     )

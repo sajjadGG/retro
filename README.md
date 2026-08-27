@@ -74,7 +74,8 @@ explicitly:
 retro setup \
   --archive-root "$HOME/Library/Application Support/retro/rollout-memory" \
   --dashboard-dir /Users/sajad/Dev/repos/Mem/dashboard \
-  --periodic 15m
+  --periodic 15m \
+  --derived-every 6h
 ```
 
 `pip install` never installs a background job by itself. `retro setup` writes
@@ -99,7 +100,9 @@ and logs are under `~/Library/Logs/retro/`.
 revision when an upstream source was rewritten rather than appended, updates
 signals for changed sessions, and atomically switches the dashboard generation.
 It uses a cross-process archive lock, warns below 5 GiB free, and refuses a
-scheduled run below 2 GiB.
+scheduled run below 2 GiB. Scheduled capture runs every 15 minutes; expensive
+signal and dashboard work is coalesced and runs at most every 6 hours by
+default. Manual `retro sync` refreshes pending derived work immediately.
 
 ### Archive migration
 

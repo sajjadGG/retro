@@ -74,3 +74,4 @@ def test_saved_config_is_valid_json(tmp_path: Path):
 
     raw = json.loads(config_path().read_text(encoding="utf-8"))
     assert raw["sync_interval_seconds"] == 900
+    assert raw["derived_interval_seconds"] == 21600

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import resolve_dashboard_dir, user_state_dir
+from .config import load_config, resolve_dashboard_dir, user_state_dir
 from .importers.claude import ClaudeImporter, ClaudeSession
 from .importers.codex import CodexImporter, CodexThread
 from .importers.copilot import CopilotImporter
@@ -20,7 +20,7 @@ from .importers.vscode_copilot import CopilotSession
 from .locking import LockUnavailableError, exclusive_lock
 from .memory_store import reindex as reindex_memory
 from .renderer import render_file
-from .schema import Host
+from .schema import HOSTS, Host
 from .signals import REGISTRY as SIGNAL_REGISTRY
 from .signals import (
     read_signal_readings,
@@ -46,11 +46,14 @@ class SyncReport:
     free_bytes: int = 0
     imported: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)
+    rendered: list[str] = field(default_factory=list)
     revisions: list[str] = field(default_factory=list)
     failures: list[dict[str, str]] = field(default_factory=list)
     signals_recomputed: bool = False
     memory_reindexed: bool = False
     dashboard_rebuilt: bool = False
+    derived_deferred: bool = False
+    pending_sessions: list[str] = field(default_factory=list)
     warning: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,26 +129,72 @@ def run_sync(
                         continue
                     changed.add((importer.host, result.session_id))
                     report.imported.append(key)
-                    render_file(
-                        result.normalized_path,
-                        layout.rendered_path(importer.host, result.session_id),
-                    )
 
             signal_signature = _signal_signature()
+            memory_signature = _memory_source_signature(layout)
+            pending = {
+                tuple(value.split("/", 1))
+                for value in previous_state.get("pending_sessions", [])
+                if isinstance(value, str) and "/" in value
+            }
+            pending.update(changed)
+            pending_typed: set[tuple[Host, str]] = {
+                (host, session_id)  # type: ignore[arg-type]
+                for host, session_id in pending
+                if host in HOSTS
+            }
+            signal_schema_changed = (
+                previous_state.get("signal_signature") != signal_signature
+            )
+            memory_changed = (
+                previous_state.get("memory_signature") != memory_signature
+            )
+            dashboard_missing = not (output_dir / "index.html").exists()
+            derived_due = _derived_due(
+                previous_state,
+                scheduled=scheduled,
+                interval_seconds=load_config().derived_interval_seconds,
+            )
             full_signal_rebuild = (
                 force_derived
                 or not (layout.root / "signals" / "readings.jsonl").exists()
-                or previous_state.get("signal_signature") != signal_signature
+                or signal_schema_changed
             )
-            if full_signal_rebuild:
+            should_rebuild_derived = (
+                force_derived
+                or dashboard_missing
+                or signal_schema_changed
+                or memory_changed
+                or (bool(pending_typed) and (not scheduled or derived_due))
+            )
+            if should_rebuild_derived:
+                render_targets = (
+                    {
+                        (host, session_id)
+                        for host in HOSTS
+                        for session_id in layout.list_normalized(host)
+                    }
+                    if force_derived
+                    else pending_typed
+                )
+                for host, session_id in sorted(render_targets):
+                    normalized = layout.normalized_path(host, session_id)
+                    if not normalized.exists():
+                        continue
+                    render_file(
+                        normalized,
+                        layout.rendered_path(host, session_id),
+                    )
+                    report.rendered.append(f"{host}/{session_id}")
+            if should_rebuild_derived and full_signal_rebuild:
                 readings = run_signals(layout)
                 write_signal_artifacts(layout, readings)
                 report.signals_recomputed = True
-            elif changed:
+            elif should_rebuild_derived and pending_typed:
                 existing = read_signal_readings(layout)
                 replacements = []
                 by_host: dict[Host, list[str]] = defaultdict(list)
-                for host, session_id in changed:
+                for host, session_id in pending_typed:
                     by_host[host].append(session_id)
                 for host, session_ids in by_host.items():
                     replacements.extend(
@@ -155,29 +204,32 @@ def run_sync(
                             session_ids=session_ids,
                         )
                     )
-                merged = replace_session_readings(existing, replacements, changed)
+                merged = replace_session_readings(
+                    existing,
+                    replacements,
+                    pending_typed,
+                )
                 write_signal_artifacts(layout, merged)
                 report.signals_recomputed = True
 
-            memory_signature = _memory_source_signature(layout)
-            if (
+            if should_rebuild_derived and (
                 force_derived
                 or not layout.memory_index_path().exists()
-                or previous_state.get("memory_signature") != memory_signature
+                or memory_changed
             ):
                 reindex_memory(layout)
                 report.memory_reindexed = True
 
-            dashboard_missing = not (output_dir / "index.html").exists()
-            if (
-                force_derived
-                or changed
-                or dashboard_missing
-                or report.memory_reindexed
-                or report.signals_recomputed
-            ):
+            if should_rebuild_derived:
                 _rebuild_dashboard_atomically(layout, output_dir)
                 report.dashboard_rebuilt = True
+                pending_typed.clear()
+            elif pending_typed:
+                report.derived_deferred = True
+
+            report.pending_sessions = sorted(
+                f"{host}/{session_id}" for host, session_id in pending_typed
+            )
 
             report.status = "partial" if report.failures else "success"
             report.completed_at = datetime.now(timezone.utc).isoformat()
@@ -185,6 +237,16 @@ def run_sync(
                 **report.to_dict(),
                 "signal_signature": signal_signature,
                 "memory_signature": memory_signature,
+                "last_derived_at": (
+                    report.completed_at
+                    if report.dashboard_rebuilt
+                    else previous_state.get("last_derived_at")
+                    or (
+                        previous_state.get("completed_at")
+                        if previous_state.get("dashboard_rebuilt")
+                        else None
+                    )
+                ),
             }
             atomic_write_text(
                 state_path,
@@ -293,6 +355,29 @@ def _signal_signature() -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _derived_due(
+    previous_state: dict[str, Any],
+    *,
+    scheduled: bool,
+    interval_seconds: int,
+) -> bool:
+    if not scheduled:
+        return True
+    raw = previous_state.get("last_derived_at")
+    if not isinstance(raw, str):
+        if previous_state.get("dashboard_rebuilt"):
+            raw = previous_state.get("completed_at")
+    if not isinstance(raw, str):
+        return True
+    try:
+        last = datetime.fromisoformat(raw)
+    except ValueError:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds() >= interval_seconds
 
 
 def _memory_source_signature(layout: Layout) -> str:

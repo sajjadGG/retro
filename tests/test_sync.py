@@ -198,3 +198,60 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
     assert report.signals_recomputed is True
     assert report.dashboard_rebuilt is True
     assert rebuilt == [dashboard.resolve()]
+
+
+def test_scheduled_sync_defers_derived_work_until_interval(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "index.html").write_text("existing", encoding="utf-8")
+    (layout.root / "signals").mkdir()
+    (layout.root / "signals" / "readings.jsonl").write_text("", encoding="utf-8")
+    layout.memory_index_path().parent.mkdir(parents=True, exist_ok=True)
+    layout.memory_index_path().write_bytes(b"index")
+    state = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps(
+            {
+                "completed_at": "2999-01-01T00:00:00+00:00",
+                "last_derived_at": "2999-01-01T00:00:00+00:00",
+                "dashboard_rebuilt": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
+    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
+    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    monkeypatch.setattr("retro.sync._signal_signature", lambda: "same")
+    monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "same")
+    raw_state = json.loads(state.read_text(encoding="utf-8"))
+    raw_state["signal_signature"] = "same"
+    raw_state["memory_signature"] = "same"
+    raw_state["pending_sessions"] = ["codex/session-1"]
+    state.write_text(json.dumps(raw_state), encoding="utf-8")
+    rebuilt = []
+    monkeypatch.setattr(
+        "retro.sync._rebuild_dashboard_atomically",
+        lambda layout, output: rebuilt.append(output),
+    )
+    rendered = []
+    monkeypatch.setattr(
+        "retro.sync.render_file",
+        lambda source, target: rendered.append((source, target)),
+    )
+
+    report = run_sync(layout, dashboard_dir=dashboard, scheduled=True)
+
+    assert report.status == "success"
+    assert report.derived_deferred is True
+    assert report.pending_sessions == ["codex/session-1"]
+    assert report.signals_recomputed is False
+    assert report.dashboard_rebuilt is False
+    assert rebuilt == []
+    assert rendered == []
