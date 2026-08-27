@@ -66,6 +66,12 @@ quest_app = typer.Typer(
 )
 app.add_typer(quest_app, name="quest")
 
+sft_app = typer.Typer(
+    no_args_is_help=True,
+    help="Curate rollout data for SFT, generate Modal training bundles, and compare benchmark runs.",
+)
+app.add_typer(sft_app, name="sft")
+
 console = Console()
 
 
@@ -620,6 +626,155 @@ def signal_show(
         console.print(f"[yellow]No readings for {host_full}/{session_id}[/yellow]")
         raise typer.Exit(1)
     console.print(table)
+
+
+# ---- sft ---------------------------------------------------------------------
+
+
+@sft_app.command("export")
+def sft_export(
+    dataset_name: str = typer.Option("default", "--dataset-name", help="Output dataset name"),
+    host: str = typer.Option("all", "--host", help="Host filter: claude|codex|all"),
+    max_sessions: int | None = typer.Option(None, "--max-sessions", help="Optional diversity cap"),
+    eval_fraction: float = typer.Option(0.1, "--eval-fraction", help="Held-out evaluation fraction"),
+    include_reasoning: bool = typer.Option(
+        False,
+        "--include-reasoning",
+        help="Keep assistant reasoning traces",
+    ),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """Export a curated ShareGPT-like SFT dataset from normalized rollouts."""
+    from .sft import export_curated_dataset
+
+    lay = _layout(root)
+    hosts = None if host.lower() in {"all", "*"} else [_expand_host(host)]
+    result = export_curated_dataset(
+        lay,
+        dataset_name=dataset_name,
+        hosts=hosts,
+        max_sessions=max_sessions,
+        eval_fraction=eval_fraction,
+        include_reasoning=include_reasoning,
+    )
+    manifest_path = lay.sft_manifest_path(dataset_name)
+    console.print(f"[green]curated dataset ready:[/green] {dataset_name}")
+    console.print(f"  train:    {lay.sft_dataset_path(dataset_name, 'train')}")
+    console.print(f"  eval:     {lay.sft_dataset_path(dataset_name, 'eval')}")
+    console.print(f"  manifest: {manifest_path}")
+    console.print(
+        "  included: "
+        f"{result.manifest['selected_sessions']}  "
+        f"rejected: {result.manifest['rejected_sessions']}"
+    )
+
+
+@sft_app.command("train")
+def sft_train(
+    dataset_name: str = typer.Option("default", "--dataset-name", help="Curated dataset name"),
+    run_name: str = typer.Option("default", "--run-name", help="Training run identifier"),
+    base_model: str = typer.Option(
+        "Qwen/Qwen2.5-Coder-7B-Instruct",
+        "--base-model",
+        help="Base model to fine-tune with Unsloth",
+    ),
+    output_format: str = typer.Option("safetensors", "--output-format", help="safetensors|gguf"),
+    gpu: str = typer.Option("A100", "--gpu", help="Modal GPU type"),
+    max_seq_length: int = typer.Option(4096, "--max-seq-length", help="Training context window"),
+    per_device_batch_size: int = typer.Option(1, "--batch-size", help="Per-device batch size"),
+    gradient_accumulation_steps: int = typer.Option(8, "--grad-accum", help="Gradient accumulation steps"),
+    num_train_epochs: int = typer.Option(1, "--epochs", help="Training epochs"),
+    learning_rate: float = typer.Option(2e-4, "--learning-rate", help="Learning rate"),
+    modal_volume: str = typer.Option("retro-sft", "--modal-volume", help="Modal volume name"),
+    run_remote: bool = typer.Option(False, "--run", help="Run the generated Modal job immediately"),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """Generate a Modal + Unsloth training bundle and optionally launch it."""
+    from .sft import maybe_run_modal_training, write_modal_training_bundle
+
+    if output_format not in {"safetensors", "gguf"}:
+        raise typer.BadParameter("output-format must be one of: safetensors, gguf")
+
+    lay = _layout(root)
+    bundle = write_modal_training_bundle(
+        lay,
+        dataset_name=dataset_name,
+        run_name=run_name,
+        base_model=base_model,
+        output_format=output_format,
+        gpu=gpu,
+        max_seq_length=max_seq_length,
+        per_device_batch_size=per_device_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        num_train_epochs=num_train_epochs,
+        learning_rate=learning_rate,
+        modal_volume=modal_volume,
+    )
+    console.print(f"[green]training bundle ready:[/green] {run_name}")
+    console.print(f"  config:  {bundle['config']}")
+    console.print(f"  script:  {bundle['script']}")
+    console.print(f"  weights: {bundle['weights_dir']}")
+
+    if run_remote:
+        completed = maybe_run_modal_training(bundle["script"], bundle["config"])
+        if completed is None:
+            console.print("[red]Modal CLI is not installed locally; generated bundle only.[/red]")
+            raise typer.Exit(1)
+        if completed.stdout:
+            console.print(completed.stdout.strip())
+        if completed.stderr:
+            console.print(completed.stderr.strip())
+
+
+@sft_app.command("eval")
+def sft_eval(
+    run_name: str = typer.Option("default", "--run-name", help="Training/eval run identifier"),
+    benchmark: str = typer.Option(
+        "swe-bench-verified",
+        "--benchmark",
+        help="Benchmark name: swe-bench-verified|terminal-bench-2.1",
+    ),
+    runner: str = typer.Option("agentarena", "--runner", help="Runner: agentarena|touchstone"),
+    base_model: str = typer.Option(..., "--base-model", help="Baseline model name"),
+    tuned_model: str = typer.Option(..., "--tuned-model", help="Fine-tuned model name or path"),
+    base_results: Path | None = typer.Option(
+        None,
+        "--base-results",
+        help="Existing base benchmark JSON/JSONL",
+    ),
+    tuned_results: Path | None = typer.Option(
+        None,
+        "--tuned-results",
+        help="Existing tuned benchmark JSON/JSONL",
+    ),
+    root: Path | None = typer.Option(None, help="rollout-memory root"),
+):
+    """Write a benchmark plan and compare base vs tuned benchmark outputs when present."""
+    from .sft import write_evaluation_plan
+
+    lay = _layout(root)
+    plan, summary = write_evaluation_plan(
+        lay,
+        run_name=run_name,
+        benchmark=benchmark,
+        runner=runner,
+        base_model=base_model,
+        tuned_model=tuned_model,
+        base_results=base_results,
+        tuned_results=tuned_results,
+    )
+    console.print(f"[green]evaluation plan ready:[/green] {lay.sft_eval_plan_path(run_name)}")
+    console.print(f"  base command:  {' '.join(plan['commands']['base'])}")
+    console.print(f"  tuned command: {' '.join(plan['commands']['tuned'])}")
+    if summary is not None:
+        console.print(f"  comparison:    {lay.sft_eval_report_path(run_name)}")
+        for metric, values in summary["metrics"].items():
+            console.print(
+                "  "
+                f"{metric}: base={values['base']:.4f} "
+                f"tuned={values['tuned']:.4f} "
+                f"delta={values['delta']:+.4f}"
+            )
 
 
 # ---- dashboard --------------------------------------------------------------
