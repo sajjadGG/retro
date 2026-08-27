@@ -96,6 +96,7 @@ class ClaudeImporter:
         # latest-modified root with a projects/ dir wins.
         self.claude_home = self._pick_sidecar_root()
         self.projects_dir = self.claude_home / "projects"
+        self._discover_cache: list[ClaudeSession] | None = None
 
     def _pick_sidecar_root(self) -> Path:
         for root in self.roots:
@@ -106,6 +107,8 @@ class ClaudeImporter:
     # ---- discovery -----------------------------------------------------------
 
     def discover(self) -> list[ClaudeSession]:
+        if self._discover_cache is not None:
+            return list(self._discover_cache)
         out: list[ClaudeSession] = []
         seen_ids: set[str] = set()
         for root in self.roots:
@@ -136,7 +139,8 @@ class ClaudeImporter:
                         )
                     )
         out.sort(key=lambda s: s.mtime, reverse=True)
-        return out
+        self._discover_cache = out
+        return list(self._discover_cache)
 
     def find_session(self, session_id: str) -> ClaudeSession | None:
         for s in self.discover():
@@ -157,6 +161,9 @@ class ClaudeImporter:
                 f"No Claude Code transcript found for session id {identifier!r} "
                 f"under {self.projects_dir}"
             )
+        current_stat = session.transcript_path.stat()
+        session.size_bytes = current_stat.st_size
+        session.mtime = current_stat.st_mtime
         raw_dir = self.layout.raw_dir(self.host, session.session_id)
         raw_transcript = raw_dir / "transcript.jsonl"
         if raw_dir.exists() and not force:
