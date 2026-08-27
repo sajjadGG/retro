@@ -19,12 +19,14 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [`memory_storage_backend_spec.md`](specs/memory_storage_backend_spec.md) — SQLite memory index over flat files.
 - [`rollout_dashboard_spec.md`](specs/rollout_dashboard_spec.md) — the dashboard.
 - [`ccusage_comparison_spec.md`](specs/ccusage_comparison_spec.md) — gap analysis vs. ccusage.
+- [`global_rollout_archive_migration_plan.md`](specs/global_rollout_archive_migration_plan.md) — global archive, migration, and periodic sync design.
 
 ---
 
 ## Table of contents
 
 - [Install](#install)
+- [Global setup and periodic capture](#global-setup-and-periodic-capture)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Storage layout](#storage-layout)
 - [Capture](#capture)
@@ -62,6 +64,64 @@ The PyPI distribution is named `retro-agent-memory` because `retro` is already o
 
 ---
 
+## Global setup and periodic capture
+
+Retro uses one archive for the current OS user, regardless of the directory
+where `retro` is invoked. Configure it and install the macOS user LaunchAgent
+explicitly:
+
+```bash
+retro setup \
+  --archive-root "$HOME/Library/Application Support/retro/rollout-memory" \
+  --dashboard-dir /Users/sajad/Dev/repos/Mem/dashboard \
+  --periodic 15m
+```
+
+`pip install` never installs a background job by itself. `retro setup` writes
+the user config and installs the job. Use a stable `pipx` or per-user runtime;
+the scheduler refuses project/worktree `.venv` executables that may disappear.
+
+```bash
+retro config show
+retro doctor
+retro sync
+retro schedule status
+retro schedule run-now
+retro schedule uninstall
+```
+
+Root precedence is `--root`, `RETRO_ROOT`, the legacy
+`RETRO_ARTIFACT_ROOT`, user config, then the platform per-user data directory.
+On macOS, operational state is under `~/Library/Application Support/retro/`
+and logs are under `~/Library/Logs/retro/`.
+
+`retro sync` imports only new or changed local source sessions, preserves a raw
+revision when an upstream source was rewritten rather than appended, updates
+signals for changed sessions, and atomically switches the dashboard generation.
+It uses a cross-process archive lock, warns below 5 GiB free, and refuses a
+scheduled run below 2 GiB.
+
+### Archive migration
+
+Migrations are checksummed, resumable, and refuse conflicting overwrites:
+
+```bash
+retro archive plan \
+  --from /path/to/old-a/rollout-memory \
+  --from /path/to/old-b/rollout-memory \
+  --into "$HOME/Library/Application Support/retro/rollout-memory"
+
+retro archive migrate --plan /path/to/plan.json --rebuild-derived
+retro archive verify --plan /path/to/plan.json
+retro archive cutover --plan /path/to/plan.json --link-path /path/to/legacy/rollout-memory
+```
+
+Cutover is allowed only after a successful derived rebuild and a newer
+verification. The original legacy archive is moved to a retained source-backup
+directory before its old path becomes a compatibility symlink.
+
+---
+
 ## Architecture at a glance
 
 ```
@@ -91,7 +151,8 @@ Each stage is independent — you can re-render markdown, recompute signals, re-
 
 ## Storage layout
 
-Artifacts land in `./rollout-memory/` by default:
+Artifacts land in the configured per-user archive. The platform default on
+macOS is `~/Library/Application Support/retro/rollout-memory`:
 
 ```
 rollout-memory/
@@ -474,9 +535,10 @@ python -m retro.dashboard_build --artifact-root /path/to/rollout-memory
 retro dashboard experiments
 ```
 
-The artifact root defaults to `./rollout-memory` and output to `./dashboard`, both relative to the current directory.
+The artifact root and dashboard output come from the per-user config. Override
+either for one command with `--root` and `--out`.
 
-Then open `dashboard/index.html` directly from disk.
+Then open the configured `dashboard/index.html` directly from disk.
 
 ### Cost computation
 
@@ -484,7 +546,7 @@ Then open `dashboard/index.html` directly from disk.
 - **Per-model attribution**: each token delta is tagged with the active model (`turn_context.model` for Codex, per-message `model` for Claude). Multi-model sessions produce per-model rows.
 - **Copilot usage**: VS Code request snapshots provide prompt/completion totals; Copilot CLI and Agent Host sessions add per-model input, output, cache read/write, reasoning tokens, and Copilot request units from the local session database.
 - **Codex token deltas** prefer the explicit `info.last_token_usage` per-turn delta when present, falling back to cumulative subtraction for older Codex builds.
-- **Cached-input handling** follows ccusage's behavior: subtract for Codex (its `input_tokens` is cumulative including cache), don't subtract for Anthropic (its `input_tokens` is already fresh non-cached).
+- **Cached-input handling** follows each source format: Codex totals include cached input; Copilot Agent Host totals are split into fresh input, cache reads, and cache writes during normalization; Anthropic input is already non-cached.
 - **Cost source labeling**: each session records whether its cost was `embedded` (provider-supplied) or `calculated` (token math).
 
 Numbers are always estimates, never billing truth.

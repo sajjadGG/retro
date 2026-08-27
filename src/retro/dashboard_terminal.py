@@ -6,10 +6,8 @@ Provides a feature-parity terminal view of the static HTML dashboard.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -17,6 +15,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
+from .config import resolve_archive_root, resolve_dashboard_dir
 from .dashboard_build import build as build_dashboard_data
 
 console = Console()
@@ -24,8 +23,8 @@ console = Console()
 
 def load_dashboard_data(mode: str = "auto") -> dict[str, Any]:
     """Load dashboard data from rollouts.json, building it if missing."""
-    artifact_root = os.environ.get("RETRO_ARTIFACT_ROOT")
-    out_dir = Path.cwd() / "dashboard"
+    artifact_root = resolve_archive_root()
+    out_dir = resolve_dashboard_dir()
     json_path = out_dir / "data" / "rollouts.json"
 
     if not json_path.exists():
@@ -35,7 +34,7 @@ def load_dashboard_data(mode: str = "auto") -> dict[str, Any]:
         try:
             build_dashboard_data(
                 mode=mode,
-                artifact_root=Path(artifact_root) if artifact_root else None,
+                artifact_root=artifact_root,
                 out_dir=out_dir,
             )
         except Exception as exc:  # pragma: no cover - defensive path

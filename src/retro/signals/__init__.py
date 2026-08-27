@@ -24,6 +24,8 @@ from .base import (  # noqa: F401
 from .runner import (  # noqa: F401
     aggregate_readings,
     iter_sessions,
+    read_signal_readings,
+    replace_session_readings,
     run_signals,
     write_signal_artifacts,
 )

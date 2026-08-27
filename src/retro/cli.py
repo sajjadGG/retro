@@ -9,6 +9,8 @@ Commands:
 """
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Optional
@@ -17,6 +19,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .config import (
+    RetroConfig,
+    config_path,
+    load_config,
+    resolve_dashboard_dir,
+    save_config,
+)
 from .importers.claude import ClaudeImporter
 from .importers.codex import CodexImporter
 from .importers.copilot import CopilotImporter
@@ -68,11 +77,20 @@ quest_app = typer.Typer(
 )
 app.add_typer(quest_app, name="quest")
 
+config_app = typer.Typer(no_args_is_help=True, help="Inspect and update per-user configuration.")
+app.add_typer(config_app, name="config")
+
+archive_app = typer.Typer(no_args_is_help=True, help="Plan and execute archive migrations.")
+app.add_typer(archive_app, name="archive")
+
+schedule_app = typer.Typer(no_args_is_help=True, help="Manage periodic local capture.")
+app.add_typer(schedule_app, name="schedule")
+
 console = Console()
 
 
 def _layout(root: Optional[Path]) -> Layout:
-    lay = default_layout(root or Path.cwd() / "rollout-memory")
+    lay = default_layout(root)
     lay.ensure()
     return lay
 
@@ -615,6 +633,275 @@ def _expand_hosts(host: str) -> list[Host]:
     return [_expand_host(host)]
 
 
+# ---- global config / archive / sync -----------------------------------------
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show effective per-user paths and periodic settings."""
+    config = load_config()
+    table = Table(title=f"Retro configuration ({config_path()})")
+    table.add_column("setting")
+    table.add_column("value")
+    for key, value in config.to_dict().items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(
+        ...,
+        help="archive-root|dashboard-dir|sync-interval|sync-on-login",
+    ),
+    value: str = typer.Argument(...),
+) -> None:
+    """Update one per-user setting."""
+    current = load_config()
+    values = current.to_dict()
+    normalized = key.lower().replace("_", "-")
+    if normalized == "archive-root":
+        values["archive_root"] = str(Path(value).expanduser().resolve())
+    elif normalized == "dashboard-dir":
+        values["dashboard_dir"] = str(Path(value).expanduser().resolve())
+    elif normalized == "sync-interval":
+        from .schedule import parse_interval
+
+        values["sync_interval_seconds"] = parse_interval(value)
+    elif normalized == "sync-on-login":
+        lowered = value.lower()
+        if lowered not in {"true", "false", "yes", "no", "1", "0"}:
+            raise typer.BadParameter("sync-on-login must be true or false")
+        values["sync_on_login"] = lowered in {"true", "yes", "1"}
+    else:
+        raise typer.BadParameter(
+            "key must be archive-root, dashboard-dir, sync-interval, or sync-on-login"
+        )
+    updated = RetroConfig(**values)
+    path = save_config(updated)
+    console.print(f"[green]updated[/green] {path}")
+
+
+@app.command("setup")
+def setup_cmd(
+    archive_root: Optional[Path] = typer.Option(
+        None,
+        "--archive-root",
+        help="Global archive root",
+    ),
+    dashboard_dir: Optional[Path] = typer.Option(
+        None,
+        "--dashboard-dir",
+        help="Generated dashboard directory",
+    ),
+    periodic: str = typer.Option("15m", "--periodic", help="Capture interval, e.g. 15m or 1h"),
+    no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
+) -> None:
+    """Configure global storage and optionally install periodic capture."""
+    from .schedule import install_schedule, parse_interval
+
+    current = load_config()
+    interval = parse_interval(periodic)
+    config = RetroConfig(
+        archive_root=str(
+            (archive_root or Path(current.archive_root)).expanduser().resolve()
+        ),
+        dashboard_dir=str(
+            (dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()
+        ),
+        sync_interval_seconds=interval,
+        sync_on_login=True,
+    )
+    path = save_config(config)
+    Layout(Path(config.archive_root)).ensure()
+    Path(config.dashboard_dir).mkdir(parents=True, exist_ok=True)
+    console.print(f"[green]configured Retro:[/green] {path}")
+    console.print(f"  archive:   {config.archive_root}")
+    console.print(f"  dashboard: {config.dashboard_dir}")
+    if not no_schedule:
+        plist = install_schedule(interval)
+        console.print(f"  schedule:  {plist}  (every {interval}s)")
+
+
+@archive_app.command("plan")
+def archive_plan(
+    sources: list[Path] = typer.Option(..., "--from", help="Source rollout-memory root"),
+    into: Path = typer.Option(..., "--into", help="Canonical destination root"),
+    experiments_from: Optional[list[Path]] = typer.Option(
+        None,
+        "--experiments-from",
+        help="Repository root containing logs/ and root evaluation JSON",
+    ),
+    dashboard_dir: Optional[Path] = typer.Option(None, "--dashboard-dir"),
+) -> None:
+    """Create a checksummed migration plan without copying archive data."""
+    from .archive import create_migration_plan
+
+    plan = create_migration_plan(
+        sources,
+        into,
+        experiment_roots=experiments_from,
+        dashboard_dir=dashboard_dir,
+    )
+    data = json.loads(plan.read_text(encoding="utf-8"))
+    console.print(f"[green]migration plan:[/green] {plan}")
+    console.print(json.dumps(data["summary"], indent=2))
+
+
+@archive_app.command("migrate")
+def archive_migrate(
+    plan: Path = typer.Option(..., "--plan"),
+    rebuild: bool = typer.Option(False, "--rebuild-derived"),
+) -> None:
+    """Execute a migration plan using atomic, checksummed copies."""
+    from .archive import execute_migration, rebuild_derived_artifacts
+
+    result = execute_migration(plan)
+    console.print(f"[green]copied migration {result['migration_id']}[/green]")
+    console.print(json.dumps(result["summary"], indent=2))
+    if rebuild:
+        report = rebuild_derived_artifacts(plan)
+        console.print(
+            f"[green]rebuilt derived artifacts for "
+            f"{report['rendered_sessions']} sessions[/green]"
+        )
+
+
+@archive_app.command("verify")
+def archive_verify(
+    plan: Path = typer.Option(..., "--plan"),
+) -> None:
+    """Verify migrated checksums, event references, sessions, and memory DB."""
+    from .archive import verify_migration
+
+    report = verify_migration(plan)
+    console.print(json.dumps(report, indent=2))
+    if not report["ok"]:
+        raise typer.Exit(1)
+
+
+@archive_app.command("cutover")
+def archive_cutover(
+    plan: Path = typer.Option(..., "--plan"),
+    link_path: Path = typer.Option(..., "--link-path"),
+) -> None:
+    """Replace a verified legacy archive directory with a compatibility symlink."""
+    from .archive import cutover_compatibility_link
+
+    link = cutover_compatibility_link(plan, link_path)
+    console.print(f"[green]compatibility path ready:[/green] {link} -> {link.resolve()}")
+
+
+@app.command("sync")
+def sync_cmd(
+    root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
+    dashboard_dir: Optional[Path] = typer.Option(None, "--dashboard-dir"),
+    scheduled: bool = typer.Option(False, "--scheduled", hidden=True),
+    force_derived: bool = typer.Option(
+        False,
+        "--force-derived",
+        help="Recompute all signals, memory, and dashboard data",
+    ),
+) -> None:
+    """Capture changed local sessions and refresh derived portfolio artifacts."""
+    from .sync import run_sync
+
+    report = run_sync(
+        _layout(root),
+        dashboard_dir=dashboard_dir,
+        scheduled=scheduled,
+        force_derived=force_derived,
+    )
+    console.print(
+        f"[{'green' if report.status == 'success' else 'yellow'}]"
+        f"sync {report.status}[/]"
+    )
+    console.print(
+        f"  imported={len(report.imported)} unchanged={len(report.unchanged)} "
+        f"failures={len(report.failures)}"
+    )
+    if report.warning:
+        console.print(f"[yellow]{report.warning}[/yellow]")
+    for failure in report.failures:
+        console.print(f"[red]{failure['session']}: {failure['error']}[/red]")
+    if report.status not in {"success"}:
+        raise typer.Exit(1)
+
+
+@schedule_app.command("install")
+def schedule_install(
+    every: str = typer.Option("15m", "--every"),
+) -> None:
+    """Install or replace the current user's macOS LaunchAgent."""
+    from .schedule import install_schedule, parse_interval
+
+    interval = parse_interval(every)
+    config = load_config()
+    save_config(
+        RetroConfig(
+            archive_root=config.archive_root,
+            dashboard_dir=config.dashboard_dir,
+            sync_interval_seconds=interval,
+            sync_on_login=config.sync_on_login,
+        )
+    )
+    path = install_schedule(interval)
+    console.print(f"[green]schedule installed:[/green] {path}")
+
+
+@schedule_app.command("status")
+def schedule_status_cmd() -> None:
+    """Show periodic capture installation and loaded state."""
+    from .schedule import schedule_status
+
+    console.print_json(data=schedule_status())
+
+
+@schedule_app.command("run-now")
+def schedule_run_now() -> None:
+    """Ask launchd to start the periodic capture job now."""
+    from .schedule import run_now
+
+    run_now()
+    console.print("[green]scheduled sync started[/green]")
+
+
+@schedule_app.command("uninstall")
+def schedule_uninstall() -> None:
+    """Unload and remove Retro's user LaunchAgent."""
+    from .schedule import uninstall_schedule
+
+    path = uninstall_schedule()
+    console.print(f"[green]schedule removed:[/green] {path}")
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Report global archive, source, disk, and scheduler health."""
+    from .importers.copilot import CopilotImporter
+    from .schedule import schedule_status
+
+    layout = default_layout()
+    layout.ensure()
+    free = shutil.disk_usage(layout.root.parent).free
+    table = Table(title="Retro global archive")
+    table.add_column("check")
+    table.add_column("value")
+    table.add_row("config", str(config_path()))
+    table.add_row("archive", str(layout.root))
+    table.add_row("dashboard", str(resolve_dashboard_dir()))
+    table.add_row("free space", f"{free / 1024**3:.1f} GiB")
+    table.add_row(
+        "normalized sessions",
+        str(sum(len(layout.list_normalized(host)) for host in HOSTS)),
+    )
+    table.add_row("discoverable Copilot", str(len(CopilotImporter(layout).discover())))
+    status = schedule_status()
+    table.add_row("schedule installed", str(status.get("installed")))
+    table.add_row("schedule loaded", str(status.get("loaded")))
+    console.print(table)
+
+
 # ---- signals ----------------------------------------------------------------
 
 
@@ -744,7 +1031,11 @@ def dashboard_build(
 
     from .dashboard_build import build as build_dashboard_html
 
-    index_path = build_dashboard_html(mode=mode, artifact_root=root, out_dir=out)
+    index_path = build_dashboard_html(
+        mode=mode,
+        artifact_root=root,
+        out_dir=resolve_dashboard_dir(out),
+    )
     console.print(f"[green]dashboard ready:[/green] {index_path}")
 
 
@@ -759,7 +1050,10 @@ def dashboard_experiments(
     """Build the experimental trajectory-signals page (trajectory_experiments.html)."""
     from .dashboard_experiments import build as build_experiments_html
 
-    html_path = build_experiments_html(artifact_root=root, out_dir=out)
+    html_path = build_experiments_html(
+        artifact_root=root,
+        out_dir=resolve_dashboard_dir(out),
+    )
     console.print(f"[green]experiments page ready:[/green] {html_path}")
 
 
@@ -987,7 +1281,7 @@ def callback(
     if sys.stdout.isatty():
         try:
             from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-            lay = default_layout(root or Path.cwd() / "rollout-memory")
+            lay = default_layout(root)
             state = load_quest_state(lay)
             gen_new = ensure_daily_quests(lay, state)
             if gen_new:

@@ -280,5 +280,9 @@ def _clamp_float(value, lo: float, hi: float, default: float) -> float:
 
 
 def _headless_capture_path(ctx: MiningContext) -> Path:
-    root = ctx.artifact_root() or Path.cwd() / "rollout-memory"
+    root = ctx.artifact_root()
+    if root is None:
+        from ...config import resolve_archive_root
+
+        root = resolve_archive_root()
     return root / "headless" / METHOD / ctx.host / f"{ctx.session_id}.codex.jsonl"

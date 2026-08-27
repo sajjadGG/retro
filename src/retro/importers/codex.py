@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import iter_jsonl, truncate_summary
+from ..utils import artifact_ref, iter_jsonl, truncate_summary
 from .base import ImportResult
 
 CODEX_HOME = Path.home() / ".codex"
@@ -326,7 +326,10 @@ class CodexImporter:
             payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
             ptype = payload.get("type")
             event_id = f"{thread_id}:{line_no}"
-            raw_ref = RawRef(path=str(rollout_path), line=line_no)
+            raw_ref = RawRef(
+                path=artifact_ref(rollout_path, self.layout.root),
+                line=line_no,
+            )
             common: dict[str, Any] = dict(
                 event_id=event_id,
                 session_id=thread_id,

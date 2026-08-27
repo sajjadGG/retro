@@ -20,7 +20,7 @@ from typing import Any
 
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import iter_jsonl, truncate_summary
+from ..utils import artifact_ref, iter_jsonl, truncate_summary
 from .base import ImportResult
 
 CLAUDE_HOME = Path.home() / ".claude"
@@ -249,7 +249,10 @@ class ClaudeImporter:
             ts = raw_event.get("timestamp")
             uuid = raw_event.get("uuid") or f"{session_id}:{line_no}"
             parent = raw_event.get("parentUuid")
-            raw_ref = RawRef(path=str(transcript_path), line=line_no)
+            raw_ref = RawRef(
+                path=artifact_ref(transcript_path, self.layout.root),
+                line=line_no,
+            )
 
             common: dict[str, Any] = dict(
                 session_id=session_id,

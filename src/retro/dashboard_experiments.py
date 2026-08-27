@@ -15,9 +15,10 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-# Defaults are cwd-relative; build() rebinds these from its arguments.
-ARTIFACT_ROOT = Path.cwd() / "rollout-memory"
-OUT_DIR = Path.cwd() / "dashboard"
+from .config import resolve_archive_root, resolve_dashboard_dir
+
+ARTIFACT_ROOT = resolve_archive_root()
+OUT_DIR = resolve_dashboard_dir()
 DATA_DIR = OUT_DIR / "data"
 TRAJECTORY_PREFIX = "trajectory_"
 
@@ -25,11 +26,9 @@ TRAJECTORY_PREFIX = "trajectory_"
 def build(artifact_root: Path | None = None, out_dir: Path | None = None) -> Path:
     """Build the trajectory-experiments page; returns the generated HTML path."""
     global ARTIFACT_ROOT, OUT_DIR, DATA_DIR
-    if artifact_root is not None:
-        ARTIFACT_ROOT = Path(artifact_root).expanduser().resolve()
-    if out_dir is not None:
-        OUT_DIR = Path(out_dir).expanduser().resolve()
-        DATA_DIR = OUT_DIR / "data"
+    ARTIFACT_ROOT = resolve_archive_root(artifact_root)
+    OUT_DIR = resolve_dashboard_dir(out_dir)
+    DATA_DIR = OUT_DIR / "data"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = build_payload()
     data_path = DATA_DIR / "trajectory_experiments.json"

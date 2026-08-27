@@ -13,6 +13,17 @@ from retro.storage import Layout
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def isolated_retro_user_data(monkeypatch, tmp_path: Path):
+    data_dir = tmp_path / "retro-user-data"
+    monkeypatch.setenv("RETRO_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("RETRO_CONFIG_PATH", str(data_dir / "config.json"))
+    monkeypatch.setenv("RETRO_LOG_DIR", str(data_dir / "logs"))
+    monkeypatch.delenv("RETRO_ROOT", raising=False)
+    monkeypatch.delenv("RETRO_ARTIFACT_ROOT", raising=False)
+    monkeypatch.delenv("RETRO_DASHBOARD_DIR", raising=False)
+
+
 @pytest.fixture
 def claude_transcript() -> Path:
     return FIXTURES / "claude_transcript.jsonl"

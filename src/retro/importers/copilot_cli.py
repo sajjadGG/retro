@@ -11,7 +11,7 @@ from typing import Any
 
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import truncate_summary
+from ..utils import artifact_ref, truncate_summary
 from .base import ImportResult
 from .vscode_copilot import (
     _completion_event_type,
@@ -306,7 +306,10 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type=event_type,
                     summary=summary,
-                    raw_ref=RawRef(path=str(events_path), line=line_no),
+                    raw_ref=RawRef(
+                        path=artifact_ref(events_path, self.layout.root),
+                        line=line_no,
+                    ),
                     timestamp=_iso_timestamp(raw.get("timestamp")),
                     parent_event_id=parent_event_id,
                     payload=event_payload,

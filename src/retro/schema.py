@@ -7,6 +7,8 @@ consume it without consulting Python.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -67,11 +69,20 @@ class NormalizedEvent:
 def write_events(path: Path, events: Iterable[NormalizedEvent]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     count = 0
-    with path.open("w", encoding="utf-8") as fh:
-        for ev in events:
-            fh.write(json.dumps(ev.to_dict(), ensure_ascii=False))
-            fh.write("\n")
-            count += 1
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for ev in events:
+                fh.write(json.dumps(ev.to_dict(), ensure_ascii=False))
+                fh.write("\n")
+                count += 1
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return count
 
 

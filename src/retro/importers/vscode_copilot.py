@@ -19,7 +19,7 @@ from urllib.parse import unquote, urlparse
 
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import truncate_summary
+from ..utils import artifact_ref, truncate_summary
 from .base import ImportResult
 
 VSCODE_COPILOT_USER_DIRS_ENV = "VSCODE_COPILOT_USER_DIRS"
@@ -485,7 +485,10 @@ class VscodeCopilotImporter:
                     actor=actor,
                     event_type=event_type,
                     summary=summary,
-                    raw_ref=RawRef(path=str(transcript_path), line=line_no),
+                    raw_ref=RawRef(
+                        path=artifact_ref(transcript_path, self.layout.root),
+                        line=line_no,
+                    ),
                     timestamp=timestamp,
                     parent_event_id=(
                         _transcript_event_id(session_id, parent_id)
@@ -705,7 +708,10 @@ class VscodeCopilotImporter:
                     actor=actor,
                     event_type=event_type,
                     summary=summary,
-                    raw_ref=RawRef(path=str(source_path), line=line_no),
+                    raw_ref=RawRef(
+                        path=artifact_ref(source_path, self.layout.root),
+                        line=line_no,
+                    ),
                     timestamp=timestamp,
                     parent_event_id=parent_event_id,
                     payload=payload,

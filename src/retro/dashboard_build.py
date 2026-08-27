@@ -30,9 +30,11 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-# Defaults are cwd-relative; build() rebinds these from its arguments.
-ARTIFACT_ROOT = Path.cwd() / "rollout-memory"
-OUT_DIR = Path.cwd() / "dashboard"
+from .config import resolve_archive_root, resolve_dashboard_dir
+
+# Defaults come from the per-user config; build() rebinds explicit overrides.
+ARTIFACT_ROOT = resolve_archive_root()
+OUT_DIR = resolve_dashboard_dir()
 DATA_DIR = OUT_DIR / "data"
 PRICING_SNAPSHOT = Path(__file__).resolve().parent / "pricing" / "litellm-pricing.json"
 
@@ -166,11 +168,9 @@ def build(
     global ARTIFACT_ROOT, OUT_DIR, DATA_DIR
     if mode not in COST_MODES:
         raise ValueError(f"mode must be one of {COST_MODES}, got {mode!r}")
-    if artifact_root is not None:
-        ARTIFACT_ROOT = Path(artifact_root).expanduser().resolve()
-    if out_dir is not None:
-        OUT_DIR = Path(out_dir).expanduser().resolve()
-        DATA_DIR = OUT_DIR / "data"
+    ARTIFACT_ROOT = resolve_archive_root(artifact_root)
+    OUT_DIR = resolve_dashboard_dir(out_dir)
+    DATA_DIR = OUT_DIR / "data"
     pricing = PricingMap.load()
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)

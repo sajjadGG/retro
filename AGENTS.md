@@ -71,6 +71,8 @@ python3 -m venv .venv
 - **`raw/` is immutable.** Re-imports refuse to overwrite unless `--force` is passed.
 - **Unknown events are preserved, not dropped.** Importers emit `event_type="unknown"` with the original payload so nothing is silently lost.
 - **Everything is evidence-linked.** Signal readings and mined memories carry `event_id` references back to source events.
+- **The default archive is per-user, not cwd-local.** Resolve paths through `config.py` / `default_layout()` and keep tests isolated with `RETRO_DATA_DIR`.
+- **Archive publication is atomic.** Migration, sync, signal, normalized-event, and dashboard writes must stage and replace rather than expose partial files.
 
 ## Common tasks
 

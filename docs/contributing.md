@@ -7,6 +7,10 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+Tests isolate `RETRO_DATA_DIR` and `RETRO_CONFIG_PATH`; never point tests at a
+real user archive. The installed CLI defaults to the per-user archive resolved
+by `retro.config`, not a checkout-local `rollout-memory/`.
+
 ## Checks
 
 ```bash
