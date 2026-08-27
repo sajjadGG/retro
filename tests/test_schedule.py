@@ -38,7 +38,7 @@ def test_launch_agent_generation(monkeypatch, tmp_path: Path):
     assert payload["StartInterval"] == 900
     assert payload["RunAtLoad"] is True
     assert payload["ProgramArguments"] == [
-        str(python.resolve()),
+        str(python.absolute()),
         "-m",
         "retro.cli",
         "sync",

@@ -57,7 +57,7 @@ def install_schedule(
         raise RuntimeError("Periodic scheduler installation is currently supported on macOS")
     if interval_seconds < 60:
         raise ValueError("Periodic interval must be at least 60 seconds")
-    executable = (python_executable or Path(sys.executable)).expanduser().resolve()
+    executable = (python_executable or Path(sys.executable)).expanduser().absolute()
     if not executable.is_file():
         raise FileNotFoundError(f"Python executable does not exist: {executable}")
     if _is_unstable_executable(executable):
