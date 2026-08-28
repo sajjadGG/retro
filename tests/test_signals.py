@@ -92,6 +92,38 @@ class TestHeuristicSignals:
         readings = sig(_ctx(events))
         assert readings[0].value == 2
 
+    def test_unique_files_edited_extracts_codex_apply_patch(self):
+        events = [
+            _ev(
+                event_type="file_edit",
+                payload={
+                    "name": "apply_patch",
+                    "arguments": (
+                        "*** Update File: src/app.py\n"
+                        "*** Add File: tests/test_app.py\n"
+                    ),
+                },
+            )
+        ]
+        readings = REGISTRY["unique_files_edited"](_ctx(events))
+        assert readings[0].value == 2
+        assert readings[0].metadata["files"] == ["src/app.py", "tests/test_app.py"]
+
+    def test_unique_files_edited_extracts_success_result_path(self):
+        events = [
+            _ev(
+                event_type="file_edit",
+                payload={
+                    "tool_name": "Write",
+                    "is_error": False,
+                    "content": "File created successfully at: /workspace/demo/new.py",
+                },
+            )
+        ]
+        readings = REGISTRY["unique_files_edited"](_ctx(events))
+        assert readings[0].value == 1
+        assert readings[0].metadata["files"] == ["/workspace/demo/new.py"]
+
     def test_user_message_count(self):
         events = [
             _ev(actor="user", event_type="message"),

@@ -1,6 +1,6 @@
 # User Task Distribution Benchmark
 
-Status: research design v0.1
+Status: research design v0.1; time-consistent file-localization slice implemented
 
 Working name: UTD-Bench
 
@@ -1219,6 +1219,28 @@ rollout-memory/
 
 Every derived artifact should carry event, task, commit, and environment provenance consistent with `retro`'s evidence-linked architecture. Raw captured data remains immutable; benchmark versions refer to it rather than rewriting it.
 
+### 23.1 Implemented time-consistent localization slice
+
+[time_consistent.py](../../src/retro/benchmarks/time_consistent.py) implements the narrower construction
+and evaluation protocol from reference [4]. It deliberately replaces the
+earlier provisional profile contract where the paper requires a stricter one:
+
+- one explicit repository snapshot and knowledge cutoff `T0`;
+- rollout goal episodes in `(T0, T1]` as the private task source;
+- file-edit paths as evaluator-only modified-file truth;
+- four leakage-filtered prompt granularities, with `contextual` as default;
+- immutable, checksummed benchmark and run directories;
+- exact file-set precision, recall, and F1;
+- unweighted mean task F1 plus task-level extreme-outcome diagnostics;
+- matched baseline-versus-augmented deltas when both conditions are supplied.
+
+The implementation stores each learner-visible prompt level in a separate file
+and keeps ground truth, expected file counts, and source provenance private.
+Its generated `historical_observed` prediction file is private evaluator input,
+derived from pre-edit inspection events; it is not presented as a baseline run
+under one of the generated prompt variants. The method remains a localization
+proxy and does not replace the verifier-first end-to-end task contract above.
+
 ## 24. Open research decisions
 
 1. What scope is the first target distribution: one repository, all coding work, or all delegated agent work?
@@ -1277,7 +1299,7 @@ https://paperclip.gxl.ai/citations/papers/arx_2607.03162#L19-L32,L37-L47,L59-L66
 [3] Yang J., Lieret K., Jimenez C. E., et al. “SWE-smith: Scaling Data for Software Engineering Agents.” *arXiv* (2025).
 https://paperclip.gxl.ai/citations/papers/arx_2504.21798#L5-L14,L23-L31
 
-[4] “A Time-Consistent Benchmark for Repository-Level Software Engineering Agents.” *arXiv* (2026).
+[4] “A Time-Consistent Benchmark for Repository-Level Software Engineering Evaluation.” *arXiv* (2026).
 https://paperclip.gxl.ai/citations/papers/arx_2603.26137#L21-L38,L43-L55
 
 [5] “SWE-rebench: An Automated Pipeline for Task Collection and Decontaminated Evaluation of Software Engineering Agents.” *arXiv* (2025).

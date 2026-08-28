@@ -33,6 +33,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Capture](#capture)
 - [Signals](#signals)
 - [Mining](#mining)
+- [Time-consistent benchmarks](#time-consistent-benchmarks)
 - [Memory backend](#memory-backend)
 - [Dashboard](#dashboard)
 - [Pricing snapshot](#pricing-snapshot)
@@ -208,6 +209,20 @@ rollout-memory/
     items.jsonl                               # canonical appended memory records
     events.jsonl                              # memory lifecycle / utility log
     index.sqlite                              # derived SQLite + FTS index, rebuildable
+
+  benchmarks/<benchmark-id>/                  # immutable generated task version
+    manifest.json                             # cutoff, snapshot, method, checksums
+    tasks/prompts/<level>.jsonl                # isolated learner input for one prompt level
+    private/ground-truth.jsonl                # evaluator-only truth + provenance
+    private/historical-localization-predictions.jsonl
+    knowledge/eligible-event-refs.jsonl        # pre-cutoff evidence boundary
+
+  benchmark-runs/<benchmark-id>/<run-id>/      # immutable evaluation result
+    run-manifest.json
+    predictions.jsonl
+    results.json
+    report.md
+    private/task-details.jsonl
 ```
 
 `raw/` is treated as **immutable**: re-importing the same session refuses unless `--force` is passed.
@@ -451,6 +466,84 @@ def mine_my_method(ctx: MiningContext) -> MiningResult:
 ```
 
 Import it in `mining/methods/__init__.py`. `retro methods` and `--method` pick it up.
+
+---
+
+## Time-consistent benchmarks
+
+`retro benchmark` implements the construction and evaluation protocol from
+[A Time-Consistent Benchmark for Repository-Level Software Engineering
+Evaluation](https://arxiv.org/abs/2603.26137), adapted to private rollout data.
+The paper creates tasks from pull requests merged after a cutoff. Retro uses a
+post-cutoff user goal episode as the task and the episode's file-edit events as
+hidden modified-file ground truth.
+
+The core validity boundary is unchanged:
+
+- repository snapshot and augmentation knowledge are fixed at or before `T0`;
+- tasks come only from `(T0, T1]`;
+- generated prompts never expose the hidden changed-file names;
+- baseline and augmented predictions are compared only when task, model, prompt
+  level, snapshot, and metric match.
+
+The paper defines but does not publish exact templates for its four prompt
+levels. Retro therefore uses a deterministic, local, leakage-filtered
+reconstruction:
+
+| Level | Retro contract |
+|---|---|
+| `minimal` | High-level action sentence only |
+| `concise` | Minimal task plus affected component |
+| `contextual` | Problem/use context and component, without inline implementation details; default |
+| `guided` | Richer source context plus change-shape and validation guidance |
+
+Each level is written to a separate task file. A minimal-prompt run therefore
+cannot read the contextual or guided variant, post-cutoff event references,
+expected file count, or modified-file truth.
+
+### Build and evaluate
+
+Both `--cutoff` and `--end` must be timezone-aware. Benchmark versions and run
+IDs are immutable; choose a new ID rather than overwriting an earlier result.
+
+```bash
+# Build tasks from all matching captured hosts for one local repository.
+retro benchmark build cortex-20260601-v1 \
+  --project /path/to/repository \
+  --cutoff 2026-06-01T00:00:00Z \
+  --end 2026-08-01T00:00:00Z \
+  --host '*'
+
+# Inventory benchmark versions.
+retro benchmark list
+
+# Score a model or agent run.
+retro benchmark evaluate cortex-20260601-v1 predictions.jsonl \
+  --run-id baseline-contextual-v1
+
+# Score the generated diagnostic derived from the captured agent's pre-edit
+# inspection events. This is not a generated-prompt baseline.
+retro benchmark evaluate cortex-20260601-v1 \
+  "/path/to/rollout-memory/benchmarks/cortex-20260601-v1/private/historical-localization-predictions.jsonl" \
+  --run-id historical-observed-v1
+```
+
+Each prediction JSONL row has this contract:
+
+```json
+{"task_id":"tcl_...","condition":"baseline","model":"model-id","prompt_level":"contextual","predicted_files":["src/example.py","tests/test_example.py"]}
+```
+
+Use repository-relative paths. By default, every
+`(condition, model, prompt_level)` group must predict all tasks. Pass
+`--allow-partial` only for explicitly diagnostic runs. If both `baseline` and
+`augmented` groups are present, Retro reports the matched per-task mean F1
+delta and win/tie/loss counts.
+
+Task metrics are exact file-set precision, recall, and F1. The paper's score is
+the unweighted mean task-level F1; Retro also reports micro metrics, exact-match
+rate, zero-precision rate, perfect-recall rate, and zero-recall rate. This is a
+localization benchmark, not evidence that a patch is correct or that tests pass.
 
 ---
 

@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
 from datetime import datetime
 
 from ..schema import NormalizedEvent
+from ..utils import event_file_paths
 from .base import SessionContext, event_text, iter_messages, reading, register
 
 # ---- activity ---------------------------------------------------------------
@@ -47,7 +47,7 @@ def _unique_files_edited(ctx: SessionContext):
     for ev in ctx.events:
         if ev.event_type != "file_edit":
             continue
-        files.update(_extract_paths(ev))
+        files.update(event_file_paths(ev))
     return reading(
         ctx,
         _unique_files_edited,
@@ -68,7 +68,7 @@ def _unique_files_read(ctx: SessionContext):
     for ev in ctx.events:
         if ev.event_type != "file_read":
             continue
-        files.update(_extract_paths(ev))
+        files.update(event_file_paths(ev))
     return reading(ctx, _unique_files_read, len(files))
 
 
@@ -416,28 +416,6 @@ def _capture_gap_signal(ctx: SessionContext):
         not e.timestamp for e in ctx.events
     )
     return reading(ctx, _capture_gap_signal, has_gap)
-
-
-# ---- helpers ----------------------------------------------------------------
-
-
-def _extract_paths(ev: NormalizedEvent) -> Iterable[str]:
-    payload = ev.payload or {}
-    paths: set[str] = set()
-    for key in ("file_path", "path", "filepath"):
-        v = payload.get(key)
-        if isinstance(v, str):
-            paths.add(v)
-    inp = payload.get("input")
-    if isinstance(inp, dict):
-        for key in ("file_path", "path", "filepath"):
-            v = inp.get(key)
-            if isinstance(v, str):
-                paths.add(v)
-    changes = payload.get("changes")
-    if isinstance(changes, dict):
-        paths.update(k for k in changes.keys() if isinstance(k, str))
-    return paths
 
 
 def _find_secret_exposures(ctx: SessionContext) -> list[dict[str, str]]:
