@@ -25,6 +25,7 @@ def test_parse_interval():
 
 
 def test_launch_agent_generation(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("retro.schedule.sys.platform", "darwin")
     path = tmp_path / "io.retro.sync.plist"
     python = tmp_path / "python"
     python.write_text("", encoding="utf-8")
@@ -48,6 +49,7 @@ def test_launch_agent_generation(monkeypatch, tmp_path: Path):
 
 
 def test_launch_agent_rejects_project_virtualenv(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("retro.schedule.sys.platform", "darwin")
     python = tmp_path / ".venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
@@ -57,6 +59,7 @@ def test_launch_agent_rejects_project_virtualenv(monkeypatch, tmp_path: Path):
 
 
 def test_schedule_status_and_uninstall(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("retro.schedule.sys.platform", "darwin")
     path = tmp_path / "io.retro.sync.plist"
     path.write_text("placeholder", encoding="utf-8")
     monkeypatch.setenv("RETRO_LAUNCH_AGENT_PATH", str(path))
@@ -72,3 +75,20 @@ def test_schedule_status_and_uninstall(monkeypatch, tmp_path: Path):
     assert status["loaded"] is True
     assert uninstall_schedule() == path
     assert not path.exists()
+
+
+def test_schedule_reports_unsupported_off_macos(monkeypatch, tmp_path: Path):
+    path = tmp_path / "io.retro.sync.plist"
+    monkeypatch.setattr("retro.schedule.sys.platform", "linux")
+    monkeypatch.setenv("RETRO_LAUNCH_AGENT_PATH", str(path))
+
+    status = schedule_status()
+
+    assert status == {
+        "supported": False,
+        "installed": False,
+        "loaded": False,
+        "path": str(path),
+    }
+    with pytest.raises(RuntimeError, match="supported on macOS"):
+        install_schedule(900, python_executable=tmp_path / "python", load=False)
