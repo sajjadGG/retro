@@ -2,22 +2,33 @@
 
 Commands:
   retro list                       -> show discoverable sessions per host
-  retro import claude|codex [...]  -> capture + normalize a session
+  retro import claude|codex|copilot [...]  -> capture + normalize a session
   retro import all                 -> capture + normalize all discoverable sessions
   retro render <host> <id>         -> re-render markdown from normalized
   retro show   <host> <id>         -> show artifact paths + counts
 """
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from .config import (
+    RetroConfig,
+    config_path,
+    load_config,
+    resolve_dashboard_dir,
+    save_config,
+)
 from .importers.claude import ClaudeImporter
 from .importers.codex import CodexImporter
+from .importers.copilot import CopilotImporter
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -29,7 +40,7 @@ from .mining import (
     write_mining_artifacts,
 )
 from .renderer import render_file
-from .schema import Host, read_events
+from .schema import HOSTS, Host, read_events
 from .signals import REGISTRY as SIGNAL_REGISTRY
 from .signals import run_signals, write_signal_artifacts
 from .storage import Layout, default_layout
@@ -37,7 +48,7 @@ from .storage import Layout, default_layout
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
-    help="Capture Codex / Claude Code rollouts and store them as durable local artifacts.",
+    help="Capture Codex, Claude Code, and VS Code Copilot rollouts as durable local artifacts.",
 )
 import_app = typer.Typer(no_args_is_help=True, help="Import a session from a host.")
 app.add_typer(import_app, name="import")
@@ -66,11 +77,20 @@ quest_app = typer.Typer(
 )
 app.add_typer(quest_app, name="quest")
 
+config_app = typer.Typer(no_args_is_help=True, help="Inspect and update per-user configuration.")
+app.add_typer(config_app, name="config")
+
+archive_app = typer.Typer(no_args_is_help=True, help="Plan and execute archive migrations.")
+app.add_typer(archive_app, name="archive")
+
+schedule_app = typer.Typer(no_args_is_help=True, help="Manage periodic local capture.")
+app.add_typer(schedule_app, name="schedule")
+
 console = Console()
 
 
-def _layout(root: Path | None) -> Layout:
-    lay = default_layout(root or Path.cwd() / "rollout-memory")
+def _layout(root: Optional[Path]) -> Layout:
+    lay = default_layout(root)
     lay.ensure()
     return lay
 
@@ -80,16 +100,22 @@ def _layout(root: Path | None) -> Layout:
 
 @app.command("list")
 def list_cmd(
-    host: str | None = typer.Option(None, help="Filter to one host: claude|codex"),
+    host: Optional[str] = typer.Option(None, help="Filter to one host: claude|codex|copilot"),
     limit: int = typer.Option(20, help="Max rows per host"),
-    root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
+    root: Optional[Path] = typer.Option(
+        None,
+        help="rollout-memory root (default ./rollout-memory)",
+    ),
 ):
     """List sessions discoverable on this machine."""
     lay = _layout(root)
-    if host in (None, "claude", "claude-code"):
+    host_full = _expand_host(host) if host else None
+    if host_full in (None, "claude-code"):
         _print_claude_table(ClaudeImporter(lay), limit, lay)
-    if host in (None, "codex"):
+    if host_full in (None, "codex"):
         _print_codex_table(CodexImporter(lay), limit, lay)
+    if host_full in (None, "vscode-copilot"):
+        _print_copilot_table(CopilotImporter(lay), limit, lay)
 
 
 def _print_claude_table(imp: ClaudeImporter, limit: int, lay: Layout) -> None:
@@ -143,17 +169,41 @@ def _print_codex_table(imp: CodexImporter, limit: int, lay: Layout) -> None:
     console.print(table)
 
 
-# ---- import claude / codex --------------------------------------------------
+def _print_copilot_table(imp: CopilotImporter, limit: int, lay: Layout) -> None:
+    all_sessions = imp.discover()
+    sessions = all_sessions[:limit]
+    imported = set(lay.list_imported("vscode-copilot"))
+    table = Table(title=f"VS Code Copilot  ({len(sessions)}/{len(all_sessions)} shown)")
+    table.add_column("imported", justify="center")
+    table.add_column("session_id")
+    table.add_column("source")
+    table.add_column("workspace")
+    table.add_column("model")
+    table.add_column("title")
+    for session in sessions:
+        mark = "✓" if session.session_id in imported else ""
+        table.add_row(
+            mark,
+            session.session_id,
+            session.source_kind + (" (active)" if getattr(session, "active", False) else ""),
+            session.workspace_name,
+            session.display_model,
+            session.display_title,
+        )
+    console.print(table)
+
+
+# ---- import claude / codex / copilot ----------------------------------------
 
 
 @import_app.command("claude")
 def import_claude(
-    session_id: str | None = typer.Option(None, "--session-id", help="Specific session id"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="Specific session id"),
     latest: bool = typer.Option(False, "--latest", help="Import the most-recent session"),
     all_sessions: bool = typer.Option(False, "--all", help="Import every discoverable Claude Code session"),
-    limit: int | None = typer.Option(None, "--limit", help="Optional max sessions to import with --all"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Optional max sessions to import with --all"),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing raw capture"),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
     no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
 ):
     """Import a Claude Code session."""
@@ -182,12 +232,12 @@ def import_claude(
 
 @import_app.command("codex")
 def import_codex(
-    thread_id: str | None = typer.Option(None, "--thread-id", help="Specific thread id"),
+    thread_id: Optional[str] = typer.Option(None, "--thread-id", help="Specific thread id"),
     latest: bool = typer.Option(False, "--latest", help="Import the most-recent thread"),
     all_sessions: bool = typer.Option(False, "--all", help="Import every discoverable Codex thread"),
-    limit: int | None = typer.Option(None, "--limit", help="Optional max threads to import with --all"),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Optional max threads to import with --all"),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing raw capture"),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
     no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
 ):
     """Import a Codex thread."""
@@ -214,19 +264,72 @@ def import_codex(
     _do_import(imp, thread_id, force=force, lay=lay, render=not no_render)
 
 
+@import_app.command("copilot")
+def import_copilot(
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="Specific chat session id"),
+    latest: bool = typer.Option(False, "--latest", help="Import the most-recent Copilot chat"),
+    all_sessions: bool = typer.Option(
+        False,
+        "--all",
+        help="Import every discoverable VS Code Copilot chat session",
+    ),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Optional max sessions to import with --all"),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing raw capture"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    user_data_dir: Optional[Path] = typer.Option(
+        None,
+        "--user-data-dir",
+        help="Explicit VS Code User data directory",
+    ),
+    session_state_dir: Optional[Path] = typer.Option(
+        None,
+        "--session-state-dir",
+        help="Explicit Copilot Agent Host session-state directory",
+    ),
+    no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
+):
+    """Import a VS Code GitHub Copilot or Agent Host session."""
+    lay = _layout(root)
+    imp = CopilotImporter(
+        lay,
+        user_data_dir=user_data_dir,
+        session_state_dir=session_state_dir,
+    )
+    if all_sessions:
+        _import_many(
+            imp,
+            [(session.session_id, session.display_title) for session in imp.discover()[:limit]],
+            force=force,
+            lay=lay,
+            render=not no_render,
+        )
+        return
+    if not session_id and not latest:
+        raise typer.BadParameter("Pass --session-id <id>, --latest, or --all")
+    if latest:
+        session = imp.latest()
+        if session is None:
+            console.print("[red]No local VS Code Copilot sessions found.[/red]")
+            raise typer.Exit(1)
+        session_id = session.session_id
+    assert session_id is not None
+    _do_import(imp, session_id, force=force, lay=lay, render=not no_render)
+
+
 @import_app.command("all")
 def import_all(
     force: bool = typer.Option(False, "--force", help="Overwrite existing raw captures"),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
     no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
-    limit_per_host: int | None = typer.Option(
+    limit_per_host: Optional[int] = typer.Option(
         None, "--limit-per-host", help="Optional max sessions per host"
     ),
 ):
-    """Import every discoverable Claude Code session and Codex thread."""
+    """Import every discoverable session from all supported hosts."""
     lay = _layout(root)
     claude = ClaudeImporter(lay)
     codex = CodexImporter(lay)
+    copilot = CopilotImporter(lay)
     failures = []
     failures.extend(
         _import_many(
@@ -242,6 +345,19 @@ def import_all(
         _import_many(
             codex,
             [(t.thread_id, t.display_title) for t in codex.discover()[:limit_per_host]],
+            force=force,
+            lay=lay,
+            render=not no_render,
+            exit_on_failure=False,
+        )
+    )
+    failures.extend(
+        _import_many(
+            copilot,
+            [
+                (session.session_id, session.display_title)
+                for session in copilot.discover()[:limit_per_host]
+            ],
             force=force,
             lay=lay,
             render=not no_render,
@@ -332,14 +448,14 @@ def _import_many(
 
 @app.command("mine")
 def mine_cmd(
-    host: str = typer.Argument(..., help="claude|codex|*"),
+    host: str = typer.Argument(..., help="claude|codex|copilot|*"),
     session_id: str = typer.Argument(..., help="session id, thread id, or *"),
     method: str = typer.Option(
         "reme_refine_poc",
         "--method",
         help="Mining method name, or `all` to run every registered method.",
     ),
-    filter_names: str | None = typer.Option(
+    filter_names: Optional[str] = typer.Option(
         None,
         "--filter",
         help="Comma-separated list of filters to apply after mining (e.g. risk_aware).",
@@ -347,7 +463,7 @@ def mine_cmd(
     all_sessions: bool = typer.Option(
         False, "--all", help="Mine all imported normalized sessions for the host"
     ),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Mine prompt-time memory from an imported normalized rollout."""
     # Resolve method choices.
@@ -450,9 +566,9 @@ def _mine_targets(
 
 @app.command("render")
 def render_cmd(
-    host: str = typer.Argument(..., help="claude|codex"),
+    host: str = typer.Argument(..., help="claude|codex|copilot"),
     session_id: str = typer.Argument(...),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Re-render markdown from already-imported normalized events."""
     lay = _layout(root)
@@ -468,9 +584,9 @@ def render_cmd(
 
 @app.command("show")
 def show_cmd(
-    host: str = typer.Argument(..., help="claude|codex"),
+    host: str = typer.Argument(..., help="claude|codex|copilot"),
     session_id: str = typer.Argument(...),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Show artifact paths and basic stats for an imported session."""
     lay = _layout(root)
@@ -505,14 +621,298 @@ def _expand_host(host: str) -> Host:
         return "claude-code"
     if h in ("codex", "cx"):
         return "codex"
-    raise typer.BadParameter(f"unknown host {host!r}; use claude|codex")
+    if h in ("copilot", "vscode", "vscode-copilot", "gh-copilot"):
+        return "vscode-copilot"
+    raise typer.BadParameter(f"unknown host {host!r}; use claude|codex|copilot")
 
 
 def _expand_hosts(host: str) -> list[Host]:
     h = host.lower()
     if h in ("*", "all"):
-        return ["claude-code", "codex"]
+        return list(HOSTS)
     return [_expand_host(host)]
+
+
+# ---- global config / archive / sync -----------------------------------------
+
+
+@config_app.command("show")
+def config_show() -> None:
+    """Show effective per-user paths and periodic settings."""
+    config = load_config()
+    table = Table(title=f"Retro configuration ({config_path()})")
+    table.add_column("setting")
+    table.add_column("value")
+    for key, value in config.to_dict().items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+@config_app.command("set")
+def config_set(
+    key: str = typer.Argument(
+        ...,
+        help="archive-root|dashboard-dir|sync-interval|derived-interval|sync-on-login",
+    ),
+    value: str = typer.Argument(...),
+) -> None:
+    """Update one per-user setting."""
+    current = load_config()
+    values = current.to_dict()
+    normalized = key.lower().replace("_", "-")
+    if normalized == "archive-root":
+        values["archive_root"] = str(Path(value).expanduser().resolve())
+    elif normalized == "dashboard-dir":
+        values["dashboard_dir"] = str(Path(value).expanduser().resolve())
+    elif normalized == "sync-interval":
+        from .schedule import parse_interval
+
+        values["sync_interval_seconds"] = parse_interval(value)
+    elif normalized == "derived-interval":
+        from .schedule import parse_interval
+
+        values["derived_interval_seconds"] = parse_interval(value)
+    elif normalized == "sync-on-login":
+        lowered = value.lower()
+        if lowered not in {"true", "false", "yes", "no", "1", "0"}:
+            raise typer.BadParameter("sync-on-login must be true or false")
+        values["sync_on_login"] = lowered in {"true", "yes", "1"}
+    else:
+        raise typer.BadParameter(
+            "key must be archive-root, dashboard-dir, sync-interval, "
+            "derived-interval, or sync-on-login"
+        )
+    updated = RetroConfig(**values)
+    path = save_config(updated)
+    console.print(f"[green]updated[/green] {path}")
+
+
+@app.command("setup")
+def setup_cmd(
+    archive_root: Optional[Path] = typer.Option(
+        None,
+        "--archive-root",
+        help="Global archive root",
+    ),
+    dashboard_dir: Optional[Path] = typer.Option(
+        None,
+        "--dashboard-dir",
+        help="Generated dashboard directory",
+    ),
+    periodic: str = typer.Option("15m", "--periodic", help="Capture interval, e.g. 15m or 1h"),
+    derived_every: str = typer.Option(
+        "6h",
+        "--derived-every",
+        help="Minimum interval between scheduled signal/dashboard rebuilds",
+    ),
+    no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
+) -> None:
+    """Configure global storage and optionally install periodic capture."""
+    from .schedule import install_schedule, parse_interval
+
+    current = load_config()
+    interval = parse_interval(periodic)
+    derived_interval = parse_interval(derived_every)
+    config = RetroConfig(
+        archive_root=str(
+            (archive_root or Path(current.archive_root)).expanduser().resolve()
+        ),
+        dashboard_dir=str(
+            (dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()
+        ),
+        sync_interval_seconds=interval,
+        derived_interval_seconds=derived_interval,
+        sync_on_login=True,
+    )
+    path = save_config(config)
+    Layout(Path(config.archive_root)).ensure()
+    Path(config.dashboard_dir).mkdir(parents=True, exist_ok=True)
+    console.print(f"[green]configured Retro:[/green] {path}")
+    console.print(f"  archive:   {config.archive_root}")
+    console.print(f"  dashboard: {config.dashboard_dir}")
+    if not no_schedule:
+        plist = install_schedule(interval)
+        console.print(f"  schedule:  {plist}  (every {interval}s)")
+
+
+@archive_app.command("plan")
+def archive_plan(
+    sources: list[Path] = typer.Option(..., "--from", help="Source rollout-memory root"),
+    into: Path = typer.Option(..., "--into", help="Canonical destination root"),
+    experiments_from: Optional[list[Path]] = typer.Option(
+        None,
+        "--experiments-from",
+        help="Repository root containing logs/ and root evaluation JSON",
+    ),
+    dashboard_dir: Optional[Path] = typer.Option(None, "--dashboard-dir"),
+) -> None:
+    """Create a checksummed migration plan without copying archive data."""
+    from .archive import create_migration_plan
+
+    plan = create_migration_plan(
+        sources,
+        into,
+        experiment_roots=experiments_from,
+        dashboard_dir=dashboard_dir,
+    )
+    data = json.loads(plan.read_text(encoding="utf-8"))
+    console.print(f"[green]migration plan:[/green] {plan}")
+    console.print(json.dumps(data["summary"], indent=2))
+
+
+@archive_app.command("migrate")
+def archive_migrate(
+    plan: Path = typer.Option(..., "--plan"),
+    rebuild: bool = typer.Option(False, "--rebuild-derived"),
+) -> None:
+    """Execute a migration plan using atomic, checksummed copies."""
+    from .archive import execute_migration, rebuild_derived_artifacts
+
+    result = execute_migration(plan)
+    console.print(f"[green]copied migration {result['migration_id']}[/green]")
+    console.print(json.dumps(result["summary"], indent=2))
+    if rebuild:
+        report = rebuild_derived_artifacts(plan)
+        console.print(
+            f"[green]rebuilt derived artifacts for "
+            f"{report['rendered_sessions']} sessions[/green]"
+        )
+
+
+@archive_app.command("verify")
+def archive_verify(
+    plan: Path = typer.Option(..., "--plan"),
+) -> None:
+    """Verify migrated checksums, event references, sessions, and memory DB."""
+    from .archive import verify_migration
+
+    report = verify_migration(plan)
+    console.print(json.dumps(report, indent=2))
+    if not report["ok"]:
+        raise typer.Exit(1)
+
+
+@archive_app.command("cutover")
+def archive_cutover(
+    plan: Path = typer.Option(..., "--plan"),
+    link_path: Path = typer.Option(..., "--link-path"),
+) -> None:
+    """Replace a verified legacy archive directory with a compatibility symlink."""
+    from .archive import cutover_compatibility_link
+
+    link = cutover_compatibility_link(plan, link_path)
+    console.print(f"[green]compatibility path ready:[/green] {link} -> {link.resolve()}")
+
+
+@app.command("sync")
+def sync_cmd(
+    root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
+    dashboard_dir: Optional[Path] = typer.Option(None, "--dashboard-dir"),
+    scheduled: bool = typer.Option(False, "--scheduled", hidden=True),
+    force_derived: bool = typer.Option(
+        False,
+        "--force-derived",
+        help="Recompute all signals, memory, and dashboard data",
+    ),
+) -> None:
+    """Capture changed local sessions and refresh derived portfolio artifacts."""
+    from .sync import run_sync
+
+    report = run_sync(
+        _layout(root),
+        dashboard_dir=dashboard_dir,
+        scheduled=scheduled,
+        force_derived=force_derived,
+    )
+    console.print(
+        f"[{'green' if report.status == 'success' else 'yellow'}]"
+        f"sync {report.status}[/]"
+    )
+    console.print(
+        f"  imported={len(report.imported)} unchanged={len(report.unchanged)} "
+        f"failures={len(report.failures)}"
+    )
+    if report.warning:
+        console.print(f"[yellow]{report.warning}[/yellow]")
+    for failure in report.failures:
+        console.print(f"[red]{failure['session']}: {failure['error']}[/red]")
+    if report.status not in {"success"}:
+        raise typer.Exit(1)
+
+
+@schedule_app.command("install")
+def schedule_install(
+    every: str = typer.Option("15m", "--every"),
+) -> None:
+    """Install or replace the current user's macOS LaunchAgent."""
+    from .schedule import install_schedule, parse_interval
+
+    interval = parse_interval(every)
+    config = load_config()
+    save_config(
+        RetroConfig(
+            archive_root=config.archive_root,
+            dashboard_dir=config.dashboard_dir,
+            sync_interval_seconds=interval,
+            derived_interval_seconds=config.derived_interval_seconds,
+            sync_on_login=config.sync_on_login,
+        )
+    )
+    path = install_schedule(interval)
+    console.print(f"[green]schedule installed:[/green] {path}")
+
+
+@schedule_app.command("status")
+def schedule_status_cmd() -> None:
+    """Show periodic capture installation and loaded state."""
+    from .schedule import schedule_status
+
+    console.print_json(data=schedule_status())
+
+
+@schedule_app.command("run-now")
+def schedule_run_now() -> None:
+    """Ask launchd to start the periodic capture job now."""
+    from .schedule import run_now
+
+    run_now()
+    console.print("[green]scheduled sync started[/green]")
+
+
+@schedule_app.command("uninstall")
+def schedule_uninstall() -> None:
+    """Unload and remove Retro's user LaunchAgent."""
+    from .schedule import uninstall_schedule
+
+    path = uninstall_schedule()
+    console.print(f"[green]schedule removed:[/green] {path}")
+
+
+@app.command("doctor")
+def doctor_cmd() -> None:
+    """Report global archive, source, disk, and scheduler health."""
+    from .importers.copilot import CopilotImporter
+    from .schedule import schedule_status
+
+    layout = default_layout()
+    layout.ensure()
+    free = shutil.disk_usage(layout.root.parent).free
+    table = Table(title="Retro global archive")
+    table.add_column("check")
+    table.add_column("value")
+    table.add_row("config", str(config_path()))
+    table.add_row("archive", str(layout.root))
+    table.add_row("dashboard", str(resolve_dashboard_dir()))
+    table.add_row("free space", f"{free / 1024**3:.1f} GiB")
+    table.add_row(
+        "normalized sessions",
+        str(sum(len(layout.list_normalized(host)) for host in HOSTS)),
+    )
+    table.add_row("discoverable Copilot", str(len(CopilotImporter(layout).discover())))
+    status = schedule_status()
+    table.add_row("schedule installed", str(status.get("installed")))
+    table.add_row("schedule loaded", str(status.get("loaded")))
+    console.print(table)
 
 
 # ---- signals ----------------------------------------------------------------
@@ -520,7 +920,7 @@ def _expand_hosts(host: str) -> list[Host]:
 
 @signal_app.command("list")
 def signal_list(
-    group: str | None = typer.Option(None, help="Filter by group: activity|outcome|cost|risk"),
+    group: Optional[str] = typer.Option(None, help="Filter by group: activity|outcome|cost|risk"),
 ):
     """List registered signals grouped by intent."""
     table = Table(title=f"Signals ({len(SIGNAL_REGISTRY)} registered)")
@@ -540,14 +940,14 @@ def signal_list(
 
 @signal_app.command("run")
 def signal_run(
-    host: str | None = typer.Option(None, help="Restrict to one host: claude|codex"),
-    session_id: str | None = typer.Option(
+    host: Optional[str] = typer.Option(None, help="Restrict to one host: claude|codex|copilot"),
+    session_id: Optional[str] = typer.Option(
         None, "--session-id", help="Restrict to one session id (repeatable via comma)"
     ),
-    signal: str | None = typer.Option(
+    signal: Optional[str] = typer.Option(
         None, "--signal", help="Restrict to one signal name (repeatable via comma)"
     ),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Compute signals over imported sessions and write readings + aggregates."""
     lay = _layout(root)
@@ -570,9 +970,9 @@ def signal_run(
 
 @signal_app.command("show")
 def signal_show(
-    host: str = typer.Argument(..., help="claude|codex"),
+    host: str = typer.Argument(..., help="claude|codex|copilot"),
     session_id: str = typer.Argument(...),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Show all signal readings stored for one session."""
     lay = _layout(root)
@@ -632,8 +1032,11 @@ def dashboard_build(
         "--mode",
         help="Cost mode: auto, calculate, or display.",
     ),
-    root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
-    out: Path | None = typer.Option(None, help="output directory (default ./dashboard)"),
+    root: Optional[Path] = typer.Option(
+        None,
+        help="rollout-memory root (default ./rollout-memory)",
+    ),
+    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
 ):
     """Build dashboard/data/rollouts.json and dashboard/index.html."""
     if mode not in {"auto", "calculate", "display"}:
@@ -641,19 +1044,29 @@ def dashboard_build(
 
     from .dashboard_build import build as build_dashboard_html
 
-    index_path = build_dashboard_html(mode=mode, artifact_root=root, out_dir=out)
+    index_path = build_dashboard_html(
+        mode=mode,
+        artifact_root=root,
+        out_dir=resolve_dashboard_dir(out),
+    )
     console.print(f"[green]dashboard ready:[/green] {index_path}")
 
 
 @dashboard_app.command("experiments")
 def dashboard_experiments(
-    root: Path | None = typer.Option(None, help="rollout-memory root (default ./rollout-memory)"),
-    out: Path | None = typer.Option(None, help="output directory (default ./dashboard)"),
+    root: Optional[Path] = typer.Option(
+        None,
+        help="rollout-memory root (default ./rollout-memory)",
+    ),
+    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
 ):
     """Build the experimental trajectory-signals page (trajectory_experiments.html)."""
     from .dashboard_experiments import build as build_experiments_html
 
-    html_path = build_experiments_html(artifact_root=root, out_dir=out)
+    html_path = build_experiments_html(
+        artifact_root=root,
+        out_dir=resolve_dashboard_dir(out),
+    )
     console.print(f"[green]experiments page ready:[/green] {html_path}")
 
 
@@ -676,7 +1089,7 @@ def dashboard_view(
 
 @app.command("analyze")
 def analyze(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Analyze command and tool call patterns across imported sessions."""
     from .analyzer import analyze_sessions, generate_report, render_console_report
@@ -696,7 +1109,7 @@ def analyze(
 
 @memory_app.command("init")
 def memory_init(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Create the memory directory and empty SQLite index."""
     from .memory_store import init
@@ -708,7 +1121,7 @@ def memory_init(
 
 @memory_app.command("reindex")
 def memory_reindex(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Rebuild index.sqlite from flat-file memory sources."""
     from .memory_store import reindex
@@ -725,7 +1138,7 @@ def memory_reindex(
 
 @memory_app.command("doctor")
 def memory_doctor(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Report memory index health and counts."""
     from .memory_store import doctor
@@ -744,7 +1157,7 @@ def memory_doctor(
 @memory_app.command("import-authored")
 def memory_import_authored(
     directory: Path = typer.Argument(..., help="Directory of markdown memory files"),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Import authored markdown memories into the flat-file memory log."""
     from .memory_store import import_authored
@@ -761,14 +1174,14 @@ def memory_import_authored(
 @memory_app.command("retrieve")
 def memory_retrieve(
     query: str = typer.Option(..., "--query", "-q", help="Search query"),
-    cwd: Path | None = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
     limit: int = typer.Option(10, "--limit", "-n", help="Maximum memories to return"),
     include_candidates: bool = typer.Option(
         True,
         "--include-candidates/--accepted-only",
         help="Include candidate memories while the promotion workflow is being built.",
     ),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Retrieve ranked memories from FTS5 keyword recall."""
     from .memory_store import retrieve
@@ -807,14 +1220,14 @@ def memory_retrieve(
 @memory_app.command("weave")
 def memory_weave(
     query: str = typer.Option(..., "--query", "-q", help="Search query"),
-    cwd: Path | None = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", help="Repo/cwd for repo-scoped recall"),
     limit: int = typer.Option(6, "--limit", "-n", help="Maximum memories to include"),
     include_candidates: bool = typer.Option(
         True,
         "--include-candidates/--accepted-only",
         help="Include candidate memories while the promotion workflow is being built.",
     ),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Emit a compact prompt-time memory block."""
     from .memory_store import weave
@@ -838,9 +1251,9 @@ def memory_weave(
 def memory_update_utility(
     memory_id: str = typer.Option(..., "--memory-id", help="Memory id to update"),
     reward: float = typer.Option(..., "--reward", help="Reward in [0, 1]"),
-    session_id: str | None = typer.Option(None, "--session-id", help="Session that used the memory"),
-    reason: str | None = typer.Option(None, "--reason", help="Optional update reason"),
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    session_id: Optional[str] = typer.Option(None, "--session-id", help="Session that used the memory"),
+    reason: Optional[str] = typer.Option(None, "--reason", help="Optional update reason"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
     """Append a utility event and update q_value."""
     from .memory_store import update_utility
@@ -874,14 +1287,14 @@ def _fmt_counts(counts: dict[str, int]) -> str:
 
 @app.callback()
 def callback(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """retro: local-first coding agent session capture and memory tool."""
     # Print streak message on execution if in a TTY
     if sys.stdout.isatty():
         try:
             from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-            lay = default_layout(root or Path.cwd() / "rollout-memory")
+            lay = default_layout(root)
             state = load_quest_state(lay)
             gen_new = ensure_daily_quests(lay, state)
             if gen_new:
@@ -900,7 +1313,7 @@ def callback(
 
 @quest_app.command("list")
 def quest_list(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """List active daily quests, progression, and streak count."""
     from .quest import ensure_daily_quests, load_quest_state, save_quest_state
@@ -933,7 +1346,7 @@ def quest_list(
 
 @quest_app.command("verify")
 def quest_verify(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Run local metrics checks to verify active daily quests."""
     from .quest import load_quest_state, save_quest_state, verify_quests
@@ -968,7 +1381,7 @@ def quest_verify(
 
 @quest_app.command("buy-freeze")
 def quest_buy_freeze(
-    root: Path | None = typer.Option(None, help="rollout-memory root"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Purchase a Streak Freeze to protect your streak on inactive days (costs 200 XP)."""
     from .quest import buy_streak_freeze, load_quest_state, save_quest_state

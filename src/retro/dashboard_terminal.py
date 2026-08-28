@@ -6,10 +6,8 @@ Provides a feature-parity terminal view of the static HTML dashboard.
 from __future__ import annotations
 
 import json
-import os
 import sys
 from collections import defaultdict
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
@@ -17,6 +15,7 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 
+from .config import resolve_archive_root, resolve_dashboard_dir
 from .dashboard_build import build as build_dashboard_data
 
 console = Console()
@@ -24,8 +23,8 @@ console = Console()
 
 def load_dashboard_data(mode: str = "auto") -> dict[str, Any]:
     """Load dashboard data from rollouts.json, building it if missing."""
-    artifact_root = os.environ.get("RETRO_ARTIFACT_ROOT")
-    out_dir = Path.cwd() / "dashboard"
+    artifact_root = resolve_archive_root()
+    out_dir = resolve_dashboard_dir()
     json_path = out_dir / "data" / "rollouts.json"
 
     if not json_path.exists():
@@ -35,7 +34,7 @@ def load_dashboard_data(mode: str = "auto") -> dict[str, Any]:
         try:
             build_dashboard_data(
                 mode=mode,
-                artifact_root=Path(artifact_root) if artifact_root else None,
+                artifact_root=artifact_root,
                 out_dir=out_dir,
             )
         except Exception as exc:  # pragma: no cover - defensive path
@@ -106,6 +105,20 @@ def format_duration(seconds: int | None) -> str:
     return f"{seconds // 60}m {seconds % 60}s"
 
 
+def format_host(host: str) -> str:
+    color = {
+        "claude-code": "orange3",
+        "codex": "blue",
+        "vscode-copilot": "purple",
+    }.get(host, "white")
+    return f"[{color}]{host}[/{color}]"
+
+
+def cycle_host_filter(current: str) -> str:
+    hosts = ("all", "claude-code", "codex", "vscode-copilot")
+    return hosts[(hosts.index(current) + 1) % len(hosts)] if current in hosts else "all"
+
+
 def render_activity_histogram(by_day: dict[str, Any]) -> None:
     """Draw a clean ASCII stacked-bar histogram for daily session activity."""
     if not by_day:
@@ -116,32 +129,43 @@ def render_activity_histogram(by_day: dict[str, Any]) -> None:
     max_sessions = max((by_day[day].get("sessions", 0) for day in days), default=1)
     max_width = 30  # Max bar length in terminal chars
 
-    console.print("[bold]ACTIVITY BY DAY[/bold] (Claude: [orange3]█[/orange3], Codex: [blue]█[/blue])")
+    console.print(
+        "[bold]ACTIVITY BY DAY[/bold] "
+        "(Claude: [orange3]█[/orange3], Codex: [blue]█[/blue], Copilot: [purple]█[/purple])"
+    )
     console.print("─" * 60)
 
     for day in days:
         d = by_day[day]
         claude = d.get("sessions_claude", 0)
         codex = d.get("sessions_codex", 0)
-        total = claude + codex
+        copilot = d.get("sessions_copilot", 0)
+        total = claude + codex + copilot
 
         if max_sessions > 0:
             claude_len = int((claude / max_sessions) * max_width)
             codex_len = int((codex / max_sessions) * max_width)
+            copilot_len = int((copilot / max_sessions) * max_width)
         else:
-            claude_len = codex_len = 0
+            claude_len = codex_len = copilot_len = 0
 
         # Guarantee at least 1 block if count > 0 but rounded to 0
         if claude > 0 and claude_len == 0:
             claude_len = 1
         if codex > 0 and codex_len == 0:
             codex_len = 1
+        if copilot > 0 and copilot_len == 0:
+            copilot_len = 1
 
         claude_bar = "[orange3]█[/orange3]" * claude_len
         codex_bar = "[blue]█[/blue]" * codex_len
-        bar = claude_bar + codex_bar
+        copilot_bar = "[purple]█[/purple]" * copilot_len
+        bar = claude_bar + codex_bar + copilot_bar
 
-        console.print(f"  {day:<10}  {bar:<{max_width}}  {claude}+{codex} (total {total})")
+        console.print(
+            f"  {day:<10}  {bar:<{max_width}}  "
+            f"{claude}+{codex}+{copilot} (total {total})"
+        )
     console.print()
 
 
@@ -159,6 +183,7 @@ def show_portfolio_kpis(data: dict[str, Any]) -> None:
 
     claude_count = by_host.get("claude-code", 0)
     codex_count = by_host.get("codex", 0)
+    copilot_count = by_host.get("vscode-copilot", 0)
 
     # We build a grid of stats
     kpi_table = Table.grid(expand=True, padding=1)
@@ -169,7 +194,9 @@ def show_portfolio_kpis(data: dict[str, Any]) -> None:
     s_count = summary.get("session_count", 0)
     sessions_panel = Panel(
         f"[bold]{s_count}[/bold] Total Sessions\n"
-        f"[orange3]{claude_count} Claude[/orange3] / [blue]{codex_count} Codex[/blue]",
+        f"[orange3]{claude_count} Claude[/orange3] / "
+        f"[blue]{codex_count} Codex[/blue] / "
+        f"[purple]{copilot_count} Copilot[/purple]",
         title="Sessions",
     )
     c_count = mem.get("candidate_count", 0)
@@ -272,7 +299,7 @@ def show_session_list(data: dict[str, Any], project_filter: str | None = None) -
 
         for idx, s in enumerate(page_sessions, start=1):
             host = s.get("host", "")
-            host_disp = f"[orange3]{host}[/orange3]" if host == "claude-code" else f"[blue]{host}[/blue]"
+            host_disp = format_host(host)
 
             # Truncate title
             title = s.get("title", s.get("session_id", "untitled"))
@@ -325,12 +352,7 @@ def show_session_list(data: dict[str, Any], project_filter: str | None = None) -
         elif choice == "p":
             page = max(page - 1, 0)
         elif choice == "f":
-            if host_filter == "all":
-                host_filter = "claude-code"
-            elif host_filter == "claude-code":
-                host_filter = "codex"
-            else:
-                host_filter = "all"
+            host_filter = cycle_host_filter(host_filter)
             page = 0
         elif choice == "s":
             search_query = input("Search text (press Enter to clear): ").strip()
@@ -355,7 +377,7 @@ def show_session_detail(s: dict[str, Any]) -> None:
         meta_table.add_column()
 
         host = s.get("host", "")
-        host_disp = f"[orange3]{host}[/orange3]" if host == "claude-code" else f"[blue]{host}[/blue]"
+        host_disp = format_host(host)
 
         duration_str = format_duration(s.get("duration_seconds"))
         events_str = f"{s.get('event_count', 0):,}"
@@ -649,7 +671,7 @@ def show_memory_aggregates(data: dict[str, Any]) -> None:
         console.print("[bold]Top Candidates Preview[/bold] (top 6 shown)")
         for c in top_candidates[:6]:
             host = c.get("host", "")
-            host_badge = f"[orange3]{host}[/orange3]" if host == "claude-code" else f"[blue]{host}[/blue]"
+            host_badge = format_host(host)
             c_kind = c.get("kind", "unknown")
             c_priority = c.get("priority")
             c_conf = c.get("confidence", 0.0)
@@ -756,7 +778,7 @@ def show_all_memories_browser(data: dict[str, Any]) -> None:
 
         for c in page_candidates:
             host = c.get("host", "")
-            host_badge = f"[orange3]{host}[/orange3]" if host == "claude-code" else f"[blue]{host}[/blue]"
+            host_badge = format_host(host)
 
             c_scope = c.get("scope")
             c_reason = c.get("scope_reason", "default")
@@ -848,9 +870,7 @@ def show_all_memories_browser(data: dict[str, Any]) -> None:
         elif choice == "p":
             page = max(page - 1, 0)
         elif choice == "h":
-            host_filter = (
-                "claude-code" if host_filter == "all" else "codex" if host_filter == "claude-code" else "all"
-            )
+            host_filter = cycle_host_filter(host_filter)
             page = 0
         elif choice == "o":
             scopes = ("all", "user", "repo", "task", "global")

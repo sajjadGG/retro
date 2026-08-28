@@ -16,6 +16,7 @@ from pathlib import Path
 
 from ..schema import Host
 from ..storage import Layout
+from ..utils import atomic_write_text
 from .base import REGISTRY, SessionContext, Signal, SignalReading, load_events
 
 
@@ -201,21 +202,52 @@ def write_signal_artifacts(layout: Layout, readings: list[SignalReading]) -> dic
     signals_dir.mkdir(parents=True, exist_ok=True)
 
     readings_path = signals_dir / "readings.jsonl"
-    with readings_path.open("w", encoding="utf-8") as fh:
-        for r in readings:
-            fh.write(json.dumps(r.to_dict(), ensure_ascii=False))
-            fh.write("\n")
+    atomic_write_text(
+        readings_path,
+        "".join(json.dumps(r.to_dict(), ensure_ascii=False) + "\n" for r in readings),
+    )
 
     aggregates = aggregate_readings(readings)
     agg_path = signals_dir / "aggregates.json"
-    agg_path.write_text(
-        json.dumps(aggregates, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    atomic_write_text(
+        agg_path,
+        json.dumps(aggregates, ensure_ascii=False, indent=2) + "\n",
     )
 
     summary_path = signals_dir / "summary.md"
-    summary_path.write_text(_render_summary(readings, aggregates), encoding="utf-8")
+    atomic_write_text(summary_path, _render_summary(readings, aggregates))
 
     return {"readings": readings_path, "aggregates": agg_path, "summary": summary_path}
+
+
+def read_signal_readings(layout: Layout) -> list[SignalReading]:
+    path = layout.root / "signals" / "readings.jsonl"
+    if not path.exists():
+        return []
+    readings: list[SignalReading] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, raw_line in enumerate(handle, start=1):
+            if not raw_line.strip():
+                continue
+            try:
+                raw = json.loads(raw_line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid signal reading at {path}:{line_no}") from exc
+            readings.append(SignalReading(**raw))
+    return readings
+
+
+def replace_session_readings(
+    existing: list[SignalReading],
+    replacements: list[SignalReading],
+    sessions: set[tuple[Host, str]],
+) -> list[SignalReading]:
+    retained = [
+        reading
+        for reading in existing
+        if (reading.host, reading.session_id) not in sessions
+    ]
+    return retained + replacements
 
 
 def _render_summary(readings: list[SignalReading], aggregates: dict) -> str:

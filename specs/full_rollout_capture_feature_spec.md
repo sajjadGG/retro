@@ -2,13 +2,13 @@
 
 ## Purpose
 
-Build a project that captures complete coding-agent rollouts from Codex and Claude Code, stores them as durable local artifacts, and mines those artifacts for useful lessons that can improve future sessions.
+Build a project that captures complete coding-agent rollouts from Codex, Claude Code, and VS Code GitHub Copilot Chat, stores them as durable local artifacts, and mines those artifacts for useful lessons that can improve future sessions.
 
 The first goal is total data capture. The second goal is learning from that captured data.
 
 ## Problem
 
-Codex and Claude Code sessions contain a rich record of how work actually happens: user prompts, assistant messages, tool calls, command outputs, file reads, edits, sub-agent work, failures, corrections, and final answers. This rollout data is valuable because it shows the agent's working style and the user's correction patterns.
+Codex, Claude Code, and VS Code Copilot sessions contain a rich record of how work actually happens: user prompts, assistant messages, tool calls, command outputs, file reads, edits, sub-agent work, failures, corrections, and final answers. This rollout data is valuable because it shows the agent's working style and the user's correction patterns.
 
 Today that data is scattered across host-specific storage. Some of it exists in local rollout or transcript files. Some of it is visible through lifecycle hooks. Some of it may only be available indirectly through file-history sidecars, tool-event hooks, command logs, or host-specific databases.
 
@@ -18,7 +18,7 @@ The project should make this explicit: collect everything available, normalize i
 
 ### Objective 1: Full Rollout Capture
 
-For any Codex or Claude Code session, capture the fullest possible rollout:
+For any supported host session, capture the fullest possible rollout:
 
 - user messages,
 - assistant messages,
@@ -70,7 +70,7 @@ Mining can happen in two modes:
 
 ## Current Host Observations
 
-These observations should be verified during implementation because both Codex and Claude Code may change storage internals.
+These observations should be verified during implementation because every host may change storage internals.
 
 ### Claude Code
 
@@ -110,6 +110,39 @@ The local `threads` table in `state_5.sqlite` includes a `rollout_path` column. 
 Codex also has tables for sub-agent/thread relationships, including `thread_spawn_edges`, plus other job/thread state tables. Logs are stored in `logs_2.sqlite`.
 
 Implication: Codex v0 capture should use `state_5.sqlite.threads.rollout_path` to discover rollout files, use the rollout JSONL as the source of truth, and augment it with thread metadata, spawn edges, and logs where useful.
+
+### VS Code GitHub Copilot Chat
+
+VS Code persists local chat sessions under the platform `User` data directory:
+
+```text
+workspaceStorage/<workspace-id>/chatSessions/<session-id>.json
+workspaceStorage/<workspace-id>/chatSessions/<session-id>.jsonl
+globalStorage/emptyWindowChatSessions/<session-id>.json[l]
+```
+
+Legacy `.json` files contain a complete session. Current `.jsonl` files are append-only mutation logs whose entry kinds are initial state, property set, array push/splice, and property delete. Copilot agent sessions can also expose:
+
+```text
+workspaceStorage/<workspace-id>/GitHub.copilot-chat/transcripts/<session-id>.jsonl
+workspaceStorage/<workspace-id>/chatEditingSessions/<session-id>/
+workspaceStorage/<workspace-id>/GitHub.copilot-chat/chat-session-resources/<session-id>/
+globalStorage/github.copilot-chat/session-store.db
+```
+
+The direct Copilot transcript records session/user/assistant/turn/tool lifecycle events with stable ids, parent ids, timestamps, reasoning, tool arguments, and execution outcomes. The core VS Code chat snapshot supplies model ids, token counts, Copilot credits, edit groups, confirmations, and final tool metadata.
+
+Copilot CLI and VS Code Agent Host sessions persist separately:
+
+```text
+~/.copilot/session-state/<session-id>/events.jsonl
+~/.copilot/session-state/<session-id>/workspace.yaml
+~/.copilot/session-store.db
+```
+
+These logs contain the current CLI-based sessions shown in VS Code's Agent Sessions UI, including hooks, permissions, external tools, subagents, model changes, usage checkpoints, errors, shutdown/resume events, and active sessions. The SQLite store adds per-model input/output/cache/reasoning accounting.
+
+Implication: combine core VS Code chat discovery with Agent Host session-state discovery. Prefer direct event logs for normalization, preserve each source verbatim, and label the source so the dashboard can distinguish `vscode-chat` from `copilot-cli`.
 
 ## Capture Strategy
 
@@ -153,6 +186,20 @@ V0 should support:
 5. Optionally join warning/error logs from `logs_2.sqlite` by `thread_id`.
 6. If Codex hooks are available in the active environment, add a hook adapter later; do not block v0 on hooks.
 
+### VS Code Copilot Capture
+
+V0 should support:
+
+1. Discover non-empty Copilot sessions from workspace, empty-window, profile, and VS Code Server user-data roots.
+2. Copy the original `.json` or `.jsonl` session file verbatim.
+3. Reconstruct and store the current JSONL mutation state without discarding unknown response parts.
+4. Prefer the direct Copilot event transcript when present and preserve its event ids and parent links.
+5. Snapshot the matching editing session, tool-result resources, workspace metadata, and session-store rows.
+6. Preserve request-level model, token, and Copilot-credit fields for dashboard accounting.
+7. Discover Copilot CLI and Agent Host rollouts from `~/.copilot/session-state`.
+8. Capture active logs as point-in-time snapshots and allow automatic re-import when they grow.
+9. Join detailed usage rows from `~/.copilot/session-store.db`.
+
 ## Storage Model
 
 Store raw capture and derived artifacts separately.
@@ -170,6 +217,14 @@ rollout-memory/
         rollout.jsonl
         thread.json
         logs.jsonl
+        sidecars/
+    vscode-copilot/
+      <session-id>/
+        session.jsonl
+        session.snapshot.json
+        transcript.jsonl
+        events.jsonl
+        import_meta.json
         sidecars/
   normalized/
     <host>/<session-id>.events.jsonl
@@ -203,7 +258,7 @@ Each normalized event should include:
 {
   "event_id": "stable-id",
   "session_id": "host-session-or-thread-id",
-  "host": "codex|claude-code",
+  "host": "codex|claude-code|vscode-copilot",
   "timestamp": "iso-8601-or-null",
   "sequence": 123,
   "parent_event_id": "optional",
@@ -408,7 +463,7 @@ V0 requirements:
 
 ### Cross-Host V0
 
-- The same normalized event schema supports both Codex and Claude Code.
+- The same normalized event schema supports Codex, Claude Code, and VS Code Copilot.
 - Host-specific raw fields are preserved.
 - Host-specific adapters are isolated behind a common importer interface.
 
@@ -417,6 +472,7 @@ V0 requirements:
 - How complete is Codex rollout JSONL compared with the live desktop conversation?
 - Does Codex expose reliable hooks in CLI and Desktop, or should v0 rely on rollout files and SQLite only?
 - Which Claude Code sidecar files are necessary to reconstruct file edits beyond what the transcript stores?
+- Which VS Code/Copilot persistence fields will remain stable across future storage migrations?
 - How should sub-agent traces be linked if the host records them as separate sessions?
 - How aggressively should command output be truncated in markdown views while preserving raw output?
 - Should mined memory be stored in markdown first, SQLite first, or both?
@@ -433,11 +489,15 @@ V0 requirements:
    - discover `rollout_path`,
    - parse rollout JSONL,
    - render markdown.
-3. Define normalized event schema.
-4. Write raw + normalized + markdown artifacts to `rollout-memory/`.
-5. Build a manual miner command:
+3. Build `vscode_copilot_importer`:
+   - reconstruct legacy JSON and current JSONL mutation logs,
+   - capture Copilot transcripts and editing/resource sidecars,
+   - normalize direct event transcripts with core-state fallback.
+4. Define normalized event schema.
+5. Write raw + normalized + markdown artifacts to `rollout-memory/`.
+6. Build a manual miner command:
    - input: normalized event JSONL,
    - output: session lessons JSON + markdown plus scope-indexed repo/user memory records.
-6. Add hook integration:
+7. Add hook integration:
    - Claude `SessionEnd` triggers import + mining.
    - Codex hook integration only after confirming available hook behavior.

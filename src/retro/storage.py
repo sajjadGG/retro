@@ -56,5 +56,7 @@ class Layout:
         return sorted(p.name[: -len(suffix)] for p in host_dir.glob(f"*{suffix}") if p.is_file())
 
 
-def default_layout(root: Path | str = "rollout-memory") -> Layout:
-    return Layout(Path(root).resolve())
+def default_layout(root: Path | str | None = None) -> Layout:
+    from .config import resolve_archive_root
+
+    return Layout(resolve_archive_root(root))

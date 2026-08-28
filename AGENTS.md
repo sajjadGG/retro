@@ -4,7 +4,7 @@ Instructions for AI coding agents working on this project.
 
 ## Project overview
 
-`retro` is a local-first CLI tool that captures Codex and Claude Code agent sessions, normalizes them into a common event schema, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-agent-memory`.
+`retro` is a local-first CLI tool that captures Codex, Claude Code, and VS Code GitHub Copilot Chat agent sessions, normalizes them into a common event schema, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-agent-memory`.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ Key packages under `src/retro/`:
 | `schema.py` | `NormalizedEvent` dataclass — the canonical event type everything consumes |
 | `storage.py` | `Layout` — filesystem path conventions for `rollout-memory/` |
 | `utils.py` | Shared helpers: `iter_jsonl`, `event_text`, `iter_messages`, `truncate` |
-| `importers/` | Host-specific importers (Claude Code, Codex) that produce normalized events |
+| `importers/` | Host-specific importers (Claude Code, Codex, VS Code Copilot) that produce normalized events |
 | `signals/` | Evaluators that emit readings (numeric/boolean/categorical) about a session |
 | `mining/` | Methods that extract reusable memory candidates from normalized events |
 | `renderer.py` | Markdown transcript renderer |
@@ -63,7 +63,7 @@ python3 -m venv .venv
 
 ## Conventions
 
-- **Python ≥ 3.10.** Use `X | None` not `Optional[X]`.
+- **Python ≥ 3.9.** Modules use `from __future__ import annotations`, so prefer `X | None` over `Optional[X]` except in runtime-reflected APIs such as Typer command callbacks.
 - **No comments unless the why is non-obvious.** Code should be self-documenting.
 - **Tests required.** New signals, importers, and mining methods must have test coverage. Tests live in `tests/` and use pytest. Fixture JSONL files are in `tests/fixtures/`.
 - **Shared helpers live in `utils.py`.** Don't duplicate `event_text`, `iter_jsonl`, `truncate`, or `iter_messages` locally.
@@ -71,6 +71,8 @@ python3 -m venv .venv
 - **`raw/` is immutable.** Re-imports refuse to overwrite unless `--force` is passed.
 - **Unknown events are preserved, not dropped.** Importers emit `event_type="unknown"` with the original payload so nothing is silently lost.
 - **Everything is evidence-linked.** Signal readings and mined memories carry `event_id` references back to source events.
+- **The default archive is per-user, not cwd-local.** Resolve paths through `config.py` / `default_layout()` and keep tests isolated with `RETRO_DATA_DIR`.
+- **Archive publication is atomic.** Migration, sync, signal, normalized-event, and dashboard writes must stage and replace rather than expose partial files.
 
 ## Common tasks
 

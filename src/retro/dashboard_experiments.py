@@ -15,9 +15,10 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-# Defaults are cwd-relative; build() rebinds these from its arguments.
-ARTIFACT_ROOT = Path.cwd() / "rollout-memory"
-OUT_DIR = Path.cwd() / "dashboard"
+from .config import resolve_archive_root, resolve_dashboard_dir
+
+ARTIFACT_ROOT = resolve_archive_root()
+OUT_DIR = resolve_dashboard_dir()
 DATA_DIR = OUT_DIR / "data"
 TRAJECTORY_PREFIX = "trajectory_"
 
@@ -25,11 +26,9 @@ TRAJECTORY_PREFIX = "trajectory_"
 def build(artifact_root: Path | None = None, out_dir: Path | None = None) -> Path:
     """Build the trajectory-experiments page; returns the generated HTML path."""
     global ARTIFACT_ROOT, OUT_DIR, DATA_DIR
-    if artifact_root is not None:
-        ARTIFACT_ROOT = Path(artifact_root).expanduser().resolve()
-    if out_dir is not None:
-        OUT_DIR = Path(out_dir).expanduser().resolve()
-        DATA_DIR = OUT_DIR / "data"
+    ARTIFACT_ROOT = resolve_archive_root(artifact_root)
+    OUT_DIR = resolve_dashboard_dir(out_dir)
+    DATA_DIR = OUT_DIR / "data"
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = build_payload()
     data_path = DATA_DIR / "trajectory_experiments.json"
@@ -213,6 +212,7 @@ def render_html(payload: dict[str, Any]) -> str:
     tr:hover,tr.selected {{ background:#ffedd5; }}
     .badge {{ display:inline-flex; align-items:center; border-radius:999px; padding:2px 8px; font-size:12px; font-weight:650; background:#ecebe4; color:#363831; margin:1px 2px 1px 0; }}
     .badge.codex {{ background:#dbeafe; color:#1d4ed8; }}
+    .badge.vscode-copilot {{ background:#f0e7ff; color:#6f42c1; }}
     .badge.claude-code {{ background:#ffedd5; color:#c2410c; }}
     .badge.warn {{ background:#fef3c7; color:#92400e; }}
     .badge.bad {{ background:#fee2e2; color:#991b1b; }}

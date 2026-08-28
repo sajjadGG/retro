@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -62,3 +64,31 @@ def truncate_summary(text: str, limit: int = 200) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def artifact_ref(path: Path, archive_root: Path) -> str:
+    """Return an archive-relative path when *path* is inside the archive."""
+    try:
+        return path.resolve().relative_to(archive_root.resolve()).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def resolve_artifact_ref(reference: str, archive_root: Path) -> Path:
+    path = Path(reference)
+    return path if path.is_absolute() else archive_root / path
+
+
+def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()

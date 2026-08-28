@@ -1,9 +1,12 @@
 """CLI smoke tests using Typer's CliRunner."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from typer.testing import CliRunner
 
 from retro.cli import app
+from retro.config import load_config
 
 runner = CliRunner()
 
@@ -49,6 +52,11 @@ def test_import_codex_no_args():
     assert result.exit_code != 0
 
 
+def test_import_copilot_no_args():
+    result = runner.invoke(app, ["import", "copilot"])
+    assert result.exit_code != 0
+
+
 def test_show_unknown_host():
     result = runner.invoke(app, ["show", "foobar", "some-id"])
     assert result.exit_code != 0
@@ -73,3 +81,61 @@ def test_analyze_command(tmp_path):
     assert "Wrote analysis report to:" in result.output
 
 
+def test_global_archive_command_help():
+    for args in (
+        ["config", "--help"],
+        ["archive", "--help"],
+        ["schedule", "--help"],
+        ["setup", "--help"],
+        ["sync", "--help"],
+        ["doctor", "--help"],
+    ):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 0, result.output
+
+
+def test_config_set_and_show(tmp_path):
+    archive = tmp_path / "archive"
+    set_result = runner.invoke(
+        app,
+        ["config", "set", "archive-root", str(archive)],
+    )
+    assert set_result.exit_code == 0
+
+    show_result = runner.invoke(app, ["config", "show"])
+    assert show_result.exit_code == 0
+    assert "archive_root" in show_result.output
+    assert load_config().archive_root == str(archive.resolve())
+
+
+def test_setup_without_schedule(tmp_path):
+    archive = tmp_path / "archive"
+    dashboard = tmp_path / "dashboard"
+    result = runner.invoke(
+        app,
+        [
+            "setup",
+            "--archive-root",
+            str(archive),
+            "--dashboard-dir",
+            str(dashboard),
+            "--periodic",
+            "15m",
+            "--no-schedule",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert archive.is_dir()
+    assert dashboard.is_dir()
+
+
+def test_doctor_fresh_install_and_dashboard_override(monkeypatch, tmp_path):
+    override = Path("/tmp/retro-override-dashboard")
+    monkeypatch.setenv("RETRO_DASHBOARD_DIR", str(override))
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "Retro global archive" in result.output
+    assert "override-dashboard" in result.output

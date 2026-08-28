@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Build a local dashboard for browsing captured Codex and Claude Code rollouts, comparing session-level stats, and drilling into any rollout's rendered transcript and mined memory.
+Build a local dashboard for browsing captured Codex, Claude Code, and VS Code Copilot rollouts, comparing session-level stats, and drilling into any rollout's rendered transcript and mined memory.
 
 The dashboard is a view layer over `rollout-memory/`. It should not own capture, normalization, rendering, or mining logic.
 
@@ -16,7 +16,7 @@ These answer: "What has happened across all sessions?"
 - total sessions used for dashboard stats,
 - sessions with token usage,
 - sessions with cost estimates,
-- sessions by host: Codex vs Claude Code,
+- sessions by host: Codex vs Claude Code vs VS Code Copilot,
 - active days,
 - sessions per day,
 - total captured events,
@@ -110,6 +110,8 @@ The dashboard should follow the conventions used by existing usage dashboards:
 - Codex `token_count.info.total_token_usage` is cumulative. For reporting, use the final/max cumulative total, or compute per-turn deltas from successive totals when per-model breakdown is required.
 - Codex `input_tokens` includes cached input. Cost should charge `input_tokens - cached_input_tokens` at the normal input rate and `cached_input_tokens` at the cache-read rate.
 - Codex reasoning tokens are useful to show, but the current ccusage implementation does not charge them as a separate line item.
+- VS Code Copilot request snapshots expose prompt/completion tokens, model ids, and Copilot credits. Credits should be shown separately from estimated provider token cost.
+- Copilot CLI and Agent Host session-store rows expose per-model input, output, cache read/write, reasoning tokens, request multipliers, and nano-AIU usage. The dashboard should label these sessions by source and mark active snapshots.
 
 The dashboard should show:
 

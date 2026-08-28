@@ -7,6 +7,10 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+Tests isolate `RETRO_DATA_DIR` and `RETRO_CONFIG_PATH`; never point tests at a
+real user archive. The installed CLI defaults to the per-user archive resolved
+by `retro.config`, not a checkout-local `rollout-memory/`.
+
 ## Checks
 
 ```bash
@@ -18,8 +22,8 @@ python3 -m venv .venv
 
 ## Conventions
 
-- Python 3.10+.
-- Prefer `X | None` over `Optional[X]`.
+- Python 3.9+.
+- Prefer `X | None` over `Optional[X]` except in runtime-reflected APIs such as Typer command callbacks.
 - Keep raw captures immutable.
 - Preserve unknown events as `event_type="unknown"` rather than dropping them.
 - Use shared helpers from `src/retro/utils.py`.

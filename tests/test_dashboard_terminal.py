@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from retro.config import resolve_archive_root, resolve_dashboard_dir
 from retro.dashboard_terminal import load_dashboard_data
 
 
@@ -28,5 +29,5 @@ def test_load_dashboard_data_builds_with_packaged_module(tmp_path: Path, monkeyp
 
     assert data["generated_at"] == "now"
     assert calls["mode"] == "auto"
-    assert calls["artifact_root"] is None
-    assert calls["out_dir"] == tmp_path / "dashboard"
+    assert calls["artifact_root"] == resolve_archive_root()
+    assert calls["out_dir"] == resolve_dashboard_dir()

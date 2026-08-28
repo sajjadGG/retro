@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
     steps:
       - name: Check out repository
@@ -58,8 +58,12 @@ jobs:
         run: |
           mkdir -p /tmp/dash-smoke/rollout-memory
           cd /tmp/dash-smoke
-          retro dashboard build
-          retro dashboard experiments
+          retro dashboard build \
+            --root /tmp/dash-smoke/rollout-memory \
+            --out /tmp/dash-smoke/dashboard
+          retro dashboard experiments \
+            --root /tmp/dash-smoke/rollout-memory \
+            --out /tmp/dash-smoke/dashboard
           test -f dashboard/index.html
           test -f dashboard/data/rollouts.json
           test -f dashboard/trajectory_experiments.html

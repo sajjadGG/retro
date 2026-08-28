@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import iter_jsonl, truncate_summary
+from ..utils import artifact_ref, iter_jsonl, truncate_summary
 from .base import ImportResult
 
 CODEX_HOME = Path.home() / ".codex"
@@ -114,6 +114,7 @@ class CodexImporter:
         # first root (lookups will gracefully return empty).
         self.codex_home = self._pick_primary_home()
         self.state_db = self.codex_home / "state_5.sqlite"
+        self._discover_cache: list[CodexThread] | None = None
 
     def _pick_primary_home(self) -> Path:
         for root in self.roots:
@@ -124,6 +125,8 @@ class CodexImporter:
     # ---- discovery -----------------------------------------------------------
 
     def discover(self) -> list[CodexThread]:
+        if self._discover_cache is not None:
+            return list(self._discover_cache)
         threads: list[CodexThread] = []
         seen_ids: set[str] = set()
         for root in self.roots:
@@ -134,7 +137,8 @@ class CodexImporter:
                 seen_ids.add(thread.thread_id)
                 threads.append(thread)
         threads.sort(key=lambda t: t.updated_at, reverse=True)
-        return threads
+        self._discover_cache = threads
+        return list(self._discover_cache)
 
     def _discover_root(self, root: Path, kind: RootKind) -> list[CodexThread]:
         if kind == "sqlite_home":
@@ -326,7 +330,10 @@ class CodexImporter:
             payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
             ptype = payload.get("type")
             event_id = f"{thread_id}:{line_no}"
-            raw_ref = RawRef(path=str(rollout_path), line=line_no)
+            raw_ref = RawRef(
+                path=artifact_ref(rollout_path, self.layout.root),
+                line=line_no,
+            )
             common: dict[str, Any] = dict(
                 event_id=event_id,
                 session_id=thread_id,
