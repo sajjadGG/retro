@@ -7,8 +7,23 @@ This page gets a new user from zero to a browsable local portfolio and memory in
 From PyPI:
 
 ```bash
-pip install retro-agent-memory
+python3 -m pip install --upgrade retro-ai
 retro --help
+```
+
+`retro-ai` is the PyPI distribution name. Installation creates the `retro`
+console command. For a persistent per-user command instead of a project virtual
+environment:
+
+```bash
+python3 -m pip install --user --upgrade retro-ai
+```
+
+If pip reports that its scripts directory is not on `PATH`, add that directory
+to your shell startup file. On macOS with the system Python 3.9 it is commonly:
+
+```bash
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"
 ```
 
 From a clone:
@@ -25,9 +40,13 @@ python3 -m venv .venv
 retro list
 retro list --host claude
 retro list --host codex
+retro list --host copilot
 ```
 
-`retro` discovers Claude Code logs under `~/.claude/projects/` and `~/.config/claude/projects/`, and Codex sessions under `~/.codex`.
+`retro` discovers Claude Code logs under `~/.claude/projects/` and
+`~/.config/claude/projects/`, Codex sessions under `~/.codex`, VS Code chat
+history, and Copilot CLI / Agent Host sessions under
+`~/.copilot/session-state`.
 
 Use env overrides for archives or alternate roots:
 
@@ -41,10 +60,23 @@ CODEX_HOME="$HOME/.codex,/backup/codex" retro list --host codex
 ```bash
 retro import claude --latest
 retro import codex --latest
+retro import copilot --latest
 retro import all --limit-per-host 20
 ```
 
-Imported files land under `rollout-memory/`. Raw captures are immutable unless you pass `--force`.
+Imported files land under the configured per-user archive. Run `retro doctor`
+to see the effective path. Raw captures are immutable unless a newer append-only
+source is safely captured.
+
+For periodic machine-wide capture on macOS:
+
+```bash
+retro setup \
+  --archive-root "$HOME/Library/Application Support/retro/rollout-memory" \
+  --dashboard-dir "$HOME/Library/Application Support/retro/dashboard" \
+  --periodic 15m \
+  --derived-every 6h
+```
 
 ## 4. Run Signals
 
@@ -92,7 +124,9 @@ retro memory update-utility --memory-id <id> --reward 0.8 --session-id <session-
 retro dashboard build
 ```
 
-Open `dashboard/index.html` from disk. The dashboard reads rollouts, signals, mined memory, and the SQLite memory index.
+Run `retro config show` to see the configured dashboard path and open its
+`index.html`. The dashboard reads rollouts, signals, mined memory, and the
+SQLite memory index.
 
 ## 9. Verify Your Setup
 

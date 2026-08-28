@@ -20,6 +20,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [`rollout_dashboard_spec.md`](specs/rollout_dashboard_spec.md) — the dashboard.
 - [`ccusage_comparison_spec.md`](specs/ccusage_comparison_spec.md) — gap analysis vs. ccusage.
 - [`global_rollout_archive_migration_plan.md`](specs/global_rollout_archive_migration_plan.md) — global archive, migration, and periodic sync design.
+- [`CHANGELOG.md`](CHANGELOG.md) — release history and upgrade notes.
 
 ---
 
@@ -48,10 +49,28 @@ Requires Python ≥ 3.9.
 From PyPI:
 
 ```bash
-pip install retro-agent-memory
+python3 -m pip install --upgrade retro-ai
+retro --help
 ```
 
-That installs the `retro` CLI.
+The distribution is named `retro-ai`; it installs the `retro` command through
+the package's console entry point. Inside a virtual environment, the command is
+added to that environment's `bin/` directory. For a persistent command managed
+outside a project environment, use:
+
+```bash
+python3 -m pip install --user --upgrade retro-ai
+```
+
+If pip warns that its scripts directory is not on `PATH`, add the directory
+shown in that warning to your shell configuration. On macOS with the system
+Python 3.9, that is commonly:
+
+```bash
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"
+```
+
+Then reopen the terminal and run `retro --help`.
 
 From a clone:
 
@@ -60,7 +79,9 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
 
-The PyPI distribution is named `retro-agent-memory` because `retro` is already occupied on PyPI; the import package and CLI are still named `retro`.
+The PyPI distribution is named `retro-ai` because the `retro` project name is
+already occupied on PyPI; the Python import package and CLI command are both
+named `retro`.
 
 ---
 
@@ -583,7 +604,7 @@ Publishing lives in `.github/workflows/publish.yml`. It runs when a GitHub relea
 
 One-time PyPI setup:
 
-1. Create or claim the PyPI project `retro-agent-memory`.
+1. Create or claim the PyPI project `retro-ai`.
 2. Add a trusted publisher for repository `sajjadGG/retro`.
 3. Use workflow `.github/workflows/publish.yml`.
 4. Use environment `pypi`.
@@ -592,8 +613,8 @@ Release flow:
 
 ```bash
 # bump version in pyproject.toml first
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 Then publish a GitHub release for that tag. The release event triggers the PyPI publish job.
