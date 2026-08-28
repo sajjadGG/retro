@@ -19,6 +19,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from .benchmarks import (
+    build_time_consistent_benchmark,
+    evaluate_time_consistent_benchmark,
+)
 from .config import (
     RetroConfig,
     config_path,
@@ -58,6 +62,12 @@ signal_app = typer.Typer(
     help="Compute, list, and inspect signal readings over captured sessions.",
 )
 app.add_typer(signal_app, name="signal")
+
+benchmark_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and evaluate time-consistent private benchmarks from rollouts.",
+)
+app.add_typer(benchmark_app, name="benchmark")
 
 dashboard_app = typer.Typer(
     no_args_is_help=True,
@@ -562,6 +572,168 @@ def _mine_targets(
     if len(hosts) != 1:
         raise typer.BadParameter("When host is *, session_id must be * or --all must be used")
     return [(hosts[0], session_id)]
+
+
+# ---- benchmark ---------------------------------------------------------------
+
+
+@benchmark_app.command("build")
+def benchmark_build_cmd(
+    benchmark_id: str = typer.Argument(..., help="Immutable benchmark version identifier"),
+    project: Path = typer.Option(
+        ...,
+        "--project",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Local git repository represented by the rollout tasks",
+    ),
+    cutoff: str = typer.Option(
+        ...,
+        "--cutoff",
+        help="Timezone-aware T0; knowledge and repository state stop here",
+    ),
+    end: str = typer.Option(
+        ...,
+        "--end",
+        help="Timezone-aware inclusive T1 for generated task episodes",
+    ),
+    host: str = typer.Option(
+        "*",
+        "--host",
+        help="claude|codex|copilot|*",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Generate four prompt variants and hidden file truth from future rollout episodes."""
+    lay = _layout(root)
+    result = build_time_consistent_benchmark(
+        lay,
+        benchmark_id=benchmark_id,
+        project_root=project,
+        cutoff_time=cutoff,
+        end_time=end,
+        hosts=_expand_hosts(host),
+    )
+    console.print(
+        f"[green]built {result.benchmark_id} with {result.task_count} tasks[/green]"
+    )
+    console.print(f"  snapshot:    {result.snapshot_commit}")
+    console.print(f"  benchmark:   {result.path}")
+    console.print(f"  diagnostics: {result.observed_predictions_path}")
+
+
+@benchmark_app.command("evaluate")
+def benchmark_evaluate_cmd(
+    benchmark_id: str = typer.Argument(..., help="Benchmark version identifier"),
+    predictions: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="JSONL file containing predicted repository-relative file sets",
+    ),
+    run_id: Optional[str] = typer.Option(
+        None,
+        "--run-id",
+        help="Immutable run identifier; defaults to the current UTC timestamp",
+    ),
+    allow_partial: bool = typer.Option(
+        False,
+        "--allow-partial",
+        help="Allow a condition/model/prompt group to omit benchmark tasks",
+    ),
+    baseline_condition: str = typer.Option(
+        "baseline",
+        "--baseline-condition",
+        help="Condition name used as the matched-comparison baseline",
+    ),
+    augmented_condition: str = typer.Option(
+        "augmented",
+        "--augmented-condition",
+        help="Condition name used as the matched-comparison treatment",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Score file predictions with exact precision, recall, F1, and matched deltas."""
+    lay = _layout(root)
+    result = evaluate_time_consistent_benchmark(
+        lay,
+        benchmark_id=benchmark_id,
+        predictions_path=predictions,
+        run_id=run_id,
+        allow_partial=allow_partial,
+        baseline_condition=baseline_condition,
+        augmented_condition=augmented_condition,
+    )
+    table = Table(title=f"Benchmark evaluation: {result.run_id}")
+    for column in ("condition", "model", "prompt", "tasks", "macro F1", "exact match"):
+        table.add_column(column)
+    for aggregate in result.aggregate:
+        table.add_row(
+            aggregate["condition"],
+            aggregate["model"],
+            aggregate["prompt_level"],
+            str(aggregate["task_count"]),
+            f"{aggregate['macro_f1']:.3f}",
+            f"{aggregate['exact_match_rate']:.3f}",
+        )
+    console.print(table)
+    for comparison in result.paired_comparisons:
+        console.print(
+            "  matched delta "
+            f"{comparison['model']}/{comparison['prompt_level']}: "
+            f"{comparison['mean_file_f1_delta']:+.3f} "
+            f"({comparison['matched_task_count']} tasks)"
+        )
+    console.print(f"[green]wrote immutable run to {result.path}[/green]")
+
+
+@benchmark_app.command("list")
+def benchmark_list_cmd(
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """List locally generated benchmark versions."""
+    lay = _layout(root)
+    table = Table(title="Benchmarks")
+    table.add_column("id")
+    table.add_column("method")
+    table.add_column("tasks")
+    table.add_column("cutoff")
+    for benchmark_dir in sorted(path for path in lay.benchmarks_dir().iterdir() if path.is_dir()):
+        manifest_path = benchmark_dir / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            console.print(
+                f"[yellow]skipping invalid benchmark manifest {manifest_path}: {exc}[/yellow]"
+            )
+            continue
+        if not isinstance(manifest, dict):
+            console.print(
+                f"[yellow]skipping non-object benchmark manifest {manifest_path}[/yellow]"
+            )
+            continue
+        source = manifest.get("source")
+        source = source if isinstance(source, dict) else {}
+        temporal = manifest.get("temporal_contract")
+        temporal = temporal if isinstance(temporal, dict) else {}
+        legacy_contract = manifest.get("contract")
+        legacy_contract = legacy_contract if isinstance(legacy_contract, dict) else {}
+        table.add_row(
+            str(manifest.get("benchmark_id", benchmark_dir.name)),
+            str(manifest.get("method", "unknown")),
+            str(source.get("task_count", "?")),
+            str(
+                temporal.get(
+                    "knowledge_and_snapshot_at_or_before",
+                    legacy_contract.get("cutoff_time", "?"),
+                )
+            ),
+        )
+    console.print(table)
 
 
 @app.command("render")

@@ -17,12 +17,23 @@ def test_layout_paths():
     assert lay.mined_prompt_path("codex", "t1", "skill_pro") == Path(
         "/tmp/rm/mined/skill_pro/codex/t1.prompt.md"
     )
+    assert lay.benchmark_dir("bench-v1") == Path("/tmp/rm/benchmarks/bench-v1")
+    assert lay.benchmark_runs_dir("bench-v1") == Path(
+        "/tmp/rm/benchmark-runs/bench-v1"
+    )
 
 
 def test_ensure_creates_dirs(tmp_path: Path):
     lay = Layout(tmp_path / "rollout-memory")
     lay.ensure()
-    for sub in ("raw", "normalized", "rendered", "mined"):
+    for sub in (
+        "raw",
+        "normalized",
+        "rendered",
+        "mined",
+        "benchmarks",
+        "benchmark-runs",
+    ):
         assert (tmp_path / "rollout-memory" / sub).is_dir()
 
 

@@ -85,6 +85,7 @@ def test_global_archive_command_help():
     for args in (
         ["config", "--help"],
         ["archive", "--help"],
+        ["benchmark", "--help"],
         ["schedule", "--help"],
         ["setup", "--help"],
         ["sync", "--help"],

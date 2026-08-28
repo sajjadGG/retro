@@ -38,8 +38,26 @@ class Layout:
     def memory_index_path(self) -> Path:
         return self.memories_dir() / "index.sqlite"
 
+    def benchmarks_dir(self) -> Path:
+        return self.root / "benchmarks"
+
+    def benchmark_dir(self, benchmark_id: str) -> Path:
+        return self.benchmarks_dir() / benchmark_id
+
+    def benchmark_runs_dir(self, benchmark_id: str | None = None) -> Path:
+        root = self.root / "benchmark-runs"
+        return root / benchmark_id if benchmark_id else root
+
     def ensure(self) -> None:
-        for sub in ("raw", "normalized", "rendered", "mined", "memories"):
+        for sub in (
+            "raw",
+            "normalized",
+            "rendered",
+            "mined",
+            "memories",
+            "benchmarks",
+            "benchmark-runs",
+        ):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_imported(self, host: Host) -> list[str]:
