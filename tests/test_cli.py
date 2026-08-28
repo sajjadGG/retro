@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import click
+import typer
 from typer.testing import CliRunner
 
 from retro.cli import app
@@ -99,7 +101,19 @@ def test_benchmark_run_help():
     result = runner.invoke(app, ["benchmark", "run", "--help"])
     assert result.exit_code == 0
     assert "GhostLab OpenShell" in result.output
-    assert "--use-git-credential" in result.output
+
+    root = typer.main.get_command(app)
+    assert isinstance(root, click.Group)
+    benchmark = root.commands["benchmark"]
+    assert isinstance(benchmark, click.Group)
+    run = benchmark.commands["run"]
+    options = {
+        option
+        for parameter in run.params
+        if isinstance(parameter, click.Option)
+        for option in parameter.opts
+    }
+    assert "--use-git-credential" in options
 
 
 def test_config_set_and_show(tmp_path):
