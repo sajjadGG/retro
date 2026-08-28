@@ -4,7 +4,7 @@ Instructions for AI coding agents working on this project.
 
 ## Project overview
 
-`retro` is a local-first CLI tool that captures Codex, Claude Code, and VS Code GitHub Copilot Chat agent sessions, normalizes them into a common event schema, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-agent-memory`.
+`retro` is a local-first CLI tool that captures Codex, Claude Code, and VS Code GitHub Copilot Chat agent sessions, normalizes them into a common event schema, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-ai`; the installed CLI command is `retro`.
 
 ## Architecture
 
