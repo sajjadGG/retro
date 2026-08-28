@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- GhostLab/OpenShell execution for time-consistent benchmark tasks, with
+  independent sandboxes, exact repository snapshots, constrained Copilot tools
+  and egress, a digest-pinned base image, private runner traces, and immutable
+  scoring.
+
 ## 0.3.0 - 2026-08-27
 
 ### Added

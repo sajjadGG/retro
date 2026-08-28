@@ -139,9 +139,10 @@ def run_sync(
             }
             pending.update(changed)
             pending_typed: set[tuple[Host, str]] = {
-                (host, session_id)  # type: ignore[arg-type]
-                for host, session_id in pending
-                if host in HOSTS
+                (host, session_id)
+                for host in HOSTS
+                for pending_host, session_id in pending
+                if pending_host == host
             }
             signal_schema_changed = (
                 previous_state.get("signal_signature") != signal_signature

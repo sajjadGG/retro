@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,7 +15,9 @@ from retro.benchmarks import (
     build_time_consistent_benchmark,
     evaluate_time_consistent_benchmark,
     file_localization_metrics,
+    ghostlab_runner,
     parse_timestamp,
+    run_ghostlab_benchmark,
 )
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.storage import Layout
@@ -457,3 +461,237 @@ def test_detects_benchmark_artifact_tampering(benchmark_source, tmp_path: Path):
             predictions_path=predictions,
             run_id="tampered",
         )
+
+
+def test_ghostlab_runner_uses_independent_sealed_sandboxes(
+    benchmark_source,
+    monkeypatch,
+):
+    layout, project = benchmark_source
+    build = _build(layout, project)
+    private_truth = {
+        record["task_id"]: record["expected_files"]
+        for record in _jsonl(build.path / "private" / "ground-truth.jsonl")
+    }
+    configs = []
+    snapshot_observations = []
+
+    class FakeRunner:
+        def __init__(self, config, name):
+            self.config = config
+            self.name = name
+            self.sandbox = SimpleNamespace(exec=self.sandbox_exec)
+
+        def sandbox_exec(self, command, *, input_text, env, timeout):
+            assert command == ["copilot", "--version"]
+            assert input_text is None
+            assert env == {}
+            assert timeout == 30
+            return SimpleNamespace(
+                returncode=0,
+                stdout="GitHub Copilot CLI 1.0.81.\n",
+                stderr="",
+            )
+
+        def run_turn(self, prompt):
+            task_id = re.search(r"Task ID: (\S+)", prompt).group(1)
+            response = json.dumps(
+                {
+                    "task_id": task_id,
+                    "predicted_files": private_truth[task_id],
+                }
+            )
+            output = "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool.execution_start",
+                            "data": {"toolCallId": "read-1", "toolName": "view"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool.execution_complete",
+                            "data": {"toolCallId": "read-1", "success": True},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "assistant.message",
+                            "data": {"content": response},
+                        }
+                    ),
+                ]
+            )
+            return SimpleNamespace(
+                output=output,
+                exit_code=0,
+                timed_out=False,
+                stderr="",
+            )
+
+        def close(self):
+            artifact_dir = Path(self.config["sandbox"]["artifact_dir"])
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / f"openshell-{self.name}.log").write_text(
+                "provider request allowed\n",
+                encoding="utf-8",
+            )
+
+    def runner_config(**kwargs):
+        configs.append(kwargs)
+        snapshot = Path(kwargs["sandbox"]["uploads"][0]["source"])
+        snapshot_observations.append(
+            {
+                "has_git": (snapshot / ".git").exists(),
+                "mode": snapshot.stat().st_mode & 0o777,
+            }
+        )
+        return kwargs
+
+    api = ghostlab_runner._GhostlabApi(
+        runner_config=runner_config,
+        create_runner=lambda config, name: FakeRunner(config, name),
+        render_egress_policy=lambda hosts, binaries: (
+            f"hosts={','.join(hosts)}\nbinaries={','.join(binaries)}\n"
+        ),
+        version="test",
+    )
+    monkeypatch.setattr(ghostlab_runner, "_load_ghostlab_api", lambda: api)
+    monkeypatch.setattr(
+        ghostlab_runner,
+        "_command_version",
+        lambda command: "openshell test",
+    )
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "test-secret-token")
+
+    result = run_ghostlab_benchmark(
+        layout,
+        benchmark_id=build.benchmark_id,
+        run_id="ghostlab-run",
+        model="mai-code-1.1-flash",
+        workers=2,
+    )
+
+    assert result.task_count == 2
+    assert result.evaluation.aggregate[0]["macro_f1"] == 1.0
+    assert len(configs) == 2
+    assert len({config["sandbox"]["artifact_dir"] for config in configs}) == 2
+    for config in configs:
+        assert config["kind"] == "process"
+        assert config["prompt_mode"] == "stdin"
+        assert config["command"][:2] == ["/bin/sh", "-c"]
+        assert "\n" not in config["command"][2]
+        assert "--secret-env-vars=COPILOT_GITHUB_TOKEN" in config["command"][2]
+        assert config["sandbox"]["backend"] == "openshell"
+        assert config["sandbox"]["keep"] is False
+        assert config["sandbox"]["env_allowlist"] == ["COPILOT_GITHUB_TOKEN"]
+    assert snapshot_observations == [
+        {"has_git": False, "mode": 0o555},
+        {"has_git": False, "mode": 0o555},
+    ]
+
+    run_dir = result.evaluation.path
+    runner_manifest = json.loads(
+        (run_dir / "private" / "runner" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert runner_manifest["protocol"]["backend"] == "ghostlab-openshell"
+    assert runner_manifest["protocol"]["independent_sandbox_per_task"] is True
+    assert runner_manifest["protocol"]["copilot_versions"] == [
+        "GitHub Copilot CLI 1.0.81."
+    ]
+    assert (
+        run_dir / "private" / "runner" / "openshell-policy.yaml"
+    ).stat().st_mode & 0o777 == 0o600
+    for path in run_dir.rglob("*"):
+        if path.is_file():
+            assert b"test-secret-token" not in path.read_bytes()
+    assert not list(layout.benchmark_runs_dir(build.benchmark_id).glob(".ghostlab-run.*"))
+
+
+def test_ghostlab_runner_requires_explicit_credential(benchmark_source, monkeypatch):
+    layout, project = benchmark_source
+    build = _build(layout, project)
+    monkeypatch.setattr(
+        ghostlab_runner,
+        "_load_ghostlab_api",
+        lambda: ghostlab_runner._GhostlabApi(
+            runner_config=lambda **kwargs: kwargs,
+            create_runner=lambda config, name: None,
+            render_egress_policy=lambda hosts, binaries: "policy\n",
+            version="test",
+        ),
+    )
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="COPILOT_GITHUB_TOKEN is not set"):
+        run_ghostlab_benchmark(
+            layout,
+            benchmark_id=build.benchmark_id,
+            run_id="missing-credential",
+            model="mai-code-1.1-flash",
+        )
+
+
+def test_ghostlab_runner_rejects_unrecognized_credential_variable(
+    benchmark_source,
+):
+    layout, project = benchmark_source
+    build = _build(layout, project)
+
+    with pytest.raises(ValueError, match="credential_env must be one of"):
+        run_ghostlab_benchmark(
+            layout,
+            benchmark_id=build.benchmark_id,
+            run_id="unsafe-credential",
+            model="mai-code-1.1-flash",
+            credential_env="UNRELATED_SECRET",
+        )
+
+
+def test_copilot_stream_parser_records_tool_and_model_errors():
+    stream = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "tool.execution_start",
+                    "data": {"toolCallId": "1", "toolName": "shell"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool.execution_complete",
+                    "data": {"toolCallId": "1", "success": False},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "assistant.message",
+                    "data": {"content": '{"task_id":"t","predicted_files":[]}'},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "session.error",
+                    "data": {"message": "provider failed"},
+                }
+            ),
+        ]
+    )
+
+    parsed = ghostlab_runner._parse_copilot_stream(stream)
+
+    assert parsed["message"] == '{"task_id":"t","predicted_files":[]}'
+    assert parsed["errors"] == ["provider failed"]
+    assert parsed["tool_calls"] == [{"status": "failed", "tool": "shell"}]
+
+
+def test_command_version_degrades_when_binary_is_missing(monkeypatch):
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("openshell")
+
+    monkeypatch.setattr(ghostlab_runner.subprocess, "run", missing)
+
+    assert ghostlab_runner._command_version(["openshell", "--version"]) == "unknown"

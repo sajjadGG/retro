@@ -1,11 +1,12 @@
 """CLI smoke tests using Typer's CliRunner."""
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 from typer.testing import CliRunner
 
-from retro.cli import app
+from retro.cli import app, benchmark_run_cmd
 from retro.config import load_config
 
 runner = CliRunner()
@@ -93,6 +94,15 @@ def test_global_archive_command_help():
     ):
         result = runner.invoke(app, args)
         assert result.exit_code == 0, result.output
+
+
+def test_benchmark_run_help():
+    result = runner.invoke(app, ["benchmark", "run", "--help"])
+    assert result.exit_code == 0
+    assert "GhostLab OpenShell" in result.output
+
+    option = inspect.signature(benchmark_run_cmd).parameters["use_git_credential"]
+    assert "--use-git-credential" in option.default.param_decls
 
 
 def test_config_set_and_show(tmp_path):

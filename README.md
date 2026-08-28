@@ -223,6 +223,7 @@ rollout-memory/
     results.json
     report.md
     private/task-details.jsonl
+    private/runner/                            # optional GhostLab traces and policy
 ```
 
 `raw/` is treated as **immutable**: re-importing the same session refuses unless `--force` is passed.
@@ -544,6 +545,51 @@ Task metrics are exact file-set precision, recall, and F1. The paper's score is
 the unweighted mean task-level F1; Retro also reports micro metrics, exact-match
 rate, zero-precision rate, perfect-recall rate, and zero-recall rate. This is a
 localization benchmark, not evidence that a patch is correct or that tests pass.
+
+### Run tasks safely with GhostLab and OpenShell
+
+The optional sandbox runner requires Python 3.10 or newer, GhostLab, and a
+connected NVIDIA OpenShell gateway:
+
+```bash
+python3.11 -m venv .venv
+.venv/bin/pip install -e ".[sandbox]"
+openshell status
+```
+
+Run one fresh OpenShell sandbox per benchmark task:
+
+```bash
+export COPILOT_GITHUB_TOKEN=...
+
+retro benchmark run cortex-20260601-v1 \
+  --model mai-code-1.1-flash \
+  --prompt-level contextual \
+  --run-id mai-ghostlab-contextual-v1 \
+  --workers 2
+```
+
+If a Copilot-capable GitHub token is already stored by Git's credential helper,
+`--use-git-credential` explicitly requests it without writing the value to an
+artifact. Environment variables are otherwise never inherited implicitly.
+
+The runner:
+
+- materializes the pinned commit using `git archive`, so the sandbox receives no
+  `.git` history, dirty working tree, hidden verifier, or benchmark files;
+- marks the uploaded snapshot read-only and disables Copilot shell, write, URL,
+  memory, custom-instruction, remote-control, and built-in MCP capabilities;
+- uses a provider-only OpenShell egress policy and forwards only the selected
+  credential variable;
+- creates and destroys an independent sandbox for every task;
+- rejects unexpected tools, model errors, malformed predictions, and incomplete
+  task sets rather than producing success-shaped output;
+- stores raw task traces and OpenShell logs under the run's mode-`0700`
+  `private/runner/` directory and checksums them in the immutable run manifest.
+
+`--use-git-credential` is opt-in because it grants the isolated model process
+access to the retrieved token for the duration of the run. The value is removed
+from Retro's process environment afterward and never included in run metadata.
 
 ---
 
