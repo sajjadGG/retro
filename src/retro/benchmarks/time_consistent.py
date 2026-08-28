@@ -290,13 +290,11 @@ def evaluate_time_consistent_benchmark(
     allow_partial: bool = False,
     baseline_condition: str = "baseline",
     augmented_condition: str = "augmented",
+    runner_protocol: dict[str, Any] | None = None,
+    private_artifacts_dir: Path | None = None,
 ) -> BenchmarkEvaluationResult:
     """Evaluate predicted file sets and persist an immutable run."""
-    _validate_identifier(benchmark_id, "benchmark id")
-    benchmark_dir = layout.benchmark_dir(benchmark_id)
-    manifest = _load_json(benchmark_dir / "manifest.json")
-    _validate_manifest(manifest, benchmark_id)
-    _verify_artifacts(benchmark_dir, manifest)
+    benchmark_dir, manifest = load_time_consistent_manifest(layout, benchmark_id)
 
     task_ids = _load_prompt_task_ids(benchmark_dir)
     ground_truth = {
@@ -388,6 +386,21 @@ def evaluate_time_consistent_benchmark(
     if run_target.exists():
         raise FileExistsError(f"benchmark run already exists: {run_target}")
 
+    protocol: dict[str, Any] = {
+        "allow_partial": allow_partial,
+        "augmented_condition": augmented_condition,
+        "baseline_condition": baseline_condition,
+        "matched_variables": [
+            "task_id",
+            "model",
+            "prompt_level",
+            "repository_snapshot",
+            "file_set_metric",
+        ],
+        "score": "unweighted mean task-level file F1",
+    }
+    if runner_protocol is not None:
+        protocol["runner"] = runner_protocol
     results = {
         "aggregate": aggregate,
         "benchmark_id": benchmark_id,
@@ -395,19 +408,7 @@ def evaluate_time_consistent_benchmark(
         "method": METHOD_NAME,
         "paired_comparisons": paired_comparisons,
         "paper": {"title": PAPER_TITLE, "url": PAPER_URL},
-        "protocol": {
-            "allow_partial": allow_partial,
-            "augmented_condition": augmented_condition,
-            "baseline_condition": baseline_condition,
-            "matched_variables": [
-                "task_id",
-                "model",
-                "prompt_level",
-                "repository_snapshot",
-                "file_set_metric",
-            ],
-            "score": "unweighted mean task-level file F1",
-        },
+        "protocol": protocol,
         "run_id": resolved_run_id,
         "schema_version": SCHEMA_VERSION,
         "tasks": task_rows,
@@ -426,16 +427,24 @@ def evaluate_time_consistent_benchmark(
             private_path = staging / "private" / "task-details.jsonl"
             _write_jsonl(private_path, private_rows)
             _protect_private_file(private_path)
+            private_artifacts: list[tuple[str, int | None, str]] = []
+            if private_artifacts_dir is not None:
+                private_artifacts = _copy_private_artifacts(
+                    private_artifacts_dir,
+                    staging / "private" / "runner",
+                    staging,
+                )
             _write_json(staging / "results.json", results)
             _write_evaluation_report(staging / "report.md", results)
             artifacts = _artifact_records(
                 staging,
-                (
+                [
                     ("predictions.jsonl", len(normalized_predictions), "evaluator"),
                     ("private/task-details.jsonl", len(private_rows), "private"),
                     ("report.md", None, "evaluator"),
                     ("results.json", None, "evaluator"),
-                ),
+                    *private_artifacts,
+                ],
             )
             _write_json(
                 staging / "run-manifest.json",
@@ -460,6 +469,19 @@ def evaluate_time_consistent_benchmark(
         aggregate=aggregate,
         paired_comparisons=paired_comparisons,
     )
+
+
+def load_time_consistent_manifest(
+    layout: Layout,
+    benchmark_id: str,
+) -> tuple[Path, dict[str, Any]]:
+    """Load and checksum-verify one immutable time-consistent benchmark."""
+    _validate_identifier(benchmark_id, "benchmark id")
+    benchmark_dir = layout.benchmark_dir(benchmark_id)
+    manifest = _load_json(benchmark_dir / "manifest.json")
+    _validate_manifest(manifest, benchmark_id)
+    _verify_artifacts(benchmark_dir, manifest)
+    return benchmark_dir, manifest
 
 
 def _load_repository(project_root: Path, cutoff: datetime) -> _Repository:
@@ -1272,6 +1294,29 @@ def _artifact_records(
         if count is not None:
             record["records"] = count
         records.append(record)
+    return records
+
+
+def _copy_private_artifacts(
+    source: Path,
+    target: Path,
+    staging: Path,
+) -> list[tuple[str, int | None, str]]:
+    source = source.expanduser().resolve()
+    if not source.is_dir():
+        raise FileNotFoundError(f"private runner artifacts do not exist: {source}")
+    for path in source.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"private runner artifacts cannot contain symlinks: {path}")
+    shutil.copytree(source, target)
+    target.chmod(0o700)
+    records: list[tuple[str, int | None, str]] = []
+    for path in sorted(target.rglob("*")):
+        if path.is_dir():
+            path.chmod(0o700)
+            continue
+        path.chmod(0o600)
+        records.append((path.relative_to(staging).as_posix(), None, "private"))
     return records
 
 

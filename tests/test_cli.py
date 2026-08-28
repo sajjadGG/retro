@@ -95,6 +95,13 @@ def test_global_archive_command_help():
         assert result.exit_code == 0, result.output
 
 
+def test_benchmark_run_help():
+    result = runner.invoke(app, ["benchmark", "run", "--help"])
+    assert result.exit_code == 0
+    assert "GhostLab OpenShell" in result.output
+    assert "--use-git-credential" in result.output
+
+
 def test_config_set_and_show(tmp_path):
     archive = tmp_path / "archive"
     set_result = runner.invoke(

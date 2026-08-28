@@ -20,8 +20,10 @@ from rich.console import Console
 from rich.table import Table
 
 from .benchmarks import (
+    BenchmarkEvaluationResult,
     build_time_consistent_benchmark,
     evaluate_time_consistent_benchmark,
+    run_ghostlab_benchmark,
 )
 from .config import (
     RetroConfig,
@@ -666,6 +668,101 @@ def benchmark_evaluate_cmd(
         baseline_condition=baseline_condition,
         augmented_condition=augmented_condition,
     )
+    _print_benchmark_evaluation(result)
+
+
+@benchmark_app.command("run")
+def benchmark_run_cmd(
+    benchmark_id: str = typer.Argument(..., help="Benchmark version identifier"),
+    model: str = typer.Option(..., "--model", help="GitHub Copilot model identifier"),
+    run_id: str = typer.Option(..., "--run-id", help="Immutable evaluation run identifier"),
+    prompt_level: str = typer.Option(
+        "contextual",
+        "--prompt-level",
+        help="minimal|concise|contextual|guided",
+    ),
+    condition: str = typer.Option(
+        "baseline",
+        "--condition",
+        help="Condition label stored with every prediction",
+    ),
+    workers: int = typer.Option(
+        2,
+        "--workers",
+        min=1,
+        help="Concurrent OpenShell sandboxes",
+    ),
+    timeout_seconds: int = typer.Option(
+        600,
+        "--timeout",
+        min=1,
+        help="Per-task model timeout in seconds",
+    ),
+    attempts: int = typer.Option(
+        1,
+        "--attempts",
+        min=1,
+        help="Maximum independent sandbox attempts per task",
+    ),
+    reasoning_effort: str = typer.Option(
+        "medium",
+        "--effort",
+        help="Copilot reasoning effort",
+    ),
+    context: str = typer.Option(
+        "default",
+        "--context",
+        help="Copilot context tier",
+    ),
+    credential_env: str = typer.Option(
+        "COPILOT_GITHUB_TOKEN",
+        "--credential-env",
+        help="Allowlisted environment variable containing a Copilot-capable token",
+    ),
+    use_git_credential: bool = typer.Option(
+        False,
+        "--use-git-credential",
+        help="Explicitly request a GitHub token from Git's credential helper",
+    ),
+    sandbox_image: Optional[Path] = typer.Option(
+        None,
+        "--sandbox-image",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Override the packaged OpenShell Copilot Dockerfile",
+    ),
+    cpu: str = typer.Option("2", "--cpu", help="CPU limit for each sandbox"),
+    memory: str = typer.Option("4Gi", "--memory", help="Memory limit for each sandbox"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Run benchmark tasks through GitHub Copilot inside GhostLab OpenShell."""
+    lay = _layout(root)
+    result = run_ghostlab_benchmark(
+        lay,
+        benchmark_id=benchmark_id,
+        run_id=run_id,
+        model=model,
+        prompt_level=prompt_level,
+        condition=condition,
+        workers=workers,
+        timeout_seconds=timeout_seconds,
+        attempts=attempts,
+        reasoning_effort=reasoning_effort,
+        context=context,
+        credential_env=credential_env,
+        use_git_credential=use_git_credential,
+        sandbox_image=sandbox_image,
+        cpu=cpu,
+        memory=memory,
+    )
+    _print_benchmark_evaluation(result.evaluation)
+    console.print(
+        f"[green]completed {result.task_count} independent GhostLab/OpenShell tasks[/green]"
+    )
+
+
+def _print_benchmark_evaluation(result: BenchmarkEvaluationResult) -> None:
     table = Table(title=f"Benchmark evaluation: {result.run_id}")
     for column in ("condition", "model", "prompt", "tasks", "macro F1", "exact match"):
         table.add_column(column)

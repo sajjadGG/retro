@@ -1233,6 +1233,9 @@ earlier provisional profile contract where the paper requires a stricter one:
 - exact file-set precision, recall, and F1;
 - unweighted mean task F1 plus task-level extreme-outcome diagnostics;
 - matched baseline-versus-augmented deltas when both conditions are supplied.
+- optional GhostLab/OpenShell execution with one exact-snapshot sandbox per task,
+  provider-only egress, explicit credential forwarding, read-only agent tools,
+  private traces, and fail-closed prediction validation.
 
 The implementation stores each learner-visible prompt level in a separate file
 and keeps ground truth, expected file counts, and source provenance private.
