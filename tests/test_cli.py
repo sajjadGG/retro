@@ -1,13 +1,12 @@
 """CLI smoke tests using Typer's CliRunner."""
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
-import click
-import typer
 from typer.testing import CliRunner
 
-from retro.cli import app
+from retro.cli import app, benchmark_run_cmd
 from retro.config import load_config
 
 runner = CliRunner()
@@ -102,18 +101,8 @@ def test_benchmark_run_help():
     assert result.exit_code == 0
     assert "GhostLab OpenShell" in result.output
 
-    root = typer.main.get_command(app)
-    assert isinstance(root, click.Group)
-    benchmark = root.commands["benchmark"]
-    assert isinstance(benchmark, click.Group)
-    run = benchmark.commands["run"]
-    options = {
-        option
-        for parameter in run.params
-        if isinstance(parameter, click.Option)
-        for option in parameter.opts
-    }
-    assert "--use-git-credential" in options
+    option = inspect.signature(benchmark_run_cmd).parameters["use_git_credential"]
+    assert "--use-git-credential" in option.default.param_decls
 
 
 def test_config_set_and_show(tmp_path):
