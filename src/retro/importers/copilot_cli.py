@@ -12,7 +12,7 @@ from typing import Any
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, truncate_summary
-from .base import ImportResult
+from .base import ImportResult, is_ghostlab_copilot_session_id
 from .vscode_copilot import (
     _completion_event_type,
     _copy_stable,
@@ -118,6 +118,8 @@ class CopilotCliImporter:
                 if not state_dir.is_dir() or not events_path.is_file():
                     continue
                 session_id = state_dir.name
+                if is_ghostlab_copilot_session_id(session_id):
+                    continue
                 metadata = index.get(session_id, {})
                 preview_title, preview_models = _read_event_preview(events_path)
                 workspace = _read_workspace_metadata(state_dir / "workspace.yaml")

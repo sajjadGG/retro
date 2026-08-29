@@ -25,7 +25,7 @@ from typing import Any, Literal
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, iter_jsonl, truncate_summary
-from .base import ImportResult
+from .base import ImportResult, is_ghostlab_originator
 
 CODEX_HOME = Path.home() / ".codex"
 STATE_DB = CODEX_HOME / "state_5.sqlite"
@@ -57,6 +57,7 @@ class CodexThread:
     model_provider: str
     git_branch: str | None
     archived: bool
+    originator: str = ""
     source_kind: RootKind = "sqlite_home"
     codex_home: Path | None = None  # the root this thread was discovered under
 
@@ -160,22 +161,30 @@ class CodexImporter:
             ).fetchall()
         finally:
             con.close()
-        return [
-            CodexThread(
-                thread_id=r["id"],
-                rollout_path=Path(r["rollout_path"]),
-                title=r["title"] or "",
-                cwd=r["cwd"] or "",
-                created_at=r["created_at"] or 0,
-                updated_at=r["updated_at"] or 0,
-                model_provider=r["model_provider"] or "",
-                git_branch=r["git_branch"],
-                archived=bool(r["archived"]),
-                source_kind="sqlite_home",
-                codex_home=root,
+        threads: list[CodexThread] = []
+        for row in rows:
+            rollout_path = Path(row["rollout_path"])
+            meta = _read_session_meta(rollout_path) or {}
+            originator = meta.get("originator")
+            if is_ghostlab_originator(originator):
+                continue
+            threads.append(
+                CodexThread(
+                    thread_id=row["id"],
+                    rollout_path=rollout_path,
+                    title=row["title"] or "",
+                    cwd=row["cwd"] or "",
+                    created_at=row["created_at"] or 0,
+                    updated_at=row["updated_at"] or 0,
+                    model_provider=row["model_provider"] or "",
+                    git_branch=row["git_branch"],
+                    archived=bool(row["archived"]),
+                    originator=str(originator or ""),
+                    source_kind="sqlite_home",
+                    codex_home=root,
+                )
             )
-            for r in rows
-        ]
+        return threads
 
     def _discover_jsonl_dir(self, scan_dir: Path, root: Path, kind: RootKind) -> list[CodexThread]:
         if not scan_dir.is_dir():
@@ -184,6 +193,9 @@ class CodexImporter:
         for jsonl in scan_dir.rglob("*.jsonl"):
             meta = _read_session_meta(jsonl)
             if meta is None:
+                continue
+            originator = meta.get("originator")
+            if is_ghostlab_originator(originator):
                 continue
             try:
                 mtime = int(jsonl.stat().st_mtime)
@@ -200,6 +212,7 @@ class CodexImporter:
                     model_provider=meta.get("model_provider") or "",
                     git_branch=meta.get("git_branch"),
                     archived=False,
+                    originator=str(originator or ""),
                     source_kind=kind,
                     codex_home=root,
                 )
@@ -284,6 +297,7 @@ class CodexImporter:
             "created_at": thread.created_at,
             "updated_at": thread.updated_at,
             "archived": thread.archived,
+            "originator": thread.originator,
             "source_rollout": str(thread.rollout_path),
             "source_kind": thread.source_kind,
             "codex_home": str(thread.codex_home) if thread.codex_home else None,

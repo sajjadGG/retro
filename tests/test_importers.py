@@ -4,11 +4,16 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import time
 from pathlib import Path
 
 import pytest
 
+from retro.importers.base import (
+    GHOSTLAB_COPILOT_SESSION_ID_PREFIX,
+    GHOSTLAB_ORIGINATOR,
+)
 from retro.importers.claude import ClaudeImporter
 from retro.importers.codex import CodexImporter
 from retro.importers.copilot import CopilotImporter
@@ -19,6 +24,25 @@ from retro.importers.vscode_copilot import (
 )
 from retro.schema import read_events
 from retro.storage import Layout
+
+
+def _write_tagged_codex_rollout(
+    source: Path,
+    destination: Path,
+    thread_id: str = "thread-ghostlab",
+) -> None:
+    records = [
+        json.loads(line)
+        for line in source.read_text(encoding="utf-8").splitlines()
+    ]
+    records[0]["payload"].update(
+        {"id": thread_id, "originator": GHOSTLAB_ORIGINATOR}
+    )
+    destination.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
 
 # ---- Claude importer -------------------------------------------------------
 
@@ -128,6 +152,76 @@ class TestCodexImporter:
         threads = imp.discover()
         assert len(threads) == 1
         assert threads[0].thread_id == "thread-001"
+
+    def test_discover_ignores_ghostlab_rollout(
+        self,
+        tmp_path: Path,
+        codex_rollout: Path,
+    ):
+        imp, _ = self._make_importer(tmp_path, codex_rollout)
+        tagged = imp.codex_home / "sessions" / "ghostlab.jsonl"
+        _write_tagged_codex_rollout(codex_rollout, tagged)
+
+        assert [thread.thread_id for thread in imp.discover()] == ["thread-001"]
+        with pytest.raises(FileNotFoundError):
+            imp.import_session(identifier="thread-ghostlab")
+
+    def test_sqlite_discovery_ignores_ghostlab_rollout(
+        self,
+        tmp_path: Path,
+        codex_rollout: Path,
+    ):
+        layout = Layout(tmp_path / "rollout-memory")
+        layout.ensure()
+        codex_home = tmp_path / "codex-home"
+        sessions = codex_home / "sessions"
+        sessions.mkdir(parents=True)
+        normal = sessions / "normal.jsonl"
+        tagged = sessions / "ghostlab.jsonl"
+        shutil.copy2(codex_rollout, normal)
+        _write_tagged_codex_rollout(codex_rollout, tagged)
+        con = sqlite3.connect(codex_home / "state_5.sqlite")
+        try:
+            con.execute(
+                "CREATE TABLE threads ("
+                "id TEXT PRIMARY KEY, rollout_path TEXT, title TEXT, cwd TEXT, "
+                "created_at INTEGER, updated_at INTEGER, model_provider TEXT, "
+                "git_branch TEXT, archived INTEGER)"
+            )
+            con.executemany(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        "thread-001",
+                        str(normal),
+                        "normal",
+                        "/workspace",
+                        1,
+                        2,
+                        "openai",
+                        "main",
+                        0,
+                    ),
+                    (
+                        "thread-ghostlab",
+                        str(tagged),
+                        "synthetic",
+                        "/workspace",
+                        1,
+                        3,
+                        "openai",
+                        "main",
+                        0,
+                    ),
+                ],
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        discovered = CodexImporter(layout, codex_home=codex_home).discover()
+
+        assert [thread.thread_id for thread in discovered] == ["thread-001"]
 
     def test_import_creates_artifacts(self, tmp_path: Path, codex_rollout: Path):
         imp, layout = self._make_importer(tmp_path, codex_rollout)
@@ -425,6 +519,28 @@ class TestCopilotCliImporter:
         assert active.workspace_name == "demo"
         assert set(active.models) == {"gpt-5.6-sol", "claude-sonnet-5"}
         assert active.request_count == 1
+
+    def test_discover_ignores_ghostlab_session_ids(
+        self,
+        tmp_path: Path,
+        copilot_cli_state: tuple[Path, Path],
+    ):
+        state_root, _ = copilot_cli_state
+        session_id = (
+            f"{GHOSTLAB_COPILOT_SESSION_ID_PREFIX}"
+            "4abc-8abc-0123456789ab"
+        )
+        tagged = state_root / session_id
+        tagged.mkdir()
+        (tagged / "events.jsonl").write_text("not json\n", encoding="utf-8")
+        imp, _ = self._make_importer(tmp_path, copilot_cli_state)
+
+        assert {session.session_id for session in imp.discover()} == {
+            "cli-session-active",
+            "cli-session-complete",
+        }
+        with pytest.raises(FileNotFoundError):
+            imp.import_session(identifier=session_id)
 
     def test_import_captures_event_log_metadata_and_usage(
         self,

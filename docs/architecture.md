@@ -33,6 +33,14 @@ Derived artifacts can be rebuilt:
 - `dashboard/data/rollouts.json`;
 - `dashboard/index.html`.
 
+## Source Discovery
+
+Importers exclude synthetic Ghostlab evaluation traffic before it enters the
+archive. Codex sessions are identified by `session_meta.originator: ghostlab`;
+Copilot CLI sessions use Ghostlab's reserved UUID prefix. The marker is attached
+to session metadata rather than prompts, so excluding it does not change the
+recorded conversation.
+
 ## Key Modules
 
 | Module | Role |
