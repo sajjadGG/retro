@@ -74,6 +74,14 @@ python3 -m venv .venv
 - **The default archive is per-user, not cwd-local.** Resolve paths through `config.py` / `default_layout()` and keep tests isolated with `RETRO_DATA_DIR`.
 - **Archive publication is atomic.** Migration, sync, signal, normalized-event, and dashboard writes must stage and replace rather than expose partial files.
 
+## Decision-relevant communication
+
+- Optimize specifications and research for the concrete decision or implementation at hand, not breadth.
+- State exact contracts, algorithms, thresholds, failure states, and repository gaps when they are knowable.
+- Do not pad an answer with generic practices, repository popularity, or paper lists. Include external work only when it changes a design decision, and explain that change.
+- Distinguish what the current code supports from what must be implemented. Never present a proposed interface as an existing feature.
+- Prefer a small number of strong, current, primary sources over an undirected literature catalog.
+
 ## Common tasks
 
 ### Adding a new event type to an importer
@@ -112,3 +120,4 @@ Design documents live in `specs/`. Read these for deeper context:
 - `rollout_mining_methods.md` — mining method catalog
 - `rollout_dashboard_spec.md` — dashboard design
 - `ccusage_comparison_spec.md` — how retro compares to ccusage
+- `learning/rollout_task_scorer_pipeline_spec.md` — Git-backed rollout-to-task, scorer, and Ghostlab execution contract
