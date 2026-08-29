@@ -4,6 +4,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+GHOSTLAB_ORIGINATOR = "ghostlab"
+GHOSTLAB_COPILOT_SESSION_ID_PREFIX = "67686f73-746c-"
+
+
+def is_ghostlab_originator(value: object) -> bool:
+    return isinstance(value, str) and value.strip().casefold() == GHOSTLAB_ORIGINATOR
+
+
+def is_ghostlab_copilot_session_id(session_id: str) -> bool:
+    return session_id.casefold().startswith(GHOSTLAB_COPILOT_SESSION_ID_PREFIX)
+
 
 @dataclass
 class ImportResult:
