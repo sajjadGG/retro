@@ -179,7 +179,11 @@ def test_taskset_command_help_exposes_complete_pipeline():
         "report": "--eval",
     }
     for command, option in expected.items():
-        result = runner.invoke(app, ["benchmark", "taskset", command, "--help"])
+        result = runner.invoke(
+            app,
+            ["benchmark", "taskset", command, "--help"],
+            terminal_width=240,
+        )
         assert result.exit_code == 0, result.output
         assert option in result.output
 
