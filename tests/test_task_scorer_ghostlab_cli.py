@@ -149,6 +149,32 @@ def test_artifact_run_fingerprint_and_argv_include_environment_and_settings(
     assert export_changed.input_sha256 != result.input_sha256
 
 
+def test_artifact_run_accepts_the_documented_workspace_archive_fallback(
+    tmp_path: Path, ghostlab_bin: Path
+) -> None:
+    source_root = make_source_bundle(tmp_path / "sources")
+    plan = write_plan(
+        tmp_path / "plan.json",
+        {
+            "artifact_runs": {
+                "retro-task-definer-v1": {
+                    "workspace_export_name": "state.tar.gz",
+                }
+            }
+        },
+    )
+    request = replace(
+        _definer_request(tmp_path, source_root, tmp_path / "run"),
+        exports=(),
+        export_workspace="state.tar.zst",
+    )
+
+    result = _client(ghostlab_bin, plan).artifact_run(request)
+
+    assert request.workspace_exports() == ("state.tar.zst", "state.tar.gz")
+    assert result.export_path("state.tar.gz") == tmp_path / "run" / "state.tar.gz"
+
+
 def test_artifact_run_detects_source_mutation(tmp_path: Path, ghostlab_bin: Path) -> None:
     source_root = make_source_bundle(tmp_path / "sources")
     outputs = make_definer_outputs(tmp_path / "outputs", source_root.name)

@@ -91,8 +91,13 @@ destination `--build-network-allowlist` and an externally egress-filtered
 `--build-network-name` are supplied.
 
 During `taskset run`, Retro passes the published digest-pinned image and setup
-argument array to Ghostlab. Those values override the candidate agent's ambient
-sandbox image and run before its single task turn.
+argument array to Ghostlab. A candidate agent without its own runtime image runs
+directly in that image. A local candidate-runtime Dockerfile may add the pinned
+agent CLI only when its first `FROM` exactly equals the published image; Retro
+requires a single stage, hashes the complete build context and every resolved
+runtime input into the attempt identity, and executes from a verified temporary
+snapshot. All other candidate image declarations are overridden by the
+published image.
 
 Selection and construction write explicit rejection records. A rollout with no
 replayable goal is a valid zero-task result. Scorer or harness failures remain

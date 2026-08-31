@@ -261,6 +261,14 @@ Commands are argument arrays, never shell strings. Secrets are referenced by nam
 
 Dependency download may use network only while building the pinned image. General egress is disabled during agent and scorer runs. Ghostlab may attach only the named model provider required by the configured agent; the deterministic scorer receives no provider.
 
+The agent CLI may be supplied by a local runtime-layer Dockerfile whose first
+and only `FROM` is exactly the task's pinned image. The orchestrator hashes the
+complete build context and every resolved instruction, skill, subagent prompt,
+MCP dependency, asset, policy, and explicit upload into the attempt identity.
+It executes those inputs from a verified temporary snapshot and rejects
+escaping symlinks or source/snapshot overlap. Absent a verified runtime layer,
+the published task image overrides the agent's ambient image.
+
 ## 6. `SourceBundle` contract
 
 Retro materializes one immutable directory per selected rollout:
