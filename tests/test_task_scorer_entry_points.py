@@ -52,6 +52,34 @@ class _Archive:
         self.layout.ensure()
         self.paths = TasksetPaths.from_layout(self.layout, NAME)
         self.source_root = make_source_bundle(self.paths.sources_dir(), SOURCE_ID)
+        source_manifest = json.loads((self.source_root / "manifest.json").read_text())
+        self.paths.bundle_report_path().write_text(
+            json.dumps(
+                {
+                    "schema_version": "retro-taskset-bundles-v1",
+                    "name": NAME,
+                    "sources": [
+                        {
+                            "source_id": SOURCE_ID,
+                            "host": "codex",
+                            "session_id": "019abc",
+                            "status": "bundled",
+                            "path": str(self.source_root),
+                            "content_sha256": source_manifest["content_sha256"],
+                            "code": None,
+                            "detail": "",
+                        }
+                    ],
+                    "counts": {
+                        "bundled": 1,
+                        "skipped": 0,
+                        "by_status": {"bundled": 1},
+                    },
+                },
+                indent=2,
+            )
+            + "\n"
+        )
         self.task_id = compute_task_id(SOURCE_ID, BASE_TREE, "replay", TASK_PROMPT)
 
         definer_out = make_definer_outputs(tmp_path / "out" / "definer", SOURCE_ID)

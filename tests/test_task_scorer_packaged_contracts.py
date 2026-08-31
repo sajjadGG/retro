@@ -163,8 +163,11 @@ def _report(**overrides) -> ts.ScoreReport:
         "attempt_id": "attempt-1",
         "status": "scored",
         "scorer_package_sha256": "d" * 64,
+        "valid": True,
         "score_total": 0.87,
         "passed": True,
+        "pass_threshold": 0.8,
+        "unscored_weight": 0.0,
         "components": [
             ts.ScoreComponentResult(
                 id="requested_behavior",
@@ -190,8 +193,11 @@ def test_score_reports_emit_packaged_conformant_documents():
 
     non_scored = _report(
         status="scorer_timeout",
+        valid=False,
         score_total=None,
         passed=None,
+        pass_threshold=None,
+        unscored_weight=None,
         components=[],
         commands=[],
         warnings=["scorer exceeded its wall clock"],
@@ -199,10 +205,15 @@ def test_score_reports_emit_packaged_conformant_documents():
     ts.validate_packaged(non_scored, "score-report")
     assert "score_total" not in non_scored and "passed" not in non_scored
 
+    nullable = {**non_scored, "score_total": None, "passed": None}
+    ts.validate_packaged(nullable, "score-report")
+    assert ts.ScoreReport.from_dict(nullable) == ts.ScoreReport.from_dict(non_scored)
+
 
 def test_packaged_schema_rejects_scores_on_failed_reports():
     payload = _report().to_dict()
     payload["status"] = "scorer_error"
+    payload["valid"] = False
     assert ts.packaged_schema_errors(payload, "score-report")
     with pytest.raises(ts.SchemaError, match="must not carry a score_total"):
         ts.ScoreReport.from_dict(payload)
@@ -225,6 +236,33 @@ def test_score_report_loader_tolerates_free_form_evidence_and_commands():
     assert report.components[0].evidence[0].extra == {"note": "extra"}
     assert report.commands[0].extra == {"stdout_sha256": "a" * 64}
     assert report.to_dict() == payload
+
+
+def test_packaged_score_report_matches_ghostlab_repeatability_contract():
+    payload = _report(
+        repeatability=ts.ScoreRepeatability(
+            runs=3,
+            deterministic_stable=False,
+            unstable_components=["requested_behavior"],
+            max_total_spread=0.25,
+            totals=[0.5, 0.75, 0.5],
+        )
+    ).to_dict()
+
+    ts.validate_packaged(payload, "score-report")
+    assert ts.ScoreReport.from_dict(payload).repeatability is not None
+
+    payload["repeatability"]["unexpected"] = True
+    assert "$.repeatability.unexpected is not an allowed property" in ts.packaged_schema_errors(
+        payload, "score-report"
+    )
+
+
+@pytest.mark.parametrize("field", ["score_total", "pass_threshold", "unscored_weight"])
+def test_packaged_score_report_rejects_non_finite_numbers(field):
+    payload = _report().to_dict()
+    payload[field] = float("nan")
+    assert ts.packaged_schema_errors(payload, "score-report")
 
 
 def test_lint_document_accepts_a_conformant_definition(facts: task_lint.BundleFacts):

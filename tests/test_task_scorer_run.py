@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -159,6 +160,7 @@ def test_solving_agent_scores_and_writes_an_immutable_attempt(published: _Publis
     assert payload["schema_version"] == "retro-benchmark-attempt-v1"
     assert payload["attempt_id"] == attempt.attempt_id
     assert payload["scorer_package_sha256"] == task.scorer_package_sha256
+    assert payload["pass_threshold"] == task.pass_threshold
     parsed = BenchmarkAttempt.from_dict(payload)
     assert parsed.attempt_id == attempt.attempt_id
     for status in ATTEMPT_STATUSES:
@@ -173,6 +175,24 @@ def test_solving_agent_scores_and_writes_an_immutable_attempt(published: _Publis
     )
     assert "model" not in scorer_resources
     assert "agent_id" not in scorer_resources
+    scorer_run = json.loads(
+        (attempt.attempt_dir / "scorer" / "scorer-run.json").read_text(encoding="utf-8")
+    )
+    assert scorer_run["attempt_id"] == attempt.attempt_id
+    assert scorer_run["task_id"] == task.task_id
+    assert scorer_run["status"] == "scored"
+    assert scorer_run["hashes"]["task_sha256"] == task.public_task_sha256
+    assert (
+        scorer_run["hashes"]["scorer_package_sha256"]
+        == task.scorer_package_sha256
+    )
+    assert scorer_run["isolation"] == {
+        "schema_version": "ghostlab-scorer-isolation-v1",
+        "scorer_launcher": "landlock",
+        "candidate_mount": "read_only",
+        "secure_exec_available": True,
+        "judge_launcher": "not_run",
+    }
 
     # The attempt worked in a fresh materialization of the published base bundle.
     assert (attempt.attempt_dir / "workspace" / "src" / "legacy.py").is_file()
@@ -210,6 +230,24 @@ def test_attempts_are_hash_addressed_and_resume(published: _Published) -> None:
     assert forced.attempt_id == first.attempt_id
 
 
+def test_cached_score_is_not_reused_without_its_bound_private_attestation(
+    published: _Published,
+) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    config = published.run_config()
+    first = run_attempt(published.paths, config, task, published.agent(), 0)
+    private_report = first.attempt_dir / "scorer" / "scorer-run.json"
+    payload = json.loads(private_report.read_text(encoding="utf-8"))
+    payload["attempt_id"] = "stale-attempt"
+    private_report.write_text(json.dumps(payload), encoding="utf-8")
+
+    rerun = run_attempt(published.paths, config, task, published.agent(), 0)
+
+    assert rerun.status == "scored"
+    assert rerun.reused is False
+    assert rerun.attempt_id == first.attempt_id
+
+
 @pytest.mark.parametrize(
     ("artifact_status", "expected"),
     [
@@ -242,6 +280,31 @@ def test_scorer_failure_is_not_an_agent_failure(published: _Published) -> None:
     attempt = run_attempt(published.paths, published.run_config(), task, published.agent(), 0)
     assert attempt.status == "scorer_error"
     assert attempt.score is None
+
+
+def test_misattributed_scorer_failure_is_an_invalid_result(
+    published: _Published, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    published.plan["scorer"] = {"force_status": "scorer_error"}
+    published.write_plan()
+    client = published.client()
+    scorer_run = client.scorer_run
+
+    def misattributed(request):  # noqa: ANN001, ANN202
+        result = scorer_run(request)
+        return replace(result, report={**result.report, "task_id": "wrong-task"})
+
+    monkeypatch.setattr(client, "scorer_run", misattributed)
+    task = verify_published_task(published.paths, published.task_id)
+    attempt = run_attempt(
+        published.paths,
+        published.run_config(ghostlab=client),
+        task,
+        published.agent(),
+        0,
+    )
+    assert attempt.status == "invalid_result"
+    assert "task_id" in (attempt.error or "")
 
 
 def test_scorer_harness_crash_is_a_harness_side_error(published: _Published) -> None:
@@ -329,6 +392,113 @@ def test_score_report_identity_is_cross_checked(
     published.write_plan()
     task = verify_published_task(published.paths, published.task_id)
     attempt = run_attempt(published.paths, published.run_config(), task, published.agent(), 0)
+    assert attempt.status == "invalid_result"
+    assert message in (attempt.error or "")
+
+
+@pytest.mark.parametrize(
+    ("scorer_plan", "message"),
+    [
+        ({"no_run_report": True}, "no trusted scorer-run.json"),
+        (
+            {"isolation_overrides": {"secure_exec_available": False}},
+            "exact GHOSTLAB_SECURE_EXEC",
+        ),
+        (
+            {"isolation_overrides": {"unexpected": True}},
+            "exact GHOSTLAB_SECURE_EXEC",
+        ),
+        (
+            {"run_report_overrides": {"attempt_id": "stale-attempt"}},
+            "attempt_id",
+        ),
+        (
+            {
+                "run_report_overrides": {
+                    "hashes": {
+                        "task_sha256": "0" * 64,
+                        "scorer_package_sha256": "1" * 64,
+                    }
+                }
+            },
+            "task_sha256",
+        ),
+    ],
+)
+def test_evaluation_rejects_untrusted_private_scorer_attestation(
+    published: _Published,
+    scorer_plan: dict[str, Any],
+    message: str,
+) -> None:
+    published.plan["scorer"] = scorer_plan
+    published.write_plan()
+    task = verify_published_task(published.paths, published.task_id)
+
+    attempt = run_attempt(
+        published.paths,
+        published.run_config(),
+        task,
+        published.agent(),
+        0,
+    )
+
+    assert attempt.status == "invalid_result"
+    assert attempt.score is None
+    assert message in (attempt.error or "")
+
+
+def test_evaluation_does_not_accept_a_stale_private_scorer_attestation(
+    published: _Published,
+) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    stale = (
+        published.paths.attempt_dir("eval-1", task.task_id, "candidate-good", 0)
+        / "scorer"
+        / "scorer-run.json"
+    )
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text('{"stale":true}\n', encoding="utf-8")
+    published.plan["scorer"] = {"no_run_report": True}
+    published.write_plan()
+
+    attempt = run_attempt(
+        published.paths,
+        published.run_config(),
+        task,
+        published.agent(),
+        0,
+    )
+
+    assert attempt.status == "invalid_result"
+    assert "no trusted scorer-run.json" in (attempt.error or "")
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"valid": False}, "valid=true"),
+        ({"pass_threshold": 0.7}, "pass_threshold"),
+        ({"unscored_weight": 0.1}, "unscored_weight"),
+    ],
+)
+def test_evaluation_checks_ghostlab_score_metadata(
+    published: _Published,
+    override: dict[str, Any],
+    message: str,
+) -> None:
+    published.plan["scorer"] = {"report_overrides": override}
+    published.write_plan()
+    task = verify_published_task(published.paths, published.task_id)
+
+    attempt = run_attempt(
+        published.paths,
+        published.run_config(),
+        task,
+        published.agent(),
+        0,
+    )
+
     assert attempt.status == "invalid_result"
     assert message in (attempt.error or "")
 
@@ -490,6 +660,25 @@ def test_two_agents_are_scored_independently_in_one_eval(published: _Published) 
     assert good.benchmark_score == pytest.approx(1.0)
     assert bad.benchmark_score == pytest.approx(0.0)
     assert bad.pass_rate == pytest.approx(0.0)
+
+
+def test_historical_report_uses_the_attempt_threshold(published: _Published) -> None:
+    run_agent(published.paths, published.run_config(), published.agent("bad"))
+    public_task_path = (
+        published.paths.task_dir(published.task_id) / "public" / "task.json"
+    )
+    public_task = json.loads(public_task_path.read_text())
+    public_task["scoring"]["pass_threshold"] = 0.0
+    public_task_path.write_text(json.dumps(public_task))
+
+    aggregate = collect_eval_report(published.paths, "eval-1")
+    agent = aggregate.agent("candidate-bad")
+    assert agent is not None
+    assert agent.tasks[0].pass_threshold == pytest.approx(0.8)
+    assert agent.tasks[0].pass_rate == pytest.approx(0.0)
+
+    persisted = json.loads(published.paths.results_path("eval-1").read_text())
+    assert persisted["agents"][0]["tasks"][0]["pass_threshold"] == pytest.approx(0.8)
 
 
 def test_task_source_index_maps_published_tasks(published: _Published) -> None:

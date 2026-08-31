@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 from .schema import (
     PACKAGED_SCHEMAS,
     SCHEMA_ASSET_DIR,
+    SCORER_MODES,
     SchemaError,
     packaged_schema_errors,
 )
@@ -32,6 +33,9 @@ SCORE_REPORT_SCHEMA = "retro-score-report-v1"
 
 ARTIFACT_RUN_REPORT_NAME = "artifact-run.json"
 SCORE_REPORT_NAME = "score-report.json"
+SCORER_RUN_REPORT_NAME = "scorer-run.json"
+GHOSTLAB_SCORER_RUN_SCHEMA = "ghostlab-scorer-run-v1"
+GHOSTLAB_SCORER_ISOLATION_SCHEMA = "ghostlab-scorer-isolation-v1"
 
 #: Packaged JSON Schema assets shipped in ``task_scorer/schemas/``.
 TASK_DEFINITIONS_CONTRACT = "task-definitions"
@@ -464,6 +468,7 @@ class ScorerRunRequest:
     scorer_path: Path
     candidate_path: Path
     output_path: Path
+    attempt_id: str
     trace_path: Path | None = None
     resource_usage_path: Path | None = None
     seed: int = 0
@@ -480,6 +485,7 @@ class ScorerRunResult:
 
     status: str
     report_path: Path
+    run_report_path: Path
     report: dict[str, Any]
     task_sha256: str
     scorer_sha256: str
@@ -527,6 +533,7 @@ class ScorerRunResult:
         return {
             "status": self.status,
             "report_path": str(self.report_path),
+            "run_report_path": str(self.run_report_path),
             "task_sha256": self.task_sha256,
             "scorer_sha256": self.scorer_sha256,
             "candidate_sha256": self.candidate_sha256,
@@ -686,6 +693,9 @@ class GhostlabCli:
         agent_config_sha256 = sha256_file(request.agent_config)
         prompt_sha256 = sha256_file(request.prompt_file)
         workspace_local_sha256 = sha256_path(request.workspace)
+        output_contract_sha256 = (
+            sha256_file(request.output_contract) if request.output_contract else None
+        )
 
         argv = [
             self.binary,
@@ -754,9 +764,7 @@ class GhostlabCli:
                     for spec in request.exports
                 ],
                 "export_workspace": request.export_workspace,
-                "output_contract_sha256": (
-                    sha256_file(request.output_contract) if request.output_contract else None
-                ),
+                "output_contract_sha256": output_contract_sha256,
                 "sandbox_image": request.sandbox_image,
                 "setup_commands": [list(command) for command in request.setup_commands],
                 "extra_args": list(request.extra_args),
@@ -764,11 +772,17 @@ class GhostlabCli:
             }
         )
 
+        report_path = run_dir / ARTIFACT_RUN_REPORT_NAME
+        expected_outputs = [report_path]
+        expected_outputs.extend(
+            _run_output_path(run_dir, name, argv) for name in request.declared_exports()
+        )
+        _clear_expected_outputs(expected_outputs, argv=argv, run_dir=run_dir)
+
         merged_env = {**self.env, **dict(request.env)}
         outcome = self._runner(argv, timeout, merged_env, self.cwd)
         _persist_streams(run_dir, request.label, outcome)
 
-        report_path = run_dir / ARTIFACT_RUN_REPORT_NAME
         if outcome.timed_out and not report_path.exists():
             raise GhostlabTimeoutError(
                 f"ghostlab artifact-run exceeded the {timeout:.0f}s adapter deadline",
@@ -805,14 +819,6 @@ class GhostlabCli:
                 run_dir=run_dir,
                 hint=f"expected one of {sorted(ARTIFACT_RUN_STATUSES)}",
             )
-
-        workspace_after_sha256 = sha256_path(request.workspace)
-        if workspace_after_sha256 != workspace_local_sha256:
-            raise GhostlabContractError(
-                "ghostlab artifact-run mutated the caller's workspace instead of its sandbox copy",
-                argv=argv,
-                run_dir=run_dir,
-            )
         if status == "completed":
             missing_hashes = [
                 key
@@ -826,6 +832,53 @@ class GhostlabCli:
                     argv=argv,
                     run_dir=run_dir,
                 )
+            missing_input_hashes = [
+                key
+                for key in ("agent_config_sha256", "prompt_sha256")
+                if not isinstance(report.get(key), str) or not report.get(key)
+            ]
+            if missing_input_hashes:
+                raise GhostlabContractError(
+                    "completed artifact-run report is missing required input hashes: "
+                    + ", ".join(missing_input_hashes),
+                    argv=argv,
+                    run_dir=run_dir,
+                )
+        for key, expected in (
+            ("agent_config_sha256", agent_config_sha256),
+            ("prompt_sha256", prompt_sha256),
+        ):
+            actual = report.get(key)
+            if actual is not None and actual != expected:
+                raise GhostlabContractError(
+                    f"artifact-run report {key}={actual!r} does not match "
+                    f"the current input hash {expected}",
+                    argv=argv,
+                    run_dir=run_dir,
+                )
+
+        workspace_after_sha256 = sha256_path(request.workspace)
+        if workspace_after_sha256 != workspace_local_sha256:
+            raise GhostlabContractError(
+                "ghostlab artifact-run mutated the caller's workspace instead of its sandbox copy",
+                argv=argv,
+                run_dir=run_dir,
+            )
+        _require_unchanged_input(
+            request.agent_config, agent_config_sha256, "agent config", argv, run_dir, excludes=()
+        )
+        _require_unchanged_input(
+            request.prompt_file, prompt_sha256, "prompt file", argv, run_dir, excludes=()
+        )
+        if request.output_contract is not None and output_contract_sha256 is not None:
+            _require_unchanged_input(
+                request.output_contract,
+                output_contract_sha256,
+                "output contract",
+                argv,
+                run_dir,
+                excludes=(),
+            )
         exports, export_sha256 = self._collect_exports(request, report, run_dir, argv, status)
 
         events_value = report.get("events_path")
@@ -876,15 +929,26 @@ class GhostlabCli:
             _require_file(request.trace_path, "candidate trace")
         if request.resource_usage_path is not None:
             _require_file(request.resource_usage_path, "resource usage")
+        if not isinstance(request.attempt_id, str) or not request.attempt_id.strip():
+            raise GhostlabContractError(
+                "scorer-run attempt_id must be a non-empty string",
+                hint="pass the Retro-generated attempt id through --attempt-id",
+            )
 
         output_path = request.output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         run_dir = request.run_dir or output_path.parent
         run_dir.mkdir(parents=True, exist_ok=True)
+        run_report_path = run_dir / SCORER_RUN_REPORT_NAME
 
         task_sha256 = sha256_file(request.task_path)
         scorer_sha256 = sha256_path(request.scorer_path.parent, excludes=())
         candidate_sha256 = sha256_path(request.candidate_path)
+        trace_sha256 = sha256_file(request.trace_path) if request.trace_path else None
+        resource_usage_sha256 = (
+            sha256_file(request.resource_usage_path) if request.resource_usage_path else None
+        )
+        attempt_id = request.attempt_id
 
         argv = [
             self.binary,
@@ -897,14 +961,15 @@ class GhostlabCli:
             str(request.candidate_path),
             "--output",
             str(output_path),
+            "--attempt-id",
+            attempt_id,
         ]
         if request.trace_path is not None:
             argv.extend(["--trace", str(request.trace_path)])
         if request.resource_usage_path is not None:
-            argv.extend(["--resource-usage", str(request.resource_usage_path)])
+            argv.extend(["--resources", str(request.resource_usage_path)])
         argv.extend(["--seed", str(request.seed)])
-        if request.run_dir is not None:
-            argv.extend(["--run-dir", str(request.run_dir)])
+        argv.extend(["--run-dir", str(run_dir)])
         argv.extend(request.extra_args)
 
         timeout = (
@@ -925,14 +990,19 @@ class GhostlabCli:
                 "task_sha256": task_sha256,
                 "scorer_sha256": scorer_sha256,
                 "candidate_sha256": candidate_sha256,
-                "trace_sha256": sha256_file(request.trace_path) if request.trace_path else None,
-                "resource_usage_sha256": (
-                    sha256_file(request.resource_usage_path) if request.resource_usage_path else None
-                ),
+                "trace_sha256": trace_sha256,
+                "resource_usage_sha256": resource_usage_sha256,
+                "attempt_id": attempt_id,
                 "seed": request.seed,
                 "extra_args": list(request.extra_args),
                 "timeout_seconds": timeout,
             }
+        )
+
+        _clear_expected_outputs(
+            (output_path, run_report_path),
+            argv=argv,
+            run_dir=run_dir,
         )
 
         merged_env = {**self.env, **dict(request.env)}
@@ -959,6 +1029,33 @@ class GhostlabCli:
                 hint="a crashing scorer must still be reported as status=scorer_error",
             )
 
+        _require_unchanged_input(
+            request.task_path, task_sha256, "public task", argv, run_dir, excludes=()
+        )
+        _require_unchanged_input(
+            request.scorer_path.parent,
+            scorer_sha256,
+            "scorer package",
+            argv,
+            run_dir,
+            excludes=(),
+        )
+        _require_unchanged_input(
+            request.candidate_path, candidate_sha256, "candidate state", argv, run_dir
+        )
+        if request.trace_path is not None and trace_sha256 is not None:
+            _require_unchanged_input(
+                request.trace_path, trace_sha256, "candidate trace", argv, run_dir, excludes=()
+            )
+        if request.resource_usage_path is not None and resource_usage_sha256 is not None:
+            _require_unchanged_input(
+                request.resource_usage_path,
+                resource_usage_sha256,
+                "resource usage",
+                argv,
+                run_dir,
+                excludes=(),
+            )
         report = read_json(output_path, label="score report")
         if not isinstance(report, dict):
             raise GhostlabContractError(
@@ -970,6 +1067,7 @@ class GhostlabCli:
         return ScorerRunResult(
             status=status,
             report_path=output_path,
+            run_report_path=run_report_path,
             report=report,
             task_sha256=task_sha256,
             scorer_sha256=scorer_sha256,
@@ -1025,7 +1123,7 @@ class GhostlabCli:
         exports: dict[str, Path] = {}
         export_sha256: dict[str, str] = {}
         for name in sorted(declared):
-            path = run_dir / name
+            path = _run_output_path(run_dir, name, argv)
             if not path.exists():
                 if name in request.required_exports() and status == "completed":
                     raise GhostlabContractError(
@@ -1047,6 +1145,110 @@ class GhostlabCli:
             exports[name] = path
             export_sha256[name] = digest
         return exports, export_sha256
+
+
+def validate_scorer_run_attestation(
+    path: Path,
+    *,
+    task_id: str,
+    attempt_id: str,
+    status: str,
+    task_sha256: str,
+    scorer_package_sha256: str,
+    mode: str,
+    argv: Sequence[str] = (),
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Validate Ghostlab's private proof that a scorer run was isolated."""
+    context_dir = run_dir or path.parent
+    if path.is_symlink() or not path.is_file():
+        raise GhostlabContractError(
+            f"ghostlab scorer-run wrote no trusted {SCORER_RUN_REPORT_NAME}",
+            argv=argv,
+            run_dir=context_dir,
+            hint="scores require Ghostlab's private scorer isolation attestation",
+        )
+    report = read_json(path, label="Ghostlab scorer-run attestation")
+    if not isinstance(report, Mapping):
+        raise GhostlabContractError(
+            "Ghostlab scorer-run attestation is not a JSON object",
+            argv=argv,
+            run_dir=context_dir,
+        )
+    if report.get("schema_version") != GHOSTLAB_SCORER_RUN_SCHEMA:
+        raise GhostlabContractError(
+            "Ghostlab scorer-run attestation does not declare "
+            f"{GHOSTLAB_SCORER_RUN_SCHEMA!r}",
+            argv=argv,
+            run_dir=context_dir,
+        )
+    for key, expected in (
+        ("task_id", task_id),
+        ("attempt_id", attempt_id),
+        ("status", status),
+    ):
+        actual = report.get(key)
+        if actual != expected:
+            raise GhostlabContractError(
+                f"Ghostlab scorer-run attestation {key}={actual!r} does not match "
+                f"the current run {expected!r}",
+                argv=argv,
+                run_dir=context_dir,
+            )
+
+    hashes = report.get("hashes")
+    if not isinstance(hashes, Mapping):
+        raise GhostlabContractError(
+            "Ghostlab scorer-run attestation has no input hashes",
+            argv=argv,
+            run_dir=context_dir,
+        )
+    for key, expected in (
+        ("task_sha256", task_sha256),
+        ("scorer_package_sha256", scorer_package_sha256),
+    ):
+        actual = hashes.get(key)
+        if actual != expected:
+            raise GhostlabContractError(
+                f"Ghostlab scorer-run attestation {key}={actual!r} does not match "
+                f"the current input hash {expected}",
+                argv=argv,
+                run_dir=context_dir,
+            )
+
+    if mode not in SCORER_MODES:
+        raise GhostlabContractError(
+            f"cannot validate scorer isolation for unsupported mode {mode!r}",
+            argv=argv,
+            run_dir=context_dir,
+        )
+    isolation = report.get("isolation")
+    required = {
+        "schema_version": GHOSTLAB_SCORER_ISOLATION_SCHEMA,
+        "scorer_launcher": "landlock",
+        "candidate_mount": "read_only",
+        "secure_exec_available": True,
+    }
+    expected_keys = set(required) | {"judge_launcher"}
+    if mode == "deterministic":
+        allowed_judge_launchers = {"not_run"}
+    elif mode == "judge" or status == "scored":
+        allowed_judge_launchers = {"landlock"}
+    else:
+        allowed_judge_launchers = {"landlock", "not_run"}
+    if (
+        not isinstance(isolation, Mapping)
+        or set(isolation) != expected_keys
+        or any(isolation.get(key) != value for key, value in required.items())
+        or isolation.get("judge_launcher") not in allowed_judge_launchers
+    ):
+        raise GhostlabContractError(
+            "Ghostlab scorer-run lacks the exact GHOSTLAB_SECURE_EXEC isolation "
+            f"attestation required for mode {mode!r} and status {status!r}",
+            argv=argv,
+            run_dir=context_dir,
+        )
+    return dict(isolation)
 
 
 def validate_score_report_contract(
@@ -1078,12 +1280,38 @@ def validate_score_report_contract(
             run_dir=run_dir,
             hint=f"expected one of {sorted(SCORE_REPORT_STATUSES)}",
         )
+    valid = report.get("valid")
+    if not isinstance(valid, bool):
+        raise GhostlabContractError(
+            "score report valid must be a boolean",
+            argv=argv,
+            run_dir=run_dir,
+        )
+    for key in ("score_total", "pass_threshold", "unscored_weight"):
+        value = report.get(key)
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or not 0.0 <= float(value) <= 1.0
+        ):
+            raise GhostlabContractError(
+                f"score report {key} must be a finite number within [0, 1] or null",
+                argv=argv,
+                run_dir=run_dir,
+            )
     if status != "scored" and report.get("score_total") is not None:
         raise GhostlabContractError(
             f"score report status={status} must not carry score_total",
             argv=argv,
             run_dir=run_dir,
             hint="harness and scorer failures are never converted to a numeric zero",
+        )
+    if status != "scored" and valid:
+        raise GhostlabContractError(
+            f"score report status={status} must carry valid=false",
+            argv=argv,
+            run_dir=run_dir,
         )
     return status
 
@@ -1142,6 +1370,79 @@ def _persist_streams(run_dir: Path, label: str, outcome: CommandOutcome) -> None
             atomic_write_text(run_dir / f"{safe}.{suffix}.log", stream)
 
 
+def _run_output_path(run_dir: Path, name: str, argv: Sequence[str]) -> Path:
+    relative = Path(name)
+    if not name or relative.is_absolute() or ".." in relative.parts:
+        raise GhostlabContractError(
+            f"Ghostlab output name must stay within the run directory: {name!r}",
+            argv=argv,
+            run_dir=run_dir,
+        )
+    path = run_dir / relative
+    try:
+        root = run_dir.resolve()
+        resolved_parent = path.parent.resolve(strict=False)
+    except OSError as exc:
+        raise GhostlabContractError(
+            f"could not resolve Ghostlab output path {path}: {exc}",
+            argv=argv,
+            run_dir=run_dir,
+        ) from exc
+    if path == run_dir or (resolved_parent != root and root not in resolved_parent.parents):
+        raise GhostlabContractError(
+            f"Ghostlab output name escapes the run directory: {name!r}",
+            argv=argv,
+            run_dir=run_dir,
+        )
+    return path
+
+
+def _clear_expected_outputs(
+    paths: Iterable[Path], *, argv: Sequence[str], run_dir: Path
+) -> None:
+    for path in dict.fromkeys(paths):
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            raise GhostlabInvocationError(
+                f"could not clear previous Ghostlab output {path}: {exc}",
+                argv=argv,
+                run_dir=run_dir,
+                hint="remove the stale output or choose a writable run directory",
+            ) from exc
+
+
+def _require_unchanged_input(
+    path: Path,
+    expected_sha256: str,
+    label: str,
+    argv: Sequence[str],
+    run_dir: Path,
+    *,
+    excludes: Sequence[str] = DEFAULT_TREE_EXCLUDES,
+) -> None:
+    try:
+        actual_sha256 = sha256_path(path, excludes=excludes)
+    except (GhostlabError, OSError) as exc:
+        raise GhostlabContractError(
+            f"Ghostlab {label} became unreadable during invocation: {path}",
+            argv=argv,
+            run_dir=run_dir,
+        ) from exc
+    if actual_sha256 != expected_sha256:
+        raise GhostlabContractError(
+            f"Ghostlab {label} changed during invocation; refusing output not bound "
+            "to the hashed inputs",
+            argv=argv,
+            run_dir=run_dir,
+        )
+
+
 def iter_export_specs(values: Iterable[str]) -> tuple[ExportSpec, ...]:
     return tuple(ExportSpec.parse(value) for value in values)
 
@@ -1152,7 +1453,10 @@ __all__ = [
     "ARTIFACT_RUN_STATUSES",
     "DEFAULT_TIMEOUT_SECONDS",
     "DEFAULT_TREE_EXCLUDES",
+    "GHOSTLAB_SCORER_ISOLATION_SCHEMA",
+    "GHOSTLAB_SCORER_RUN_SCHEMA",
     "SCORER_AUDIT_CONTRACT",
+    "SCORER_RUN_REPORT_NAME",
     "SCORE_INPUT_SCHEMA",
     "SCORE_REPORT_CONTRACT",
     "SCORE_REPORT_NAME",
@@ -1186,5 +1490,6 @@ __all__ = [
     "schema_path",
     "tree_manifest",
     "validate_score_report_contract",
+    "validate_scorer_run_attestation",
     "write_json",
 ]

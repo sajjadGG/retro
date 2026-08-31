@@ -57,17 +57,22 @@ def tree_hash(root):
 def scorer_package_hash(root):
     root = Path(root)
     manifest = json.loads((root / "scorer.json").read_text())
-    files = []
+    entries = []
     for path in sorted(root.rglob("*")):
-        if path.is_file() and path.name != "scorer.json":
-            files.append([path.relative_to(root).as_posix(), sha256_file(path)])
-    payload = {
-        "scorer_json": {
-            key: value for key, value in manifest.items() if key != "package_sha256"
-        },
-        "files": files,
-    }
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root).as_posix()
+        if relative == "scorer.json":
+            payload = {
+                key: value for key, value in manifest.items() if key != "package_sha256"
+            }
+            digest = hashlib.sha256(
+                json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        else:
+            digest = sha256_file(path)
+        entries.append({"path": relative, "kind": "file", "sha256": digest})
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
@@ -194,6 +199,7 @@ def artifact_run(argv):
     }
     for field in entry.get("omit_report_fields", []):
         report.pop(field, None)
+    report.update(entry.get("report_overrides", {}))
     (run_dir / "artifact-run.json").write_text(json.dumps(report, indent=2, sort_keys=True))
     return int(entry.get("process_exit", 0))
 
@@ -205,7 +211,8 @@ def scorer_run(argv):
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--trace")
-    parser.add_argument("--resource-usage")
+    parser.add_argument("--resources")
+    parser.add_argument("--attempt-id", required=True)
     parser.add_argument("--seed", default="0")
     parser.add_argument("--run-dir")
     args = parser.parse_args(argv)
@@ -219,21 +226,50 @@ def scorer_run(argv):
     scorer_json = Path(args.scorer)
     manifest = json.loads(scorer_json.read_text())
     package_sha256 = scorer_package_hash(scorer_json.parent)
-    resource_usage = (
-        json.loads(Path(args.resource_usage).read_text())
-        if args.resource_usage and Path(args.resource_usage).is_file()
-        else {}
-    )
-    attempt_id = resource_usage.get("attempt_id") or entry.get("attempt_id") or "fake"
+    attempt_id = args.attempt_id
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    def write_run_record(report):
+        if not args.run_dir or entry.get("no_run_report"):
+            return
+        run_dir = Path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        isolation = {
+            "schema_version": "ghostlab-scorer-isolation-v1",
+            "scorer_launcher": "landlock",
+            "candidate_mount": "read_only",
+            "secure_exec_available": True,
+            "judge_launcher": (
+                "landlock"
+                if manifest.get("mode") in ("judge", "hybrid", "agentic")
+                else "not_run"
+            ),
+        }
+        isolation.update(entry.get("isolation_overrides", {}))
+        record = {
+            "schema_version": "ghostlab-scorer-run-v1",
+            "task_id": manifest["task_id"],
+            "attempt_id": attempt_id,
+            "status": report["status"],
+            "hashes": {
+                "scorer_package_sha256": package_sha256,
+                "task_sha256": sha256_file(Path(args.task)),
+            },
+            "isolation": isolation,
+        }
+        record.update(entry.get("run_report_overrides", {}))
+        (run_dir / "scorer-run.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True)
+        )
+
     if entry.get("force_status"):
-        output.write_text(json.dumps({
+        report = {
             "schema_version": "retro-score-report-v1",
             "task_id": manifest["task_id"],
             "attempt_id": attempt_id,
             "status": entry["force_status"],
+            "valid": False,
             "components": [],
             "hard_gate_failures": [],
             "commands": [],
@@ -241,7 +277,9 @@ def scorer_run(argv):
             "warnings": [],
             "scorer_package_sha256": package_sha256,
             "duration_ms": 5,
-        }, indent=2, sort_keys=True))
+        }
+        output.write_text(json.dumps(report, indent=2, sort_keys=True))
+        write_run_record(report)
         return 0
 
     scratch = Path(tempfile.mkdtemp(prefix="fake-scorer-"))
@@ -266,7 +304,7 @@ def scorer_run(argv):
         "repo_path": str(repo),
         "task_path": str(inputs / "task.json"),
         "trace_path": args.trace,
-        "resource_usage_path": args.resource_usage,
+        "resource_usage_path": args.resources,
         "seed": int(args.seed),
     }, indent=2, sort_keys=True))
 
@@ -292,6 +330,7 @@ def scorer_run(argv):
             "task_id": manifest["task_id"],
             "attempt_id": attempt_id,
             "status": "scorer_error",
+            "valid": False,
             "components": [],
             "hard_gate_failures": [],
             "commands": [{"argv": command, "exit_code": result.returncode, "duration_ms": 1}],
@@ -303,8 +342,24 @@ def scorer_run(argv):
     else:
         report = json.loads(report_path.read_text())
     report["scorer_package_sha256"] = package_sha256
+    if report.get("status") == "scored":
+        threshold = float(manifest.get("pass_threshold", 0.8))
+        unscored_weight = sum(
+            float(component.get("weight", 0.0))
+            for component in report.get("components", [])
+            if component.get("value") is None
+        )
+        report["valid"] = unscored_weight <= 0.2 + 1e-9
+        report["pass_threshold"] = threshold
+        report["unscored_weight"] = round(unscored_weight, 6)
+        report["passed"] = bool(
+            report["valid"]
+            and not report.get("hard_gate_failures")
+            and float(report.get("score_total", 0.0)) + 1e-9 >= threshold
+        )
     report.update(entry.get("report_overrides", {}))
     output.write_text(json.dumps(report, indent=2, sort_keys=True))
+    write_run_record(report)
     return 0
 
 
@@ -393,6 +448,9 @@ def main():
         "status": "scored",
         "score_total": round(total, 6),
         "passed": bool(not failures and total >= 0.8),
+        "valid": True,
+        "pass_threshold": 0.8,
+        "unscored_weight": 0.0,
         "components": components,
         "hard_gate_failures": failures,
         "commands": [],

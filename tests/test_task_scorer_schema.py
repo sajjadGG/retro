@@ -214,6 +214,10 @@ def test_scorer_manifest_requires_unit_weights_and_pinned_judge():
     hybrid["judge"]["criteria"] = ["regression_suite"]
     assert ts.ScorerManifest.from_dict(hybrid).judge is not None
 
+    hybrid["judge"]["criteria"] = []
+    with pytest.raises(ts.SchemaError, match="non-empty judge criteria"):
+        ts.ScorerManifest.from_dict(hybrid)
+
     agentic = _scorer_payload(mode="agentic")
     with pytest.raises(ts.SchemaError, match="requires a pinned judge"):
         ts.ScorerManifest.from_dict(agentic)
@@ -226,6 +230,44 @@ def test_scorer_runtime_locks_network_and_mount():
         ts.ScorerManifest.from_dict(payload)
     payload["runtime"] = {"image": "sha256:" + "c" * 64, "candidate_mount": "read_write"}
     with pytest.raises(ts.SchemaError, match="candidate_mount"):
+        ts.ScorerManifest.from_dict(payload)
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    [
+        ["python3", "/candidate/repo/tests.py"],
+        ["sh", "-c", "python /candidate/repo/tests.py"],
+        ["python3", "${GHOSTLAB_CANDIDATE_ROOT}/tests.py"],
+        ["python3", "/sandbox/mount-candidate/candidate/repo/tests.py"],
+    ],
+)
+def test_scorer_manifest_rejects_candidate_entrypoints(entrypoint):
+    with pytest.raises(ts.SchemaError, match="not candidate code"):
+        ts.ScorerManifest.from_dict(_scorer_payload(entrypoint=entrypoint))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("pass_threshold", float("nan")),
+        ("pass_threshold", float("inf")),
+    ],
+)
+def test_scorer_manifest_rejects_non_finite_numbers(field, value):
+    payload = _scorer_payload()
+    payload[field] = value
+    with pytest.raises(ts.SchemaError, match="finite"):
+        ts.ScorerManifest.from_dict(payload)
+
+    payload = _scorer_payload()
+    payload["components"][0]["weight"] = value
+    with pytest.raises(ts.SchemaError, match="finite"):
+        ts.ScorerManifest.from_dict(payload)
+
+    payload = _scorer_payload()
+    payload["components"][0]["range"] = [0.0, value]
+    with pytest.raises(ts.SchemaError, match="finite"):
         ts.ScorerManifest.from_dict(payload)
 
 
@@ -297,8 +339,11 @@ def _report(**overrides) -> ts.ScoreReport:
         "attempt_id": "attempt-1",
         "status": "scored",
         "scorer_package_sha256": "d" * 64,
+        "valid": True,
         "score_total": 0.87,
         "passed": True,
+        "pass_threshold": 0.8,
+        "unscored_weight": 0.0,
         "components": [_component()],
     }
     payload.update(overrides)
@@ -312,8 +357,11 @@ def test_score_report_status_rules():
 
     errored = _report(
         status="scorer_error",
+        valid=False,
         score_total=None,
         passed=None,
+        pass_threshold=None,
+        unscored_weight=None,
         components=[],
         warnings=["scorer crashed"],
     )
@@ -323,7 +371,7 @@ def test_score_report_status_rules():
     assert ts.ScoreReport.from_dict(errored.to_dict()) == errored
 
     with pytest.raises(ts.SchemaError, match="must not carry a score_total"):
-        _report(status="scorer_error", passed=None, components=[])
+        _report(status="scorer_error", valid=False, passed=None, components=[])
     with pytest.raises(ts.SchemaError, match="must carry score_total"):
         _report(score_total=None)
     with pytest.raises(ts.SchemaError, match="must carry passed"):
@@ -335,6 +383,46 @@ def test_score_report_accepts_prefixed_package_hash_and_rejects_junk():
     assert report.scorer_package_sha256 == "d" * 64
     with pytest.raises(ts.SchemaError, match="scorer_package_sha256"):
         _report(scorer_package_sha256="not-a-hash")
+
+
+def test_score_report_round_trips_ghostlab_runtime_fields():
+    repeatability = ts.ScoreRepeatability(
+        runs=2,
+        deterministic_stable=True,
+        unstable_components=[],
+        max_total_spread=0.0,
+        totals=[0.87, 0.87],
+    )
+    report = _report(
+        valid=False,
+        unscored_weight=0.2,
+        repeatability=repeatability,
+    )
+
+    payload = report.to_dict()
+    assert payload["valid"] is False
+    assert payload["pass_threshold"] == pytest.approx(0.8)
+    assert payload["unscored_weight"] == pytest.approx(0.2)
+    assert payload["repeatability"]["runs"] == 2
+    assert ts.ScoreReport.from_dict(payload) == report
+
+
+@pytest.mark.parametrize("field", ["score_total", "pass_threshold", "unscored_weight"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_score_report_rejects_non_finite_runtime_fields(field, value):
+    with pytest.raises(ts.SchemaError, match="finite"):
+        _report(**{field: value})
+
+
+def test_score_repeatability_rejects_non_finite_values():
+    with pytest.raises(ts.SchemaError, match="finite"):
+        ts.ScoreRepeatability(
+            runs=2,
+            deterministic_stable=False,
+            unstable_components=["requested_behavior"],
+            max_total_spread=float("nan"),
+            totals=[0.5, 0.5],
+        )
 
 
 def test_unscored_hard_gate_is_a_gate_failure():

@@ -24,6 +24,7 @@ def _report(**overrides: Any) -> dict[str, Any]:
         "schema_version": "retro-score-report-v1",
         "task_id": "t1",
         "attempt_id": "a1",
+        "scorer_package_sha256": "c" * 64,
         "status": "scored",
         "score_total": 0.86,
         "passed": True,
@@ -94,6 +95,7 @@ def _attempt(
     score: float | None = 1.0,
     **extra: Any,
 ) -> AttemptRecord:
+    threshold = extra.get("pass_threshold", 0.8)
     payload: dict[str, Any] = {
         "attempt_id": f"{task_id}-{agent_id}-{seed}",
         "task_id": task_id,
@@ -102,8 +104,12 @@ def _attempt(
         "seed": seed,
         "status": status,
         "score": score,
-        "passed": bool(score is not None and score >= 0.8),
-        "pass_threshold": 0.8,
+        "passed": (
+            bool(score >= threshold)
+            if status == "scored" and score is not None
+            else None
+        ),
+        "pass_threshold": threshold,
         "tokens": {"input": 1000, "output": 200},
         "wall_time_ms": 60000,
         "cost_usd": 0.05,
@@ -249,6 +255,36 @@ def test_report_identity_must_match_current_attempt(
     assert any(message in error for error in result.errors)
 
 
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("task_id", "expected-task"),
+        ("attempt_id", "expected-attempt"),
+        ("scorer_package_sha256", "e" * 64),
+    ],
+)
+def test_failure_report_identity_is_validated_before_status_branching(
+    field: str, expected: str
+) -> None:
+    report = _report(
+        status="scorer_error",
+        score_total=None,
+        passed=None,
+        components=[],
+    )
+    result = validate_score_report(
+        report,
+        expected_task_id=expected if field == "task_id" else "t1",
+        expected_attempt_id=expected if field == "attempt_id" else "a1",
+        expected_scorer_package_sha256=(
+            expected if field == "scorer_package_sha256" else "c" * 64
+        ),
+    )
+    assert result.valid is False
+    assert any(field in error for error in result.errors)
+    assert result.score_total is None
+
+
 @pytest.mark.parametrize("field", ["score_total", "component"])
 def test_report_rejects_non_finite_numbers(field: str) -> None:
     report = _report()
@@ -346,16 +382,15 @@ def test_invalid_results_are_excluded_from_numbers_but_counted() -> None:
 
 def test_seed_spread_and_pass_rate_use_the_task_threshold() -> None:
     attempts = [
-        _attempt("t1", "src-a", "agent", 0, score=1.0),
-        _attempt("t1", "src-a", "agent", 1, score=0.5),
-        _attempt("t1", "src-a", "agent", 2, score=0.0),
+        _attempt("t1", "src-a", "agent", 0, score=1.0, pass_threshold=0.4),
+        _attempt("t1", "src-a", "agent", 1, score=0.5, pass_threshold=0.4),
+        _attempt("t1", "src-a", "agent", 2, score=0.0, pass_threshold=0.4),
     ]
-    aggregate = aggregate_attempts(
-        attempts, name="pilot", eval_id="e1", task_thresholds={"t1": 0.4}
-    )
+    aggregate = aggregate_attempts(attempts, name="pilot", eval_id="e1")
     agent = aggregate.agent("agent")
     assert agent is not None
     task = agent.tasks[0]
+    assert task.pass_threshold == pytest.approx(0.4)
     assert task.mean_score == pytest.approx(0.5)
     assert task.std_score == pytest.approx(0.408248, abs=1e-5)
     assert task.pass_rate == pytest.approx(2 / 3)
@@ -533,6 +568,42 @@ def test_aggregation_rejects_incompatible_evaluation_fingerprints(
         aggregate_attempts(attempts)
 
 
+def test_aggregation_rejects_inconsistent_persisted_thresholds() -> None:
+    attempts = [
+        _attempt("t1", "src", "agent-a", 0, score=0.7, pass_threshold=0.6),
+        _attempt("t1", "src", "agent-b", 0, score=0.7, pass_threshold=0.8),
+    ]
+    with pytest.raises(ValueError, match="pass threshold provenance"):
+        aggregate_attempts(attempts)
+
+
+def test_external_threshold_cannot_override_persisted_provenance() -> None:
+    attempts = [_attempt("t1", "src", "agent", 0, score=0.7, pass_threshold=0.8)]
+    with pytest.raises(ValueError, match="does not match immutable attempt provenance"):
+        aggregate_attempts(attempts, task_thresholds={"t1": 0.6})
+
+
+def test_aggregation_rejects_missing_persisted_threshold() -> None:
+    payload = _payload(_attempt("t1", "src", "agent", 0))
+    payload.pop("pass_threshold")
+    record = AttemptRecord.from_mapping(payload)
+    with pytest.raises(ValueError, match="pass threshold provenance"):
+        aggregate_attempts([record])
+
+
+def test_loading_legacy_attempt_without_threshold_requires_rerun(tmp_path: Path) -> None:
+    task_id = "a" * 20
+    directory = tmp_path / "attempts" / task_id / "agent" / "seed-0"
+    directory.mkdir(parents=True)
+    payload = _payload(_attempt(task_id, "src", "agent", 0))
+    payload["schema_version"] = "retro-benchmark-attempt-v1"
+    payload.pop("pass_threshold")
+    (directory / "attempt.json").write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="legacy attempts.*must be rerun"):
+        load_attempts(tmp_path)
+
+
 def test_scored_status_without_score_is_not_valid() -> None:
     record = AttemptRecord.from_mapping(
         {
@@ -541,6 +612,7 @@ def test_scored_status_without_score_is_not_valid() -> None:
             "agent_id": "agent",
             "seed": 0,
             "status": "scored",
+            "pass_threshold": 0.8,
             "agent_config_sha256": "a" * 64,
             "base_bundle_sha256": "b" * 64,
             "scorer_package_sha256": "c" * 64,

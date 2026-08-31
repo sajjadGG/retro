@@ -9,6 +9,7 @@
     "task_id",
     "attempt_id",
     "status",
+    "valid",
     "components",
     "hard_gate_failures",
     "commands",
@@ -30,8 +31,19 @@
         "judge_unavailable"
       ]
     },
-    "score_total": {"type": "number", "minimum": 0, "maximum": 1},
-    "passed": {"type": "boolean"},
+    "score_total": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "passed": {"type": ["boolean", "null"]},
+    "valid": {"type": "boolean"},
+    "pass_threshold": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "unscored_weight": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
     "components": {
       "type": "array",
       "items": {
@@ -67,7 +79,36 @@
     "judge": {"type": ["object", "null"]},
     "warnings": {"type": "array", "items": {"type": "string"}},
     "scorer_package_sha256": {"type": "string", "minLength": 1},
-    "duration_ms": {"type": "integer", "minimum": 0}
+    "duration_ms": {"type": "integer", "minimum": 0},
+    "repeatability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs",
+        "deterministic_stable",
+        "unstable_components",
+        "max_total_spread",
+        "totals"
+      ],
+      "properties": {
+        "runs": {"type": "integer", "minimum": 2},
+        "deterministic_stable": {"type": "boolean"},
+        "unstable_components": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "max_total_spread": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "totals": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    }
   },
   "allOf": [
     {
@@ -84,8 +125,9 @@
       },
       "else": {
         "properties": {
-          "score_total": false,
-          "passed": false
+          "score_total": {"type": "null"},
+          "passed": {"type": "null"},
+          "valid": {"const": false}
         }
       }
     }

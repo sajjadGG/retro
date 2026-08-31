@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
@@ -219,6 +220,8 @@ def _number(
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise SchemaError(f"{where}.{key} must be a number")
     number = float(value)
+    if not math.isfinite(number):
+        raise SchemaError(f"{where}.{key} must be finite")
     if minimum is not None and number < minimum:
         raise SchemaError(f"{where}.{key} must be >= {minimum}, got {number}")
     if maximum is not None and number > maximum:
@@ -358,7 +361,11 @@ def _json_type_matches(value: Any, expected: str) -> bool:
     if expected == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
     if expected == "boolean":
         return isinstance(value, bool)
     if expected == "null":
@@ -1284,6 +1291,8 @@ class ScorerComponent:
         for value in range_values:
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise SchemaError(f"{where}.range entries must be numbers")
+            if not math.isfinite(float(value)):
+                raise SchemaError(f"{where}.range entries must be finite")
         return cls(
             id=_string(payload, "id", where),
             kind=_string(payload, "kind", where),
@@ -1325,7 +1334,14 @@ class ScorerRuntime:
         payload = _mapping(data, where)
         _known_keys(
             payload,
-            ("image", "network", "timeout_seconds", "cpu", "memory_mb", "candidate_mount"),
+            (
+                "image",
+                "network",
+                "timeout_seconds",
+                "cpu",
+                "memory_mb",
+                "candidate_mount",
+            ),
             where,
         )
         return cls(
@@ -1400,6 +1416,16 @@ class ScorerManifest:
             raise SchemaError(f"scorer.mode must be one of {SCORER_MODES}, got {self.mode!r}")
         if not self.entrypoint:
             raise SchemaError("scorer.entrypoint must be a non-empty argument array")
+        if any(
+            token == "/candidate"
+            or "/candidate/" in token
+            or "GHOSTLAB_CANDIDATE_ROOT" in token
+            or "mount-candidate" in token
+            for token in self.entrypoint
+        ):
+            raise SchemaError(
+                "scorer.entrypoint must execute packaged scorer code, not candidate code"
+            )
         if not self.components:
             raise SchemaError("scorer.components must not be empty")
         ids = [component.id for component in self.components]
@@ -1415,6 +1441,8 @@ class ScorerManifest:
         if judge_needed and not judge_enabled:
             raise SchemaError(f"scorer mode {self.mode!r} requires a pinned judge configuration")
         if judge_enabled and self.judge is not None:
+            if judge_needed and not self.judge.criteria:
+                raise SchemaError(f"scorer mode {self.mode!r} requires non-empty judge criteria")
             declared = {component.id for component in self.components}
             missing = sorted(set(self.judge.criteria) - declared)
             if missing:
@@ -1590,8 +1618,22 @@ class ScoreComponentResult:
     evidence: list[ScoreEvidence] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        if self.value is not None and not 0.0 <= self.value <= 1.0:
-            raise SchemaError(f"component {self.id!r} value must be within [0, 1]")
+        if (
+            isinstance(self.weight, bool)
+            or not isinstance(self.weight, (int, float))
+            or not math.isfinite(float(self.weight))
+            or not 0.0 <= float(self.weight) <= 1.0
+        ):
+            raise SchemaError(f"component {self.id!r} weight must be finite and within [0, 1]")
+        if self.value is not None and (
+            isinstance(self.value, bool)
+            or not isinstance(self.value, (int, float))
+            or not math.isfinite(float(self.value))
+            or not 0.0 <= float(self.value) <= 1.0
+        ):
+            raise SchemaError(
+                f"component {self.id!r} value must be finite and within [0, 1]"
+            )
 
     @property
     def scored(self) -> bool:
@@ -1669,19 +1711,118 @@ class CommandRecord:
 
 
 @dataclass(frozen=True)
+class ScoreRepeatability:
+    runs: int
+    deterministic_stable: bool
+    unstable_components: list[str]
+    max_total_spread: float
+    totals: list[float]
+
+    def __post_init__(self) -> None:
+        if isinstance(self.runs, bool) or not isinstance(self.runs, int) or self.runs < 2:
+            raise SchemaError("score_report.repeatability.runs must be an integer >= 2")
+        if not isinstance(self.deterministic_stable, bool):
+            raise SchemaError(
+                "score_report.repeatability.deterministic_stable must be a boolean"
+            )
+        if any(not isinstance(item, str) for item in self.unstable_components):
+            raise SchemaError(
+                "score_report.repeatability.unstable_components must contain strings"
+            )
+        if (
+            isinstance(self.max_total_spread, bool)
+            or not isinstance(self.max_total_spread, (int, float))
+            or not math.isfinite(float(self.max_total_spread))
+            or not 0.0 <= float(self.max_total_spread) <= 1.0
+        ):
+            raise SchemaError(
+                "score_report.repeatability.max_total_spread must be finite and within [0, 1]"
+            )
+        if len(self.totals) < 2 or any(
+            isinstance(total, bool)
+            or not isinstance(total, (int, float))
+            or not math.isfinite(float(total))
+            or not 0.0 <= float(total) <= 1.0
+            for total in self.totals
+        ):
+            raise SchemaError(
+                "score_report.repeatability.totals must contain at least two finite "
+                "numbers within [0, 1]"
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "runs": self.runs,
+            "deterministic_stable": self.deterministic_stable,
+            "unstable_components": list(self.unstable_components),
+            "max_total_spread": float(self.max_total_spread),
+            "totals": [float(total) for total in self.totals],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any, where: str) -> ScoreRepeatability:
+        payload = _mapping(data, where)
+        _known_keys(
+            payload,
+            (
+                "runs",
+                "deterministic_stable",
+                "unstable_components",
+                "max_total_spread",
+                "totals",
+            ),
+            where,
+        )
+        raw_totals = _list(payload, "totals", where)
+        totals: list[float] = []
+        for index, value in enumerate(raw_totals):
+            totals.append(
+                _number(
+                    {"value": value},
+                    "value",
+                    f"{where}.totals[{index}]",
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            )
+        return cls(
+            runs=_integer(payload, "runs", where, minimum=2),
+            deterministic_stable=_bool(payload, "deterministic_stable", where),
+            unstable_components=_string_list(
+                payload,
+                "unstable_components",
+                where,
+                allow_empty_items=True,
+            ),
+            max_total_spread=_number(
+                payload,
+                "max_total_spread",
+                where,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            totals=totals,
+        )
+
+
+@dataclass(frozen=True)
 class ScoreReport:
     task_id: str
     attempt_id: str
     status: str
     scorer_package_sha256: str
+    valid: bool
     score_total: float | None = None
     passed: bool | None = None
+    pass_threshold: float | None = None
+    unscored_weight: float | None = None
     components: list[ScoreComponentResult] = field(default_factory=list)
     hard_gate_failures: list[str] = field(default_factory=list)
     commands: list[CommandRecord] = field(default_factory=list)
     judge: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
     duration_ms: int = 0
+    repeatability: ScoreRepeatability | None = None
 
     def __post_init__(self) -> None:
         require_task_id(self.task_id, "score_report.task_id")
@@ -1689,16 +1830,38 @@ class ScoreReport:
             raise SchemaError(
                 f"score_report.status must be one of {SCORE_STATUSES}, got {self.status!r}"
             )
+        if not isinstance(self.valid, bool):
+            raise SchemaError("score_report.valid must be a boolean")
+        for name, value in (
+            ("pass_threshold", self.pass_threshold),
+            ("unscored_weight", self.unscored_weight),
+        ):
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise SchemaError(f"score_report.{name} must be finite and within [0, 1]")
         if self.status == "scored":
             if self.score_total is None:
                 raise SchemaError("scored reports must carry score_total")
-            if not 0.0 <= self.score_total <= 1.0:
-                raise SchemaError("score_total must be within [0, 1]")
+            if (
+                isinstance(self.score_total, bool)
+                or not isinstance(self.score_total, (int, float))
+                or not math.isfinite(float(self.score_total))
+                or not 0.0 <= float(self.score_total) <= 1.0
+            ):
+                raise SchemaError("score_total must be finite and within [0, 1]")
             if self.passed is None:
                 raise SchemaError("scored reports must carry passed")
+            if not isinstance(self.passed, bool):
+                raise SchemaError("scored report passed must be a boolean")
             if not self.components:
                 raise SchemaError("scored reports must carry component results")
         else:
+            if self.valid:
+                raise SchemaError(f"status {self.status!r} must carry valid=false")
             if self.score_total is not None:
                 raise SchemaError(f"status {self.status!r} must not carry a score_total")
             if self.passed is not None:
@@ -1722,6 +1885,7 @@ class ScoreReport:
             "task_id": self.task_id,
             "attempt_id": self.attempt_id,
             "status": self.status,
+            "valid": self.valid,
         }
         if self.status == "scored":
             payload["score_total"] = self.score_total
@@ -1737,6 +1901,12 @@ class ScoreReport:
                 "duration_ms": self.duration_ms,
             }
         )
+        if self.pass_threshold is not None:
+            payload["pass_threshold"] = self.pass_threshold
+        if self.unscored_weight is not None:
+            payload["unscored_weight"] = self.unscored_weight
+        if self.repeatability is not None:
+            payload["repeatability"] = self.repeatability.to_dict()
         return payload
 
     @classmethod
@@ -1752,6 +1922,9 @@ class ScoreReport:
                 "status",
                 "score_total",
                 "passed",
+                "valid",
+                "pass_threshold",
+                "unscored_weight",
                 "components",
                 "hard_gate_failures",
                 "commands",
@@ -1759,6 +1932,7 @@ class ScoreReport:
                 "warnings",
                 "scorer_package_sha256",
                 "duration_ms",
+                "repeatability",
             ),
             where,
         )
@@ -1774,6 +1948,11 @@ class ScoreReport:
         judge_payload = payload.get("judge")
         if judge_payload is not None and not isinstance(judge_payload, Mapping):
             raise SchemaError(f"{where}.judge must be an object or null")
+        repeatability_payload = payload.get("repeatability")
+        if repeatability_payload is not None and not isinstance(
+            repeatability_payload, Mapping
+        ):
+            raise SchemaError(f"{where}.repeatability must be an object")
         components = [
             ScoreComponentResult.from_dict(item, f"{where}.components[{index}]")
             for index, item in enumerate(
@@ -1790,8 +1969,31 @@ class ScoreReport:
             task_id=_string(payload, "task_id", where),
             attempt_id=_string(payload, "attempt_id", where),
             status=_string(payload, "status", where),
+            valid=_bool(payload, "valid", where),
             score_total=total,
             passed=passed,
+            pass_threshold=(
+                None
+                if payload.get("pass_threshold") is None
+                else _number(
+                    payload,
+                    "pass_threshold",
+                    where,
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            ),
+            unscored_weight=(
+                None
+                if payload.get("unscored_weight") is None
+                else _number(
+                    payload,
+                    "unscored_weight",
+                    where,
+                    minimum=0.0,
+                    maximum=1.0,
+                )
+            ),
             components=components,
             hard_gate_failures=_string_list(payload, "hard_gate_failures", where)
             if "hard_gate_failures" in payload
@@ -1805,6 +2007,14 @@ class ScoreReport:
             duration_ms=_integer(payload, "duration_ms", where, minimum=0)
             if "duration_ms" in payload
             else 0,
+            repeatability=(
+                ScoreRepeatability.from_dict(
+                    repeatability_payload,
+                    f"{where}.repeatability",
+                )
+                if repeatability_payload is not None
+                else None
+            ),
         )
 
 
@@ -2175,6 +2385,7 @@ __all__ = [
     "ScoreEvidence",
     "ScoreInput",
     "ScoreReport",
+    "ScoreRepeatability",
     "ScoreTotal",
     "ScorerBrief",
     "ScorerComponent",

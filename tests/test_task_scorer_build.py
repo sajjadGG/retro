@@ -24,6 +24,7 @@ from retro.benchmarks.task_scorer.build import (
     StageStore,
     TasksetPaths,
     _assert_public_clean,
+    _load_isolation_attestation,
     build_source,
     build_sources,
     coerce_lint_outcome,
@@ -60,6 +61,7 @@ from tests.task_scorer_harness import (
 )
 
 SOURCE_ID = "codex__019abc"
+PACKAGE_TASK_ID = "a" * 20
 
 
 class _Fixture:
@@ -67,6 +69,7 @@ class _Fixture:
         self.tmp_path = tmp_path
         self.paths = TasksetPaths(root=tmp_path / "bench" / "pilot" / "task-scorer", name="pilot")
         self.source_root = make_source_bundle(self.paths.sources_dir(), SOURCE_ID)
+        self.write_bundle_report()
         self.task_id = compute_task_id(SOURCE_ID, BASE_TREE, "replay", TASK_PROMPT)
         self.definer_out = make_definer_outputs(tmp_path / "out" / "definer", SOURCE_ID)
         self.builder_out = make_builder_outputs(tmp_path / "out" / "builder", self.task_id)
@@ -89,6 +92,38 @@ class _Fixture:
         )
         self.auditor_agent = make_agent_config(
             tmp_path / "agents" / "auditor.json", "retro-scorer-auditor-v1", "auditor-model"
+        )
+
+    def write_bundle_report(self, source_ids: list[str] | None = None) -> None:
+        selected = [SOURCE_ID] if source_ids is None else source_ids
+        sources = []
+        for source_id in selected:
+            path = self.paths.source_dir(source_id)
+            manifest = json.loads((path / "manifest.json").read_text())
+            sources.append(
+                {
+                    "source_id": source_id,
+                    "host": "codex",
+                    "session_id": source_id.split("__")[-1],
+                    "status": "bundled",
+                    "path": str(path),
+                    "content_sha256": manifest["content_sha256"],
+                    "code": None,
+                    "detail": "",
+                }
+            )
+        write_json(
+            self.paths.bundle_report_path(),
+            {
+                "schema_version": "retro-taskset-bundles-v1",
+                "name": self.paths.name,
+                "sources": sources,
+                "counts": {
+                    "bundled": len(sources),
+                    "skipped": 0,
+                    "by_status": {"bundled": len(sources)},
+                },
+            },
         )
 
     def write_plan(self) -> None:
@@ -116,6 +151,40 @@ def fixture(tmp_path: Path) -> _Fixture:
     return _Fixture(tmp_path)
 
 
+def configure_judge_only_scorer(fixture: _Fixture) -> None:
+    package = fixture.builder_out / "scorer"
+    scorer = json.loads((package / "scorer.json").read_text())
+    scorer["mode"] = "judge"
+    scorer["judge"] = {
+        "enabled": True,
+        "agent_config": "/scorer/judge-agent.json",
+        "prompt": "/scorer/judge.prompt.md",
+        "output_schema": "/scorer/judge.schema.json",
+        "criteria": ["regression_suite"],
+    }
+    write_json(package / "scorer.json", scorer)
+    write_json(
+        package / "judge-agent.json",
+        {
+            "id": "retro-residual-judge-v1",
+            "runtime": {
+                "backend": "opencode",
+                "model": "judge-model",
+                "instructions": ["judge.prompt.md"],
+                "tools": {"bash": False, "webfetch": False},
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "external_directory": "deny",
+                },
+            },
+            "inputs": {"skills": [], "mcps": [], "assets": []},
+        },
+    )
+    write_text(package / "judge.prompt.md", "judge\n")
+    write_json(package / "judge.schema.json", {"type": "object"})
+
+
 def test_task_id_is_content_addressed_and_prompt_normalized() -> None:
     assert normalize_prompt("  Add   a\n greet\thelper  ") == "Add a greet helper"
     first = compute_task_id("src-1", "tree-1", "replay", " Add a  helper ")
@@ -139,6 +208,104 @@ def test_unpack_bundle_rejects_escaping_archive_links(tmp_path: Path) -> None:
 
     with pytest.raises(StageFailure, match="escaping link"):
         unpack_bundle(archive_path, tmp_path / "destination")
+
+
+def test_unpack_bundle_streams_regular_files_without_extractall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive_path = tmp_path / "bundle.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        content = b"safe\n"
+        member = tarfile.TarInfo("nested/file.txt")
+        member.size = len(content)
+        archive.addfile(member, io.BytesIO(content))
+
+    def forbidden(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("bulk tar APIs must not be used")
+
+    monkeypatch.setattr(tarfile.TarFile, "getmembers", forbidden)
+    monkeypatch.setattr(tarfile.TarFile, "extractall", forbidden)
+
+    destination = unpack_bundle(archive_path, tmp_path / "destination")
+    assert (destination / "nested" / "file.txt").read_bytes() == b"safe\n"
+
+
+def test_unpack_bundle_rejects_writes_through_an_archive_symlink(tmp_path: Path) -> None:
+    archive_path = tmp_path / "symlink-traversal.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        directory = tarfile.TarInfo("real")
+        directory.type = tarfile.DIRTYPE
+        archive.addfile(directory)
+        link = tarfile.TarInfo("alias")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "real"
+        archive.addfile(link)
+        content = b"must not be written through a link"
+        nested = tarfile.TarInfo("alias/file.txt")
+        nested.size = len(content)
+        archive.addfile(nested, io.BytesIO(content))
+
+    destination = tmp_path / "destination"
+    with pytest.raises(StageFailure, match="traverses symlink"):
+        unpack_bundle(archive_path, destination)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("member_type", [tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE])
+def test_unpack_bundle_rejects_special_files(tmp_path: Path, member_type: bytes) -> None:
+    archive_path = tmp_path / "special.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        member = tarfile.TarInfo("special")
+        member.type = member_type
+        archive.addfile(member)
+
+    with pytest.raises(StageFailure, match="special file"):
+        unpack_bundle(archive_path, tmp_path / "destination")
+
+
+def test_unpack_bundle_allows_only_prior_regular_file_hard_links(tmp_path: Path) -> None:
+    safe_archive = tmp_path / "safe-hardlink.tar"
+    with tarfile.open(safe_archive, "w") as archive:
+        content = b"safe\n"
+        original = tarfile.TarInfo("original.txt")
+        original.size = len(content)
+        archive.addfile(original, io.BytesIO(content))
+        link = tarfile.TarInfo("copy.txt")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "original.txt"
+        archive.addfile(link)
+    destination = unpack_bundle(safe_archive, tmp_path / "safe")
+    assert (destination / "copy.txt").read_bytes() == b"safe\n"
+
+    unsafe_archive = tmp_path / "forward-hardlink.tar"
+    with tarfile.open(unsafe_archive, "w") as archive:
+        link = tarfile.TarInfo("copy.txt")
+        link.type = tarfile.LNKTYPE
+        link.linkname = "later.txt"
+        archive.addfile(link)
+        content = b"late\n"
+        later = tarfile.TarInfo("later.txt")
+        later.size = len(content)
+        archive.addfile(later, io.BytesIO(content))
+    with pytest.raises(StageFailure, match="earlier regular file"):
+        unpack_bundle(unsafe_archive, tmp_path / "unsafe")
+
+
+def test_unpack_bundle_preserves_safe_leaf_symlinks(tmp_path: Path) -> None:
+    archive_path = tmp_path / "safe-symlink.tar"
+    with tarfile.open(archive_path, "w") as archive:
+        content = b"safe\n"
+        original = tarfile.TarInfo("target.txt")
+        original.size = len(content)
+        archive.addfile(original, io.BytesIO(content))
+        link = tarfile.TarInfo("alias.txt")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "target.txt"
+        archive.addfile(link)
+
+    destination = unpack_bundle(archive_path, tmp_path / "destination")
+    assert (destination / "alias.txt").is_symlink()
+    assert (destination / "alias.txt").read_bytes() == b"safe\n"
 
 
 def test_full_build_publishes_one_validated_task(fixture: _Fixture) -> None:
@@ -175,6 +342,13 @@ def test_full_build_publishes_one_validated_task(fixture: _Fixture) -> None:
 
     validation = json.loads((task_dir / "private" / "scorer-validation.json").read_text())
     assert validation["passed"] is True
+    assert validation["isolation_attestation"] == {
+        "schema_version": "ghostlab-scorer-isolation-v1",
+        "scorer_launcher": "landlock",
+        "candidate_mount": "read_only",
+        "secure_exec_available": True,
+        "judge_launcher": "not_run",
+    }
     by_kind = {case["kind"]: case for case in validation["cases"]}
     assert set(by_kind) == {
         "base",
@@ -202,6 +376,209 @@ def test_full_build_publishes_one_validated_task(fixture: _Fixture) -> None:
     assert provenance["source_id"] == SOURCE_ID
     assert provenance["audit"]["decision"] == "accept"
     assert provenance["ghostlab"]["version"] == "9.9.9-fake"
+
+
+def test_build_rejects_missing_secure_exec_attestation(fixture: _Fixture) -> None:
+    fixture.plan["scorer"] = {
+        "isolation_overrides": {"secure_exec_available": False}
+    }
+    fixture.write_plan()
+
+    result = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert result.published_task_ids == ()
+    rejection = next(item for item in result.rejections if item.task_id == fixture.task_id)
+    assert rejection.stage == "scorer_validated"
+    assert rejection.code == "SCORER_UNSAFE"
+    assert "GHOSTLAB_SECURE_EXEC" in rejection.detail
+
+
+def test_failed_hybrid_run_accepts_attested_scorer_before_judge_started(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    task_sha256 = "a" * 64
+    package_sha256 = "b" * 64
+    write_json(
+        run_dir / "scorer-run.json",
+        {
+            "schema_version": "ghostlab-scorer-run-v1",
+            "task_id": PACKAGE_TASK_ID,
+            "attempt_id": "attempt-1",
+            "status": "scorer_error",
+            "hashes": {
+                "task_sha256": task_sha256,
+                "scorer_package_sha256": package_sha256,
+            },
+            "isolation": {
+                "schema_version": "ghostlab-scorer-isolation-v1",
+                "scorer_launcher": "landlock",
+                "candidate_mount": "read_only",
+                "secure_exec_available": True,
+                "judge_launcher": "not_run",
+            },
+        },
+    )
+
+    attestation = _load_isolation_attestation(
+        run_dir,
+        task_id=PACKAGE_TASK_ID,
+        attempt_id="attempt-1",
+        status="scorer_error",
+        task_sha256=task_sha256,
+        package_sha256=package_sha256,
+        mode="hybrid",
+    )
+    assert attestation["judge_launcher"] == "not_run"
+
+
+def test_judge_only_build_requires_private_landlock_attestation(
+    fixture: _Fixture,
+) -> None:
+    configure_judge_only_scorer(fixture)
+
+    result = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert result.published_task_ids == (fixture.task_id,)
+    validation = json.loads(
+        (
+            fixture.paths.task_dir(fixture.task_id)
+            / "private"
+            / "scorer-validation.json"
+        ).read_text()
+    )
+    assert validation["isolation_attestation"] == {
+        "schema_version": "ghostlab-scorer-isolation-v1",
+        "scorer_launcher": "landlock",
+        "candidate_mount": "read_only",
+        "secure_exec_available": True,
+        "judge_launcher": "landlock",
+    }
+
+
+@pytest.mark.parametrize(
+    ("scorer_plan", "detail"),
+    [
+        (
+            {"isolation_overrides": {"judge_launcher": "not_run"}},
+            "GHOSTLAB_SECURE_EXEC",
+        ),
+        ({"run_report_overrides": {"isolation": None}}, "GHOSTLAB_SECURE_EXEC"),
+        (
+            {"run_report_overrides": {"attempt_id": "another-attempt"}},
+            "does not match the current run",
+        ),
+        (
+            {
+                "run_report_overrides": {
+                    "hashes": {
+                        "task_sha256": "0" * 64,
+                        "scorer_package_sha256": "0" * 64,
+                    }
+                }
+            },
+            "does not match the current input hash",
+        ),
+    ],
+)
+def test_judge_only_build_rejects_missing_or_unbound_attestation(
+    fixture: _Fixture,
+    scorer_plan: dict[str, Any],
+    detail: str,
+) -> None:
+    configure_judge_only_scorer(fixture)
+    fixture.plan["scorer"] = scorer_plan
+    fixture.write_plan()
+
+    result = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert result.published_task_ids == ()
+    rejection = next(item for item in result.rejections if item.task_id == fixture.task_id)
+    assert rejection.stage == "scorer_validated"
+    assert rejection.code == "SCORER_UNSAFE"
+    assert detail in rejection.detail
+
+
+def test_judge_only_cached_validation_has_no_attestation_bypass(
+    fixture: _Fixture,
+) -> None:
+    configure_judge_only_scorer(fixture)
+    first = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+    private_report = (
+        fixture.paths.build_task_dir(first.build_id, fixture.task_id)
+        / "scorer-validation"
+        / "runs"
+        / "base-0"
+        / "scorer-run.json"
+    )
+    private_report.unlink()
+
+    second = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert second.published_task_ids == ()
+    rejection = next(item for item in second.rejections if item.task_id == fixture.task_id)
+    assert rejection.stage == "scorer_validated"
+    assert rejection.code == "SCORER_UNSAFE"
+
+
+def test_build_rejects_isolation_attestation_for_another_scorer(
+    fixture: _Fixture,
+) -> None:
+    fixture.plan["scorer"] = {
+        "run_report_overrides": {
+            "hashes": {"scorer_package_sha256": "0" * 64}
+        }
+    }
+    fixture.write_plan()
+
+    result = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert result.published_task_ids == ()
+    rejection = next(item for item in result.rejections if item.task_id == fixture.task_id)
+    assert rejection.code == "SCORER_UNSAFE"
+    assert "does not match the current input hash" in rejection.detail
+
+
+def test_cached_validation_cannot_bypass_secure_exec_attestation(
+    fixture: _Fixture,
+) -> None:
+    first = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+    cached = (
+        fixture.paths.build_task_dir(first.build_id, fixture.task_id)
+        / "scorer-validation"
+        / "scorer-validation.json"
+    )
+    payload = json.loads(cached.read_text())
+    payload["isolation_attestation"]["secure_exec_available"] = False
+    write_json(cached, payload)
+
+    second = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert second.published_task_ids == ()
+    rejection = next(item for item in second.rejections if item.task_id == fixture.task_id)
+    assert rejection.stage == "scorer_validated"
+    assert rejection.code == "SCORER_UNSAFE"
+
+
+def test_cached_validation_reverifies_private_ghostlab_attestations(
+    fixture: _Fixture,
+) -> None:
+    first = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+    private_report = (
+        fixture.paths.build_task_dir(first.build_id, fixture.task_id)
+        / "scorer-validation"
+        / "runs"
+        / "base-0"
+        / "scorer-run.json"
+    )
+    private_report.unlink()
+
+    second = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
+
+    assert second.published_task_ids == ()
+    rejection = next(item for item in second.rejections if item.task_id == fixture.task_id)
+    assert rejection.stage == "scorer_validated"
+    assert rejection.code == "SCORER_UNSAFE"
 
 
 def test_build_rejects_source_without_validated_environment(fixture: _Fixture) -> None:
@@ -558,8 +935,8 @@ def test_selection_rejection_short_circuits_the_build(fixture: _Fixture) -> None
 
 
 def test_scorer_package_validation_enforces_the_manifest(tmp_path: Path) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123")
-    manifest, package_sha256, warnings = validate_scorer_package(package, "task123")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
+    manifest, package_sha256, warnings = validate_scorer_package(package, PACKAGE_TASK_ID)
     assert manifest["mode"] == "deterministic"
     assert len(package_sha256) == 64
     assert warnings == []
@@ -568,9 +945,55 @@ def test_scorer_package_validation_enforces_the_manifest(tmp_path: Path) -> None
     payload["components"][0]["weight"] = 0.5
     (package / "scorer.json").write_text(json.dumps(payload))
     with pytest.raises(StageFailure) as excinfo:
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
     assert excinfo.value.code == "BUILDER_CONTRACT_ERROR"
-    assert "weights sum to" in excinfo.value.detail
+    assert "weights must sum to" in excinfo.value.detail
+
+
+@pytest.mark.parametrize(
+    ("mutation", "detail"),
+    [
+        ({"unexpected": True}, "unknown keys"),
+        ({"mode": []}, "mode="),
+        ({"mode": {}}, "mode="),
+        (
+            {
+                "runtime": {
+                    "image": "sha256:" + "c" * 64,
+                    "network": "disabled",
+                    "candidate_mount": "read_only",
+                    "unexpected": True,
+                }
+            },
+            "runtime has unknown keys",
+        ),
+        ({"entrypoint": ["python3", 7]}, "must be a string"),
+        (
+            {
+                "components": [
+                    {
+                        "id": "requested_behavior",
+                        "kind": "invented",
+                        "weight": 1.0,
+                        "hard_gate": True,
+                    }
+                ]
+            },
+            "component.kind",
+        ),
+    ],
+)
+def test_scorer_package_uses_the_canonical_manifest_parser(
+    tmp_path: Path, mutation: dict[str, Any], detail: str
+) -> None:
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
+    payload = json.loads((package / "scorer.json").read_text())
+    payload.update(mutation)
+    write_json(package / "scorer.json", payload)
+
+    with pytest.raises(StageFailure, match=detail) as excinfo:
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+    assert excinfo.value.code == "BUILDER_CONTRACT_ERROR"
 
 
 @pytest.mark.parametrize(
@@ -584,42 +1007,42 @@ def test_scorer_package_validation_enforces_the_manifest(tmp_path: Path) -> None
 def test_scorer_package_rejects_unsafe_runtime(
     tmp_path: Path, field: str, value: str, detail: str
 ) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
     payload = json.loads((package / "scorer.json").read_text())
     payload["runtime"][field] = value
     write_json(package / "scorer.json", payload)
 
     with pytest.raises(StageFailure) as excinfo:
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
 
     assert excinfo.value.code == "SCORER_UNSAFE"
     assert detail in excinfo.value.detail
 
 
 def test_scorer_package_rejects_hybrid_without_pinned_judge(tmp_path: Path) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123", mode="hybrid")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
     with pytest.raises(StageFailure) as excinfo:
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
     assert "pinned judge.agent_config" in excinfo.value.detail
 
 
 def test_scorer_package_safety_scan_rejects_oracle_references(tmp_path: Path) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
     write_text(package / "helper.py", "ORACLE = 'repo/outcome/src/feature.py'\n")
     with pytest.raises(StageFailure) as excinfo:
         validate_scorer_package(
-            package, "task123", forbidden_substrings=("repo/outcome",)
+            package, PACKAGE_TASK_ID, forbidden_substrings=("repo/outcome",)
         )
     assert excinfo.value.code == "SCORER_UNSAFE"
 
 
 def test_scorer_package_hash_mismatch_is_rejected(tmp_path: Path) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
     payload = json.loads((package / "scorer.json").read_text())
     payload["package_sha256"] = "0" * 64
     (package / "scorer.json").write_text(json.dumps(payload))
     with pytest.raises(StageFailure) as excinfo:
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
     assert excinfo.value.code == "BUILDER_CONTRACT_ERROR"
     assert "differs from Retro's computed" in excinfo.value.detail
 
@@ -849,6 +1272,33 @@ def test_build_taskset_discovers_sources_and_writes_a_report(fixture: _Fixture) 
     assert payload["schema_version"] == "retro-taskset-build-v1"
     assert payload["published_task_ids"] == [fixture.task_id]
     assert payload["sources"][0]["source_id"] == SOURCE_ID
+
+
+def test_default_build_uses_only_sources_in_the_active_bundle_report(
+    fixture: _Fixture,
+) -> None:
+    stale_id = "codex__stale"
+    make_source_bundle(fixture.paths.sources_dir(), stale_id)
+
+    result = build_sources(fixture.paths, fixture.config())
+
+    assert [source.source_id for source in result.sources] == [SOURCE_ID]
+
+
+def test_default_build_rejects_a_stale_bundle_report_checksum(fixture: _Fixture) -> None:
+    payload = json.loads(fixture.paths.bundle_report_path().read_text())
+    payload["sources"][0]["content_sha256"] = "0" * 64
+    write_json(fixture.paths.bundle_report_path(), payload)
+
+    with pytest.raises(BuildConfigurationError, match="active bundle report checksum"):
+        build_sources(fixture.paths, fixture.config())
+
+
+def test_default_build_requires_an_active_bundle_report(fixture: _Fixture) -> None:
+    fixture.paths.bundle_report_path().unlink()
+
+    with pytest.raises(BuildConfigurationError, match="active bundle report is missing"):
+        build_sources(fixture.paths, fixture.config())
 
 
 def test_new_build_atomically_replaces_the_active_task_set(fixture: _Fixture) -> None:
@@ -1116,7 +1566,103 @@ def test_definer_run_passes_the_packaged_contract_to_ghostlab(fixture: _Fixture)
 def default_build_id_for(fixture: _Fixture) -> str:
     from retro.benchmarks.task_scorer.build import default_build_id
 
-    return default_build_id("pilot", fixture.config(), [SOURCE_ID])
+    manifest = json.loads((fixture.source_root / "manifest.json").read_text())
+    return default_build_id(
+        "pilot",
+        fixture.config(),
+        [SOURCE_ID],
+        source_digests={SOURCE_ID: manifest["content_sha256"]},
+    )
+
+
+def test_default_build_id_covers_verified_bundle_digest_and_runtime_policy(
+    fixture: _Fixture,
+) -> None:
+    from retro.benchmarks.task_scorer.build import default_build_id
+
+    digest = json.loads((fixture.source_root / "manifest.json").read_text())[
+        "content_sha256"
+    ]
+
+    def build_id(config: BuildConfig, source_digest: str = digest) -> str:
+        return default_build_id(
+            "pilot",
+            config,
+            [SOURCE_ID],
+            source_digests={SOURCE_ID: source_digest},
+        )
+
+    baseline = build_id(fixture.config())
+    behavior_changes = (
+        {"adjacent_per_replay": 1},
+        {"max_replay_tasks": 2},
+        {"repeatability_runs": 4},
+        {"require_audit": False, "scorer_auditor_agent": None},
+        {"definer_timeout_seconds": 101.0},
+        {"builder_timeout_seconds": 102.0},
+        {"auditor_timeout_seconds": 103.0},
+        {"scorer_timeout_seconds": 104.0},
+        {"forbidden_public_substrings": ("private",)},
+        {"forbidden_scorer_substrings": ("different-policy",)},
+    )
+    assert all(build_id(fixture.config(**change)) != baseline for change in behavior_changes)
+
+    changed_digest = "f" * 64
+    assert build_id(fixture.config(), changed_digest) != baseline
+
+
+def test_default_build_id_requires_complete_verified_source_digests(
+    fixture: _Fixture,
+) -> None:
+    from retro.benchmarks.task_scorer.build import default_build_id
+
+    with pytest.raises(BuildConfigurationError, match="verified source bundle digests"):
+        default_build_id("pilot", fixture.config(), [SOURCE_ID])
+    with pytest.raises(BuildConfigurationError, match="exactly the source ids"):
+        default_build_id(
+            "pilot",
+            fixture.config(),
+            [SOURCE_ID],
+            source_digests={"other": "f" * 64},
+        )
+
+
+def test_default_build_id_hashes_agent_inputs_and_sandbox_policy(
+    fixture: _Fixture,
+) -> None:
+    from retro.benchmarks.task_scorer.build import default_build_id
+
+    skill = fixture.definer_agent.parent / "skills" / "context" / "SKILL.md"
+    skill_script = skill.parent / "scripts" / "context.py"
+    policy = fixture.definer_agent.parent / "policy.yaml"
+    write_text(skill, "first skill\n")
+    write_text(skill_script, "print('first')\n")
+    write_text(policy, "version: 1\n")
+    agent = json.loads(fixture.definer_agent.read_text())
+    agent["inputs"]["skills"] = ["skills/context/SKILL.md"]
+    agent["sandbox"]["policy"] = "policy.yaml"
+    write_json(fixture.definer_agent, agent)
+    digest = json.loads((fixture.source_root / "manifest.json").read_text())[
+        "content_sha256"
+    ]
+
+    def identifier() -> str:
+        return default_build_id(
+            "pilot",
+            fixture.config(),
+            [SOURCE_ID],
+            source_digests={SOURCE_ID: digest},
+        )
+
+    baseline = identifier()
+    write_text(skill, "changed skill\n")
+    assert identifier() != baseline
+    baseline = identifier()
+    write_text(skill_script, "print('changed')\n")
+    assert identifier() != baseline
+    baseline = identifier()
+    write_text(policy, "version: 2\n")
+    assert identifier() != baseline
 
 
 def test_task_definitions_violating_the_packaged_contract_are_rejected(fixture: _Fixture) -> None:
@@ -1175,19 +1721,19 @@ def test_unresolvable_agent_instruction_is_warned(fixture: _Fixture) -> None:
 
 
 def test_judge_mode_scorer_must_ship_its_declared_judge_files(tmp_path: Path) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123", mode="hybrid")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
     payload = json.loads((package / "scorer.json").read_text())
     payload["judge"] = {
         "enabled": True,
         "agent_config": "/scorer/judge-agent.json",
         "prompt": "/scorer/judge.prompt.md",
         "output_schema": "/scorer/judge.schema.json",
-        "criteria": ["project_fit"],
+        "criteria": ["regression_suite"],
     }
     (package / "scorer.json").write_text(json.dumps(payload))
 
     with pytest.raises(StageFailure) as excinfo:
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
     assert "judge.agent_config" in excinfo.value.detail
 
     from retro.benchmarks.task_scorer.build import instruction_text
@@ -1197,7 +1743,9 @@ def test_judge_mode_scorer_must_ship_its_declared_judge_files(tmp_path: Path) ->
         {
             "id": "retro-residual-judge-v1",
             "runtime": {
+                "backend": "opencode",
                 "model": "judge-model",
+                "instructions": ["judge.prompt.md"],
                 "tools": {"bash": False, "webfetch": False},
                 "permission": {
                     "bash": "deny",
@@ -1205,11 +1753,12 @@ def test_judge_mode_scorer_must_ship_its_declared_judge_files(tmp_path: Path) ->
                     "external_directory": "deny",
                 },
             },
+            "inputs": {"skills": [], "mcps": [], "assets": []},
         },
     )
     write_text(package / "judge.prompt.md", instruction_text("residual-judge"))
     write_json(package / "judge.schema.json", {"type": "object"})
-    manifest, _, _ = validate_scorer_package(package, "task123")
+    manifest, _, _ = validate_scorer_package(package, PACKAGE_TASK_ID)
     assert manifest["mode"] == "hybrid"
 
 
@@ -1217,8 +1766,13 @@ def test_judge_mode_scorer_must_ship_its_declared_judge_files(tmp_path: Path) ->
     ("mutation", "detail"),
     [
         ({"model": ""}, "runtime.model"),
+        ({"plugin": ["unsafe"]}, "runtime keys"),
         ({"tools": {"bash": True, "webfetch": False}}, "tools.bash"),
         ({"tools": {"bash": False, "webfetch": True}}, "tools.webfetch"),
+        (
+            {"tools": {"bash": False, "webfetch": False, "read": True}},
+            "runtime.tools keys",
+        ),
         (
             {
                 "permission": {
@@ -1249,12 +1803,23 @@ def test_judge_mode_scorer_must_ship_its_declared_judge_files(tmp_path: Path) ->
             },
             "permission.external_directory",
         ),
+        (
+            {
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "external_directory": "deny",
+                    "read": "allow",
+                }
+            },
+            "runtime.permission keys",
+        ),
     ],
 )
 def test_judge_agent_must_be_pinned_and_read_only(
     tmp_path: Path, mutation: dict[str, Any], detail: str
 ) -> None:
-    package = make_scorer_package(tmp_path / "scorer", "task123", mode="hybrid")
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
     scorer = json.loads((package / "scorer.json").read_text())
     scorer["judge"] = {
         "enabled": True,
@@ -1265,7 +1830,9 @@ def test_judge_agent_must_be_pinned_and_read_only(
     }
     write_json(package / "scorer.json", scorer)
     runtime: dict[str, Any] = {
+        "backend": "opencode",
         "model": "judge-model",
+        "instructions": ["judge.prompt.md"],
         "tools": {"bash": False, "webfetch": False},
         "permission": {
             "bash": "deny",
@@ -1274,9 +1841,175 @@ def test_judge_agent_must_be_pinned_and_read_only(
         },
     }
     runtime.update(mutation)
-    write_json(package / "judge-agent.json", {"runtime": runtime})
+    write_json(
+        package / "judge-agent.json",
+        {"runtime": runtime, "inputs": {"skills": [], "mcps": [], "assets": []}},
+    )
     write_text(package / "judge.prompt.md", "judge\n")
     write_json(package / "judge.schema.json", {"type": "object"})
 
     with pytest.raises(StageFailure, match=detail):
-        validate_scorer_package(package, "task123")
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+
+
+@pytest.mark.parametrize("input_kind", ["mcps", "assets", "skills"])
+def test_judge_agent_rejects_untrusted_composed_inputs(
+    tmp_path: Path, input_kind: str
+) -> None:
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
+    scorer = json.loads((package / "scorer.json").read_text())
+    scorer["judge"] = {
+        "enabled": True,
+        "agent_config": "/scorer/judge-agent.json",
+        "prompt": "/scorer/judge.prompt.md",
+        "output_schema": "/scorer/judge.schema.json",
+        "criteria": ["regression_suite"],
+    }
+    write_json(package / "scorer.json", scorer)
+    write_json(
+        package / "judge-agent.json",
+        {
+            "runtime": {
+                "backend": "opencode",
+                "model": "judge-model",
+                "instructions": ["judge.prompt.md"],
+                "tools": {"bash": False, "webfetch": False},
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "external_directory": "deny",
+                },
+            },
+            "inputs": {"skills": [], "mcps": [], "assets": [], input_kind: ["untrusted"]},
+        },
+    )
+    write_text(package / "judge.prompt.md", "judge\n")
+    write_json(package / "judge.schema.json", {"type": "object"})
+
+    with pytest.raises(StageFailure, match=rf"inputs\.{input_kind} must be empty"):
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+
+
+def test_judge_agent_requires_the_exact_empty_input_shape(tmp_path: Path) -> None:
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
+    scorer = json.loads((package / "scorer.json").read_text())
+    scorer["judge"] = {
+        "enabled": True,
+        "agent_config": "/scorer/judge-agent.json",
+        "prompt": "/scorer/judge.prompt.md",
+        "output_schema": "/scorer/judge.schema.json",
+        "criteria": ["regression_suite"],
+    }
+    write_json(package / "scorer.json", scorer)
+    write_text(package / "judge.prompt.md", "judge\n")
+    write_json(package / "judge.schema.json", {"type": "object"})
+    runtime = {
+        "backend": "opencode",
+        "model": "judge-model",
+        "instructions": ["judge.prompt.md"],
+        "tools": {"bash": False, "webfetch": False},
+        "permission": {
+            "bash": "deny",
+            "edit": "deny",
+            "external_directory": "deny",
+        },
+    }
+    write_json(
+        package / "judge-agent.json",
+        {"runtime": runtime, "inputs": {"skills": [], "mcps": []}},
+    )
+    with pytest.raises(StageFailure, match="inputs keys must exactly equal"):
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+
+
+def test_judge_agent_instructions_must_be_package_hash_covered(tmp_path: Path) -> None:
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="hybrid")
+    scorer = json.loads((package / "scorer.json").read_text())
+    scorer["judge"] = {
+        "enabled": True,
+        "agent_config": "/scorer/judge-agent.json",
+        "prompt": "/scorer/judge.prompt.md",
+        "output_schema": "/scorer/judge.schema.json",
+        "criteria": ["regression_suite"],
+    }
+    write_json(package / "scorer.json", scorer)
+    write_text(package / "judge.prompt.md", "judge\n")
+    write_json(package / "judge.schema.json", {"type": "object"})
+    write_json(
+        package / "judge-agent.json",
+        {
+            "runtime": {
+                "backend": "opencode",
+                "model": "judge-model",
+                "instructions": ["judge.prompt.md"],
+                "tools": {"bash": False, "webfetch": False},
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "external_directory": "deny",
+                },
+            },
+            "inputs": {"skills": [], "mcps": [], "assets": []},
+        },
+    )
+
+    _, before, _ = validate_scorer_package(package, PACKAGE_TASK_ID)
+    write_text(package / "judge.prompt.md", "changed judge prompt\n")
+    _, after, _ = validate_scorer_package(package, PACKAGE_TASK_ID)
+    assert after != before
+
+    write_text(package / "other.prompt.md", "other\n")
+    agent = json.loads((package / "judge-agent.json").read_text())
+    agent["runtime"]["instructions"] = ["other.prompt.md"]
+    write_json(package / "judge-agent.json", agent)
+    with pytest.raises(StageFailure, match="judge.prompt declared by scorer.json"):
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+
+    outside = tmp_path / "outside.md"
+    write_text(outside, "outside\n")
+    agent = json.loads((package / "judge-agent.json").read_text())
+    agent["runtime"]["instructions"] = ["../outside.md"]
+    write_json(package / "judge-agent.json", agent)
+    with pytest.raises(StageFailure, match="escapes the scorer package"):
+        validate_scorer_package(package, PACKAGE_TASK_ID)
+
+
+def test_agentic_judge_uses_the_same_non_executing_judge_floor(tmp_path: Path) -> None:
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID, mode="agentic")
+    scorer = json.loads((package / "scorer.json").read_text())
+    scorer["judge"] = {
+        "enabled": True,
+        "agent_config": "/scorer/judge-agent.json",
+        "prompt": "/scorer/judge.prompt.md",
+        "output_schema": "/scorer/judge.schema.json",
+        "criteria": ["regression_suite"],
+    }
+    write_json(package / "scorer.json", scorer)
+    write_json(
+        package / "judge-agent.json",
+        {
+            "runtime": {
+                "backend": "opencode",
+                "model": "judge-model",
+                "instructions": ["judge.prompt.md"],
+                "tools": {"bash": False, "webfetch": False},
+                "permission": {
+                    "bash": "deny",
+                    "edit": "deny",
+                    "external_directory": "deny",
+                },
+            },
+            "inputs": {"skills": [], "mcps": [], "assets": []},
+        },
+    )
+    write_text(package / "judge.prompt.md", "judge\n")
+    write_json(package / "judge.schema.json", {"type": "object"})
+
+    manifest, _, _ = validate_scorer_package(package, PACKAGE_TASK_ID)
+    assert manifest["mode"] == "agentic"
+
+    agent = json.loads((package / "judge-agent.json").read_text())
+    agent["runtime"]["tools"]["bash"] = True
+    write_json(package / "judge-agent.json", agent)
+    with pytest.raises(StageFailure, match=r"tools\.bash must be False"):
+        validate_scorer_package(package, PACKAGE_TASK_ID)

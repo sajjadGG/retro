@@ -42,6 +42,7 @@ from .build import (
     utc_now,
 )
 from .ghostlab_cli import (
+    SCORER_RUN_REPORT_NAME,
     ArtifactRunRequest,
     GhostlabBinaryError,
     GhostlabCli,
@@ -54,6 +55,7 @@ from .ghostlab_cli import (
     sha256_file,
     sha256_json,
     sha256_path,
+    validate_scorer_run_attestation,
     write_json,
 )
 from .schema import BenchmarkTask, ProjectEnvironment, SchemaError, ScorerManifest
@@ -743,7 +745,22 @@ def run_attempt(
                 and record.agent_id == agent.agent_id
                 and record.seed == seed
             ):
-                return _reuse(payload, attempt_dir)
+                trusted = True
+                if record.status == "scored":
+                    try:
+                        validate_scorer_run_attestation(
+                            attempt_dir / "scorer" / SCORER_RUN_REPORT_NAME,
+                            task_id=task.task_id,
+                            attempt_id=attempt_id,
+                            status="scored",
+                            task_sha256=task.public_task_sha256,
+                            scorer_package_sha256=task.scorer_package_sha256,
+                            mode=str(task.scorer_manifest.get("mode", "")),
+                        )
+                    except GhostlabContractError:
+                        trusted = False
+                if trusted:
+                    return _reuse(payload, attempt_dir)
 
     attempt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -863,6 +880,7 @@ def run_attempt(
                 scorer_path=task.scorer_manifest_path,
                 candidate_path=candidate,
                 output_path=score_report_path,
+                attempt_id=attempt_id,
                 trace_path=trace,
                 resource_usage_path=resources_path,
                 seed=seed,
@@ -870,6 +888,16 @@ def run_attempt(
                 timeout_seconds=effective_scorer_timeout,
                 label="scorer",
             )
+        )
+        validate_scorer_run_attestation(
+            scored.run_report_path,
+            task_id=task.task_id,
+            attempt_id=attempt_id,
+            status=scored.status,
+            task_sha256=task.public_task_sha256,
+            scorer_package_sha256=task.scorer_package_sha256,
+            mode=str(task.scorer_manifest.get("mode", "")),
+            run_dir=scorer_run_dir,
         )
     except GhostlabTimeoutError as exc:
         return failed(
@@ -921,10 +949,34 @@ def run_attempt(
         expected_scorer_package_sha256=task.scorer_package_sha256,
     )
     status = scored.status
+    report_errors = list(validation.errors)
+    if scored.status == "scored":
+        if scored.report.get("valid") is not True:
+            report_errors.append("scored report must carry valid=true")
+        reported_threshold = scored.report.get("pass_threshold")
+        if (
+            isinstance(reported_threshold, bool)
+            or not isinstance(reported_threshold, (int, float))
+            or not math.isfinite(float(reported_threshold))
+            or abs(float(reported_threshold) - task.pass_threshold) > 1e-9
+        ):
+            report_errors.append(
+                "score report pass_threshold does not match the published scorer"
+            )
+        reported_unscored = scored.report.get("unscored_weight")
+        if (
+            isinstance(reported_unscored, bool)
+            or not isinstance(reported_unscored, (int, float))
+            or not math.isfinite(float(reported_unscored))
+            or abs(float(reported_unscored) - validation.unscored_weight) > 1e-9
+        ):
+            report_errors.append(
+                "score report unscored_weight does not match its component results"
+            )
     error: str | None = None
-    if scored.status == "scored" and not validation.valid:
+    if report_errors:
         status = "invalid_result"
-        error = "; ".join(validation.errors)
+        error = "; ".join(report_errors)
 
     return _write_attempt(
         AttemptResult(
@@ -967,6 +1019,15 @@ def _reuse(payload: Mapping[str, Any], attempt_dir: Path) -> AttemptResult:
     )
     score = payload.get("score")
     threshold = payload.get("pass_threshold")
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not math.isfinite(float(threshold))
+    ):
+        raise TaskVerificationError(
+            f"attempt record {attempt_dir / 'attempt.json'} has no valid "
+            "pass_threshold provenance"
+        )
     cost = payload.get("cost_usd")
     created_at = payload.get("created_at")
     return AttemptResult(
@@ -988,10 +1049,7 @@ def _reuse(payload: Mapping[str, Any], attempt_dir: Path) -> AttemptResult:
         ),
         score=float(score) if isinstance(score, (int, float)) and not isinstance(score, bool) else None,
         passed=payload.get("passed") if isinstance(payload.get("passed"), bool) else None,
-        pass_threshold=(
-            float(threshold) if isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
-            else 0.8
-        ),
+        pass_threshold=float(threshold),
         components=components,
         tokens=tokens,
         wall_time_ms=int(payload.get("wall_time_ms") or 0),
@@ -1073,6 +1131,7 @@ def task_source_index(paths: TasksetPaths, task_ids: Sequence[str] | None = None
 
 
 def task_threshold_index(paths: TasksetPaths, task_ids: Sequence[str] | None = None) -> dict[str, float]:
+    """Map current published tasks to thresholds; never use this for historical reports."""
     thresholds: dict[str, float] = {}
     for task_id in task_ids if task_ids is not None else list_published_tasks(paths):
         public = paths.task_dir(task_id) / "public" / "task.json"
@@ -1101,7 +1160,6 @@ def collect_eval_report(
         name=paths.name,
         eval_id=eval_id,
         task_sources=task_source_index(paths),
-        task_thresholds=task_threshold_index(paths),
         token_budgets=token_budgets,
         wall_time_budgets_ms=wall_time_budgets_ms,
         generated_at=utc_now(),

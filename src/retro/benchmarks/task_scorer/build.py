@@ -12,6 +12,8 @@ the previous artifact instead of paying for another Ghostlab run.
 from __future__ import annotations
 
 import importlib
+import inspect
+import json
 import os
 import re
 import shutil
@@ -21,15 +23,22 @@ import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from ...utils import atomic_write_text
 from .aggregate import validate_score_report
-from .bundle import BundleError, verify_bundle
+from .bundle import (
+    BUNDLE_REPORT_SCHEMA,
+    BundleError,
+    compute_content_hash,
+    load_bundle,
+    verify_bundle,
+)
 from .ghostlab_cli import (
     SCORE_REPORT_CONTRACT,
     SCORER_AUDIT_CONTRACT,
+    SCORER_RUN_REPORT_NAME,
     TASK_DEFINITIONS_CONTRACT,
     ArtifactRunRequest,
     ArtifactRunResult,
@@ -44,9 +53,16 @@ from .ghostlab_cli import (
     sha256_json,
     sha256_path,
     sha256_text,
+    validate_scorer_run_attestation,
     write_json,
 )
-from .schema import ProjectEnvironment, SchemaError, compute_task_id, normalize_prompt
+from .schema import (
+    ProjectEnvironment,
+    SchemaError,
+    ScorerManifest,
+    compute_task_id,
+    normalize_prompt,
+)
 
 STAGE_SCHEMA = "retro-taskset-stage-v1"
 SOURCE_BUNDLE_SCHEMA = "retro-source-bundle-v1"
@@ -75,9 +91,19 @@ TASK_STAGES: tuple[str, ...] = STAGES[4:]
 STAGE_INDEX = {stage: index for index, stage in enumerate(STAGES)}
 
 SCORER_MODES = frozenset({"deterministic", "judge", "hybrid", "agentic"})
-JUDGE_MODES = frozenset({"judge", "hybrid", "agentic"})
-
-WEIGHT_SUM_TOLERANCE = 1e-9
+JUDGE_MODES = SCORER_MODES - {"deterministic"}
+# Agentic command execution belongs to Ghostlab's deterministic phase; its
+# credential-bearing residual judge remains subject to the non-executing floor.
+JUDGE_AGENT_TOOL_POLICIES: Mapping[str, Mapping[str, bool]] = {
+    "judge": {"bash": False, "webfetch": False},
+    "hybrid": {"bash": False, "webfetch": False},
+    "agentic": {"bash": False, "webfetch": False},
+}
+JUDGE_AGENT_PERMISSION_POLICIES: Mapping[str, Mapping[str, str]] = {
+    "judge": {"bash": "deny", "edit": "deny", "external_directory": "deny"},
+    "hybrid": {"bash": "deny", "edit": "deny", "external_directory": "deny"},
+    "agentic": {"bash": "deny", "edit": "deny", "external_directory": "deny"},
+}
 
 # Spec section 11.1 required results.
 BASE_MAX_TOTAL = 0.20
@@ -339,6 +365,9 @@ class TasksetPaths:
         return self._delegate("benchmark_taskset_source_dir", source_id) or (
             self.sources_dir() / source_id
         )
+
+    def bundle_report_path(self) -> Path:
+        return self.root / "bundles.json"
 
     def tasks_dir(self) -> Path:
         return self._delegate("benchmark_taskset_tasks_dir") or self.root / "tasks"
@@ -671,6 +700,85 @@ def resolve_lint_fn(module_name: str = "retro.benchmarks.task_scorer.task_lint")
     )
 
 
+def _stable_callable_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _stable_callable_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_callable_value(item) for item in value]
+    if callable(value):
+        return {
+            "callable": (
+                f"{getattr(value, '__module__', type(value).__module__)}:"
+                f"{getattr(value, '__qualname__', type(value).__qualname__)}"
+            )
+        }
+    return {"type": f"{type(value).__module__}:{type(value).__qualname__}"}
+
+
+def _callable_fingerprint(value: Callable[..., Any] | None) -> dict[str, Any]:
+    if value is None:
+        module_object = importlib.import_module("retro.benchmarks.task_scorer.task_lint")
+        target = next(
+            (
+                candidate
+                for name in _LINT_ENTRYPOINTS
+                if callable(candidate := getattr(module_object, name, None))
+            ),
+            None,
+        )
+        if target is None:
+            raise BuildConfigurationError(
+                "retro.benchmarks.task_scorer.task_lint exposes no supported lint callable"
+            )
+    else:
+        target = value
+    target = inspect.unwrap(target)
+    module = getattr(target, "__module__", type(target).__module__)
+    qualname = getattr(target, "__qualname__", type(target).__qualname__)
+    try:
+        source_path = inspect.getsourcefile(target)
+    except TypeError:
+        source_path = None
+    source_sha256 = None
+    if source_path is not None and Path(source_path).is_file():
+        source_sha256 = sha256_file(Path(source_path))
+    code = getattr(target, "__code__", None)
+    implementation_sha256 = (
+        sha256_json(
+            {
+                "bytecode": code.co_code.hex(),
+                "constants": repr(code.co_consts),
+                "names": list(code.co_names),
+                "defaults": _stable_callable_value(getattr(target, "__defaults__", None)),
+                "kwdefaults": _stable_callable_value(getattr(target, "__kwdefaults__", None)),
+                "closure": [
+                    _stable_callable_value(cell.cell_contents)
+                    for cell in (getattr(target, "__closure__", None) or ())
+                ],
+            }
+        )
+        if code is not None
+        else sha256_text(f"{module}:{qualname}")
+    )
+    try:
+        state = vars(target)
+    except TypeError:
+        state = {}
+    return {
+        "callable": f"{module}:{qualname}",
+        "source_sha256": source_sha256,
+        "implementation_sha256": implementation_sha256,
+        "state": _stable_callable_value(state),
+    }
+
+
 @dataclass(frozen=True)
 class BuildConfig:
     """Everything the build state machine needs that is not on disk yet."""
@@ -722,8 +830,32 @@ class BuildConfig:
             "max_replay_tasks": self.max_replay_tasks,
             "repeatability_runs": self.repeatability_runs,
             "require_audit": self.require_audit,
+            "forbidden_public_substrings": list(self.forbidden_public_substrings),
+            "forbidden_scorer_substrings": list(self.forbidden_scorer_substrings),
+            "timeouts": {
+                "definer": self.definer_timeout_seconds,
+                "builder": self.builder_timeout_seconds,
+                "auditor": self.auditor_timeout_seconds,
+                "scorer": self.scorer_timeout_seconds,
+                "ghostlab_default": self.ghostlab.default_timeout_seconds,
+            },
             "ghostlab": self.ghostlab.version().fingerprint(),
+            "ghostlab_invocation": {
+                "cwd": str(self.ghostlab.cwd) if self.ghostlab.cwd else None,
+                "environment_sha256": sha256_json(dict(sorted(self.ghostlab.env.items()))),
+                "runner": _callable_fingerprint(self.ghostlab._runner),
+            },
             "instructions": packaged_instruction_index(),
+            "contracts": {
+                "task_definitions": sha256_file(self.definitions_contract()),
+                "scorer_audit": sha256_file(self.audit_contract()),
+                "score_report": sha256_file(schema_path(SCORE_REPORT_CONTRACT)),
+            },
+            "scorer_sdk": (
+                sha256_path(self.scorer_sdk, excludes=()) if self.scorer_sdk else None
+            ),
+            "lint": _callable_fingerprint(self.lint),
+            "builder_implementation_sha256": sha256_file(Path(__file__)),
         }
 
 
@@ -821,9 +953,151 @@ def is_git_bundle(path: Path) -> bool:
     return any(head.startswith(magic) for magic in _GIT_BUNDLE_MAGICS)
 
 
+def _tar_member_path(root: Path, name: str, *, label: str = "member") -> tuple[PurePosixPath, Path]:
+    relative = PurePosixPath(name)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise StageFailure("HARNESS_ERROR", f"bundle archive {label} {name!r} escapes its destination")
+    parts = tuple(part for part in relative.parts if part not in ("", "."))
+    normalized = PurePosixPath(*parts)
+    return normalized, root.joinpath(*parts)
+
+
+def _assert_no_symlink_parent(root: Path, target: Path, *, member_name: str) -> None:
+    current = root
+    for part in target.relative_to(root).parts[:-1]:
+        current /= part
+        if current.is_symlink():
+            raise StageFailure(
+                "HARNESS_ERROR",
+                f"bundle archive member {member_name!r} traverses symlink {current}",
+            )
+        if current.exists() and not current.is_dir():
+            raise StageFailure(
+                "HARNESS_ERROR",
+                f"bundle archive member {member_name!r} traverses non-directory {current}",
+            )
+
+
+def _safe_tar_link(
+    root: Path,
+    member_path: PurePosixPath,
+    linkname: str,
+    *,
+    symbolic: bool,
+) -> tuple[PurePosixPath, Path]:
+    link = PurePosixPath(linkname)
+    if link.is_absolute():
+        raise StageFailure(
+            "HARNESS_ERROR",
+            f"bundle archive contains an escaping link {member_path.as_posix()!r}",
+        )
+    combined = (member_path.parent / link).parts if symbolic else link.parts
+    normalized: list[str] = []
+    for part in combined:
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not normalized:
+                raise StageFailure(
+                    "HARNESS_ERROR",
+                    f"bundle archive contains an escaping link {member_path.as_posix()!r}",
+                )
+            normalized.pop()
+        else:
+            normalized.append(part)
+    relative = PurePosixPath(*normalized)
+    return relative, root.joinpath(*normalized)
+
+
+def _extract_tar_stream(bundle: Path, destination: Path) -> None:
+    root = destination.resolve()
+    members: dict[str, str] = {}
+    deferred_modes: list[tuple[Path, int]] = []
+    with bundle.open("rb") as source, tarfile.open(fileobj=source, mode="r|*") as archive:
+        for member in archive:
+            relative, target = _tar_member_path(root, member.name)
+            name = relative.as_posix()
+            if not relative.parts:
+                if not member.isdir():
+                    raise StageFailure(
+                        "HARNESS_ERROR", "bundle archive root entry must be a directory"
+                    )
+                continue
+            if name in members:
+                raise StageFailure(
+                    "HARNESS_ERROR", f"bundle archive contains duplicate member {name!r}"
+                )
+            _assert_no_symlink_parent(root, target, member_name=name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            if member.isdir():
+                if target.is_symlink() or (target.exists() and not target.is_dir()):
+                    raise StageFailure(
+                        "HARNESS_ERROR",
+                        f"bundle archive directory {name!r} conflicts with an existing entry",
+                    )
+                target.mkdir(exist_ok=True)
+                members[name] = "directory"
+                deferred_modes.append((target, member.mode & 0o777))
+                continue
+
+            if target.exists() or target.is_symlink():
+                raise StageFailure(
+                    "HARNESS_ERROR",
+                    f"bundle archive member {name!r} conflicts with an existing entry",
+                )
+            if member.isfile():
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise StageFailure(
+                        "HARNESS_ERROR", f"bundle archive cannot read regular file {name!r}"
+                    )
+                with extracted, target.open("xb") as output:
+                    shutil.copyfileobj(extracted, output, length=1024 * 1024)
+                target.chmod(member.mode & 0o777)
+                members[name] = "file"
+                continue
+            if member.issym():
+                _safe_tar_link(root, relative, member.linkname, symbolic=True)
+                os.symlink(member.linkname, target)
+                members[name] = "symlink"
+                continue
+            if member.islnk():
+                link_relative, link_target = _safe_tar_link(
+                    root, relative, member.linkname, symbolic=False
+                )
+                _assert_no_symlink_parent(
+                    root, link_target, member_name=link_relative.as_posix()
+                )
+                if (
+                    members.get(link_relative.as_posix()) != "file"
+                    or link_target.is_symlink()
+                    or not link_target.is_file()
+                ):
+                    raise StageFailure(
+                        "HARNESS_ERROR",
+                        f"bundle archive hard link {name!r} must target an earlier regular file",
+                    )
+                os.link(link_target, target, follow_symlinks=False)
+                members[name] = "file"
+                continue
+            if member.isdev() or member.isfifo():
+                raise StageFailure(
+                    "HARNESS_ERROR", f"bundle archive contains a special file {name!r}"
+                )
+            raise StageFailure(
+                "HARNESS_ERROR",
+                f"bundle archive contains unsupported member type for {name!r}",
+            )
+    for path, mode in reversed(deferred_modes):
+        path.chmod(mode)
+
+
 def unpack_bundle(bundle: Path, destination: Path) -> Path:
     """Materialize a base/oracle bundle into a fresh directory."""
-    if destination.exists():
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        destination.unlink()
+    elif destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True, exist_ok=True)
     if bundle.is_dir():
@@ -842,23 +1116,16 @@ def unpack_bundle(bundle: Path, destination: Path) -> Path:
                 f"git clone of {bundle} failed: {(result.stderr or '').strip()}",
             )
         return destination
-    with tarfile.open(bundle, "r:*") as archive:
-        root = destination.resolve()
-        for member in archive.getmembers():
-            target = (root / member.name).resolve()
-            if target != root and root not in target.parents:
-                raise StageFailure("HARNESS_ERROR", f"bundle {bundle} escapes its destination")
-            if member.isdev() or member.isfifo():
-                raise StageFailure("HARNESS_ERROR", f"bundle {bundle} contains a special file")
-            if member.issym() or member.islnk():
-                link_base = target.parent if member.issym() else root
-                link_target = (link_base / member.linkname).resolve()
-                if link_target != root and root not in link_target.parents:
-                    raise StageFailure(
-                        "HARNESS_ERROR",
-                        f"bundle {bundle} contains an escaping link {member.name}",
-                    )
-        archive.extractall(destination)
+    try:
+        _extract_tar_stream(bundle, destination)
+    except (OSError, tarfile.TarError) as error:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise StageFailure(
+            "HARNESS_ERROR", f"cannot unpack bundle {bundle}: {error}"
+        ) from error
+    except StageFailure:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
     return destination
 
 
@@ -1082,7 +1349,13 @@ def _scorer_package_file(scorer_dir: Path, declared: str, label: str) -> Path:
     return resolved
 
 
-def _validate_judge_agent(agent_path: Path) -> None:
+def _validate_judge_agent(
+    scorer_dir: Path,
+    agent_path: Path,
+    prompt_path: Path,
+    *,
+    mode: str,
+) -> None:
     try:
         payload = read_json(agent_path, label="judge agent config")
     except GhostlabError as error:
@@ -1096,12 +1369,29 @@ def _validate_judge_agent(agent_path: Path) -> None:
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR", "judge.agent_config must declare runtime"
         )
+    expected_runtime_keys = {
+        "backend",
+        "model",
+        "instructions",
+        "tools",
+        "permission",
+    }
+    if set(runtime) != expected_runtime_keys:
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            "judge.agent_config runtime keys must exactly equal "
+            f"{sorted(expected_runtime_keys)!r}",
+        )
+    if runtime.get("backend") != "opencode":
+        raise StageFailure(
+            "BUILDER_CONTRACT_ERROR",
+            "judge.agent_config runtime.backend must be 'opencode'",
+        )
     model = runtime.get("model")
     if (
         not isinstance(model, str)
         or not model.strip()
-        or "${" in model
-        or "$(" in model
+        or "$" in model
     ):
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR",
@@ -1112,28 +1402,92 @@ def _validate_judge_agent(agent_path: Path) -> None:
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR", "judge.agent_config must declare runtime.tools"
         )
-    for tool in ("bash", "webfetch"):
-        if tools.get(tool) is not False:
+    expected_tools = JUDGE_AGENT_TOOL_POLICIES[mode]
+    if set(tools) != set(expected_tools):
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            f"judge.agent_config runtime.tools keys must exactly equal "
+            f"{sorted(expected_tools)!r} for mode {mode!r}",
+        )
+    for tool, expected_tool_value in expected_tools.items():
+        if tools.get(tool) is not expected_tool_value:
             raise StageFailure(
                 "SCORER_UNSAFE",
-                f"judge.agent_config runtime.tools.{tool} must be false",
+                f"judge.agent_config runtime.tools.{tool} must be {expected_tool_value!r} "
+                f"for mode {mode!r}",
             )
     permission = runtime.get("permission")
     if not isinstance(permission, Mapping):
         raise StageFailure(
             "SCORER_UNSAFE", "judge.agent_config must declare runtime.permission"
         )
-    for capability in ("bash", "edit", "external_directory"):
-        if permission.get(capability) != "deny":
+    expected_permissions = JUDGE_AGENT_PERMISSION_POLICIES[mode]
+    if set(permission) != set(expected_permissions):
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            f"judge.agent_config runtime.permission keys must exactly equal "
+            f"{sorted(expected_permissions)!r} for mode {mode!r}",
+        )
+    for capability, expected_permission in expected_permissions.items():
+        if permission.get(capability) != expected_permission:
             raise StageFailure(
                 "SCORER_UNSAFE",
-                f"judge.agent_config runtime.permission.{capability} must be 'deny'",
+                f"judge.agent_config runtime.permission.{capability} must be "
+                f"{expected_permission!r} for mode {mode!r}",
+            )
+
+    instructions = runtime.get("instructions")
+    if (
+        not isinstance(instructions, list)
+        or len(instructions) != 1
+        or not isinstance(instructions[0], str)
+        or not instructions[0]
+    ):
+        raise StageFailure(
+            "BUILDER_CONTRACT_ERROR",
+            "judge.agent_config runtime.instructions must contain exactly judge.prompt",
+        )
+    instruction_path = _scorer_package_file(
+        scorer_dir,
+        instructions[0],
+        "judge.agent_config runtime.instructions[0]",
+    )
+    if instruction_path != prompt_path:
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            "judge.agent_config runtime.instructions must reference the packaged "
+            "judge.prompt declared by scorer.json",
+        )
+
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise StageFailure(
+            "BUILDER_CONTRACT_ERROR", "judge.agent_config inputs must be an object"
+        )
+    expected_input_keys = {"skills", "mcps", "assets"}
+    if set(inputs) != expected_input_keys:
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            "judge.agent_config inputs keys must exactly equal "
+            f"{sorted(expected_input_keys)!r}",
+        )
+    for input_kind in ("skills", "mcps", "assets"):
+        declared = inputs.get(input_kind, [])
+        if declared != []:
+            raise StageFailure(
+                "SCORER_UNSAFE",
+                f"judge.agent_config inputs.{input_kind} must be empty",
             )
 
 
 def _validate_scorer_security(
     scorer_dir: Path, manifest: Mapping[str, Any], mode: Any
 ) -> None:
+    if not isinstance(mode, str) or mode not in SCORER_MODES:
+        raise StageFailure(
+            "BUILDER_CONTRACT_ERROR",
+            f"scorer.json mode={mode!r} is not one of {sorted(SCORER_MODES)}",
+        )
     runtime = manifest.get("runtime")
     if not isinstance(runtime, Mapping):
         raise StageFailure("BUILDER_CONTRACT_ERROR", "scorer.json must declare runtime")
@@ -1174,7 +1528,12 @@ def _validate_scorer_security(
                 f"scorer judge.{key} must name a packaged file",
             )
         resolved[key] = _scorer_package_file(scorer_dir, declared, f"judge.{key}")
-    _validate_judge_agent(resolved["agent_config"])
+    _validate_judge_agent(
+        scorer_dir,
+        resolved["agent_config"],
+        resolved["prompt"],
+        mode=str(mode),
+    )
 
 
 def validate_scorer_package(
@@ -1184,65 +1543,29 @@ def validate_scorer_package(
     manifest_path = scorer_dir / "scorer.json"
     if not manifest_path.is_file():
         raise StageFailure("BUILDER_CONTRACT_ERROR", "scorer package has no scorer.json")
-    manifest = read_json(manifest_path, label="scorer.json")
-    if not isinstance(manifest, dict):
+    raw_manifest = read_json(manifest_path, label="scorer.json")
+    if not isinstance(raw_manifest, dict):
         raise StageFailure("BUILDER_CONTRACT_ERROR", "scorer.json is not a JSON object")
-    if manifest.get("schema_version") != SCORER_SCHEMA:
+    _validate_scorer_security(scorer_dir, raw_manifest, raw_manifest.get("mode"))
+    try:
+        parsed = ScorerManifest.from_dict(raw_manifest, where="scorer.json")
+    except SchemaError as error:
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR",
-            f"scorer.json declares schema_version={manifest.get('schema_version')!r}, "
-            f"expected {SCORER_SCHEMA!r}",
-        )
-    if manifest.get("task_id") != task_id:
+            f"scorer.json is not a valid {SCORER_SCHEMA} manifest: {error}",
+        ) from error
+    if parsed.task_id != task_id:
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR",
-            f"scorer.json task_id={manifest.get('task_id')!r} does not match {task_id!r}",
+            f"scorer.json task_id={parsed.task_id!r} does not match {task_id!r}",
         )
-    mode = manifest.get("mode")
-    if mode not in SCORER_MODES:
-        raise StageFailure(
-            "BUILDER_CONTRACT_ERROR", f"scorer.json mode={mode!r} is not one of {sorted(SCORER_MODES)}"
-        )
-    _validate_scorer_security(scorer_dir, manifest, mode)
-    entrypoint = manifest.get("entrypoint")
-    if not isinstance(entrypoint, list) or not entrypoint or not all(
-        isinstance(item, str) for item in entrypoint
-    ):
-        raise StageFailure(
-            "BUILDER_CONTRACT_ERROR", "scorer.json entrypoint must be a non-empty argv array"
-        )
-    components = manifest.get("components")
-    if not isinstance(components, list) or not components:
-        raise StageFailure("BUILDER_CONTRACT_ERROR", "scorer.json must declare components")
-    weight_sum = 0.0
-    for component in components:
-        if not isinstance(component, Mapping) or not isinstance(component.get("id"), str):
-            raise StageFailure("BUILDER_CONTRACT_ERROR", "each scorer component needs a string id")
-        weight = component.get("weight")
-        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
-            raise StageFailure(
-                "BUILDER_CONTRACT_ERROR",
-                f"component {component.get('id')!r} has a non-numeric weight",
-            )
-        weight_sum += float(weight)
-    if abs(weight_sum - 1.0) > WEIGHT_SUM_TOLERANCE:
-        raise StageFailure(
-            "BUILDER_CONTRACT_ERROR",
-            f"scorer component weights sum to {weight_sum}, expected 1.0",
-        )
-    threshold = manifest.get("pass_threshold")
-    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or not (
-        0.0 <= float(threshold) <= 1.0
-    ):
-        raise StageFailure(
-            "BUILDER_CONTRACT_ERROR", f"scorer pass_threshold={threshold!r} must be within [0, 1]"
-        )
+    manifest = parsed.to_dict()
     warnings: list[str] = []
     try:
         computed = compute_scorer_package_hash(scorer_dir)
     except ValueError as error:
         raise StageFailure("SCORER_UNSAFE", str(error)) from error
-    declared = manifest.get("package_sha256")
+    declared = parsed.package_sha256
     if isinstance(declared, str) and declared and declared != computed:
         raise StageFailure(
             "BUILDER_CONTRACT_ERROR",
@@ -1263,23 +1586,32 @@ def compute_scorer_package_hash(scorer_dir: Path) -> str:
     manifest = read_json(manifest_path, label="scorer.json")
     if not isinstance(manifest, Mapping):
         raise ValueError("scorer.json is not a JSON object")
-    files: list[tuple[str, str]] = []
+    entries: list[dict[str, str]] = []
     for path in sorted(scorer_dir.rglob("*")):
         if path.is_symlink():
             raise ValueError(
                 f"scorer package contains unsupported symlink: "
                 f"{path.relative_to(scorer_dir).as_posix()}"
             )
-        if path.is_file() and path.name != "scorer.json":
-            files.append((path.relative_to(scorer_dir).as_posix(), sha256_file(path)))
-    return sha256_json(
-        {
-            "scorer_json": {
-                key: value for key, value in manifest.items() if key != "package_sha256"
-            },
-            "files": files,
-        }
-    )
+        if not path.is_file():
+            continue
+        relative = path.relative_to(scorer_dir).as_posix()
+        if relative == "scorer.json":
+            digest = sha256_text(
+                json.dumps(
+                    {
+                        key: value
+                        for key, value in manifest.items()
+                        if key != "package_sha256"
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            )
+        else:
+            digest = sha256_file(path)
+        entries.append({"path": relative, "kind": "file", "sha256": digest})
+    return sha256_text(json.dumps(entries, sort_keys=True, separators=(",", ":")))
 
 
 def _scan_for_substrings(root: Path, needles: Sequence[str]) -> list[str]:
@@ -1356,6 +1688,7 @@ class ScorerValidation:
     repeatability: RepeatabilityResult
     codes: tuple[str, ...] = ()
     scorer_package_sha256: str = ""
+    isolation_attestation: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1366,6 +1699,7 @@ class ScorerValidation:
             "codes": list(self.codes),
             "cases": [case.to_dict() for case in self.cases],
             "repeatability": self.repeatability.to_dict(),
+            "isolation_attestation": dict(self.isolation_attestation),
         }
 
 
@@ -1931,7 +2265,11 @@ def _stage_scorer_built(
             "bundle": ctx.bundle_sha256,
             "agent": sha256_file(config.scorer_builder_agent),
             "instructions": instructions,
-            "sdk": sha256_path(config.scorer_sdk) if config.scorer_sdk else None,
+            "sdk": (
+                sha256_path(config.scorer_sdk, excludes=())
+                if config.scorer_sdk
+                else None
+            ),
             "prompt": sha256_file(prompt_path),
             "config": config.fingerprint(),
         }
@@ -2216,6 +2554,88 @@ def _validation_input_hashes(
     }
 
 
+def _load_isolation_attestation(
+    run_dir: Path,
+    *,
+    task_id: str,
+    attempt_id: str,
+    status: str,
+    task_sha256: str,
+    package_sha256: str,
+    mode: str,
+) -> dict[str, Any]:
+    try:
+        return validate_scorer_run_attestation(
+            run_dir / SCORER_RUN_REPORT_NAME,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            status=status,
+            task_sha256=task_sha256,
+            scorer_package_sha256=package_sha256,
+            mode=mode,
+            run_dir=run_dir,
+        )
+    except GhostlabError as error:
+        raise StageFailure("SCORER_UNSAFE", str(error), task_id=task_id) from error
+
+
+def _verify_recorded_isolation_attestations(
+    validation_dir: Path,
+    validation: ScorerValidation,
+    *,
+    task_sha256: str,
+    package_sha256: str,
+    mode: str,
+) -> dict[str, Any]:
+    attestations: list[dict[str, Any]] = []
+    for case in validation.cases:
+        for index in range(case.runs):
+            report_path = _contained_child(
+                validation_dir / "reports",
+                f"{case.case_id}.run{index}.json",
+                "validation report name",
+            )
+            try:
+                report = read_json(report_path, label="cached validation score report")
+            except GhostlabError as error:
+                raise StageFailure(
+                    "SCORER_UNSAFE", str(error), task_id=validation.task_id
+                ) from error
+            if not isinstance(report, Mapping):
+                raise StageFailure(
+                    "SCORER_UNSAFE",
+                    f"cached validation score report {report_path} must be an object",
+                    task_id=validation.task_id,
+                )
+            run_dir = _contained_child(
+                validation_dir / "runs",
+                f"{case.case_id}-{index}",
+                "validation run name",
+            )
+            observed = _load_isolation_attestation(
+                run_dir,
+                task_id=validation.task_id,
+                attempt_id=str(report.get("attempt_id", "")),
+                status=str(report.get("status", "")),
+                task_sha256=task_sha256,
+                package_sha256=package_sha256,
+                mode=mode,
+            )
+            attestations.append(observed)
+    expected = attestations[0] if attestations else None
+    if (
+        expected is None
+        or any(item != expected for item in attestations[1:])
+        or expected != dict(validation.isolation_attestation)
+    ):
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            "recorded validation runs do not prove the published isolation attestation",
+            task_id=validation.task_id,
+        )
+    return expected
+
+
 def _stage_scorer_validated(
     ctx: _SourceContext,
     task: Mapping[str, Any],
@@ -2229,6 +2649,7 @@ def _stage_scorer_validated(
     """Execute the six mandatory cases plus the repeatability protocol."""
     config = ctx.config
     task_id = str(task["task_id"])
+    mode = str(scorer_manifest["mode"])
     validation_dir = ctx.paths.build_task_dir(ctx.build_id, task_id) / "scorer-validation"
     cases = _load_validation_cases(cases_path, task_id)
     export_root = cases_path.parent
@@ -2247,7 +2668,15 @@ def _stage_scorer_validated(
     if previous == fingerprint and cached.is_file():
         stored = read_json(cached, label="scorer-validation.json")
         if isinstance(stored, Mapping):
-            return _load_validation(stored), fingerprint
+            validation = _load_validation(stored)
+            _verify_recorded_isolation_attestations(
+                validation_dir,
+                validation,
+                task_sha256=sha256_file(public_task_path),
+                package_sha256=package_sha256,
+                mode=mode,
+            )
+            return validation, fingerprint
 
     scratch = _contained_child(validation_dir, "candidates", "validation scratch directory")
     scratch.mkdir(parents=True, exist_ok=True)
@@ -2259,6 +2688,7 @@ def _stage_scorer_validated(
     reports_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
     reports_by_case: dict[str, list[dict[str, Any]]] = {}
+    isolation_attestations: list[dict[str, Any]] = []
     for case in cases:
         case_id = str(case["id"])
         candidate = _materialize_case_candidate(
@@ -2276,22 +2706,43 @@ def _stage_scorer_validated(
                 f"{case_id}-{index}",
                 "validation run name",
             )
+            private_run_report = run_path / "scorer-run.json"
+            if private_run_report.is_symlink() or private_run_report.is_file():
+                private_run_report.unlink()
+            elif private_run_report.exists():
+                shutil.rmtree(private_run_report)
             result = config.ghostlab.scorer_run(
                 ScorerRunRequest(
                     task_path=public_task_path,
                     scorer_path=scorer_json,
                     candidate_path=candidate,
                     output_path=report_path,
+                    attempt_id=f"validation-{task_id}-{case_id}-{index}",
                     seed=0,
                     run_dir=run_path,
                     timeout_seconds=config.scorer_timeout_seconds,
                     label=f"scorer-{case_id}-{index}",
                 )
             )
+            isolation_attestations.append(
+                _load_isolation_attestation(
+                    run_path,
+                    task_id=task_id,
+                    attempt_id=str(result.report.get("attempt_id", "")),
+                    status=result.status,
+                    task_sha256=sha256_file(public_task_path),
+                    package_sha256=package_sha256,
+                    mode=mode,
+                )
+            )
             runs.append(dict(result.report))
             if result.status == "scored":
                 report_check = validate_score_report(
-                    result.report, pass_threshold=float(scorer_manifest["pass_threshold"])
+                    result.report,
+                    pass_threshold=float(scorer_manifest["pass_threshold"]),
+                    scorer_manifest=scorer_manifest,
+                    expected_task_id=task_id,
+                    expected_scorer_package_sha256=package_sha256,
                 )
                 if not report_check.valid:
                     raise StageFailure(
@@ -2353,6 +2804,16 @@ def _stage_scorer_validated(
         repeatability=repeatability,
         codes=codes,
         scorer_package_sha256=package_sha256,
+        isolation_attestation=(
+            isolation_attestations[0] if isolation_attestations else {}
+        ),
+    )
+    _verify_recorded_isolation_attestations(
+        validation_dir,
+        validation,
+        task_sha256=sha256_file(public_task_path),
+        package_sha256=package_sha256,
+        mode=mode,
     )
     write_json(validation_dir / "scorer-validation.json", validation.to_dict())
     return validation, fingerprint
@@ -2512,6 +2973,69 @@ def _assert_public_clean(public_dir: Path, forbidden: Sequence[str]) -> None:
         )
 
 
+def _agent_dependency_hashes(agent_config: Path) -> dict[str, str]:
+    payload = read_json(agent_config, label="agent config")
+    if not isinstance(payload, Mapping):
+        return {}
+    references: dict[str, tuple[bool, bool]] = {}
+
+    def record(reference: str, *, allow_packaged: bool, include_parent: bool) -> None:
+        prior = references.get(reference, (False, False))
+        references[reference] = (
+            prior[0] or allow_packaged,
+            prior[1] or include_parent,
+        )
+
+    runtime = payload.get("runtime")
+    if isinstance(runtime, Mapping):
+        instructions = runtime.get("instructions")
+        if isinstance(instructions, list):
+            for item in instructions:
+                if isinstance(item, str):
+                    record(item, allow_packaged=True, include_parent=False)
+    inputs = payload.get("inputs")
+    if isinstance(inputs, Mapping):
+        for kind in ("skills", "mcps", "assets"):
+            declared = inputs.get(kind)
+            if not isinstance(declared, list):
+                continue
+            for item in declared:
+                if isinstance(item, str):
+                    record(
+                        item,
+                        allow_packaged=False,
+                        include_parent=kind == "skills",
+                    )
+                elif isinstance(item, Mapping):
+                    for key in ("path", "source", "config_ref"):
+                        value = item.get(key)
+                        if isinstance(value, str):
+                            record(
+                                value,
+                                allow_packaged=False,
+                                include_parent=kind == "skills" and key == "path",
+                            )
+    sandbox = payload.get("sandbox")
+    if isinstance(sandbox, Mapping) and isinstance(sandbox.get("policy"), str):
+        record(sandbox["policy"], allow_packaged=False, include_parent=False)
+
+    dependencies: dict[str, str] = {}
+    for reference, (allow_packaged, include_parent) in sorted(references.items()):
+        declared = Path(reference)
+        if declared.is_absolute():
+            resolved = declared
+        else:
+            local = agent_config.parent / declared
+            packaged = INSTRUCTION_ASSET_DIR / declared.name
+            resolved = local if local.exists() or not allow_packaged else packaged
+        if include_parent and resolved.is_file() and resolved.name == "SKILL.md":
+            resolved = resolved.parent
+        dependencies[reference] = (
+            sha256_path(resolved, excludes=()) if resolved.exists() else ""
+        )
+    return dependencies
+
+
 def _agent_asset_record(agent_config: Path | None) -> dict[str, Any] | None:
     if agent_config is None:
         return None
@@ -2520,6 +3044,7 @@ def _agent_asset_record(agent_config: Path | None) -> dict[str, Any] | None:
         "config": agent_config.name,
         "config_sha256": sha256_file(agent_config),
         "instructions": dict(sorted(instructions.items())),
+        "dependencies": _agent_dependency_hashes(agent_config),
     }
 
 
@@ -2556,7 +3081,7 @@ def _stage_published(
     scorer_forbidden = tuple(ctx.config.forbidden_scorer_substrings) + (
         str(ctx.source_dir),
     )
-    _, current_package_sha256, _ = validate_scorer_package(
+    current_manifest, current_package_sha256, _ = validate_scorer_package(
         scorer_dir,
         task_id,
         forbidden_substrings=scorer_forbidden,
@@ -2567,6 +3092,21 @@ def _stage_published(
             "scorer package changed after validation and before publication",
             task_id=task_id,
         )
+    if validation.scorer_package_sha256 != package_sha256:
+        raise StageFailure(
+            "SCORER_UNSAFE",
+            "scorer validation is not bound to the package being published",
+            task_id=task_id,
+        )
+    _verify_recorded_isolation_attestations(
+        ctx.paths.build_task_dir(ctx.build_id, task_id) / "scorer-validation",
+        validation,
+        task_sha256=sha256_file(
+            ctx.paths.build_task_dir(ctx.build_id, task_id) / "public-task.json"
+        ),
+        package_sha256=package_sha256,
+        mode=str(current_manifest["mode"]),
+    )
     target = ctx.paths.task_dir(task_id)
     fingerprint = sha256_json(
         {
@@ -2679,6 +3219,7 @@ def _load_validation(payload: Mapping[str, Any]) -> ScorerValidation:
         judge_stdev=dict(repeat_raw.get("judge_stdev") or {}),
         detail=str(repeat_raw.get("detail", "")),
     )
+    isolation = payload.get("isolation_attestation")
     return ScorerValidation(
         task_id=str(payload.get("task_id", "")),
         passed=bool(payload.get("passed")),
@@ -2686,6 +3227,7 @@ def _load_validation(payload: Mapping[str, Any]) -> ScorerValidation:
         repeatability=repeatability,
         codes=tuple(str(x) for x in payload.get("codes") or ()),
         scorer_package_sha256=str(payload.get("scorer_package_sha256", "")),
+        isolation_attestation=dict(isolation) if isinstance(isolation, Mapping) else {},
     )
 
 
@@ -2712,6 +3254,7 @@ def build_source(
     *,
     build_id: str,
     source_dir: Path | None = None,
+    expected_bundle_sha256: str | None = None,
 ) -> SourceBuildResult:
     """Drive one source through the resumable stage machine."""
     resolved_source = source_dir or paths.source_dir(source_id)
@@ -2732,6 +3275,15 @@ def build_source(
 
         stage = "bundled"
         manifest, bundle_sha256, warnings = _stage_bundled(resolved_source)
+        if (
+            expected_bundle_sha256 is not None
+            and bundle_sha256 != expected_bundle_sha256
+        ):
+            raise StageFailure(
+                "HARNESS_ERROR",
+                f"source bundle {source_id!r} checksum {bundle_sha256} does not match "
+                f"the active bundle report checksum {expected_bundle_sha256}",
+            )
         if state.reached("bundled", bundle_sha256):
             reused.append("bundled")
         state = store.save(state.advance("bundled", bundle_sha256, warnings=warnings))
@@ -2909,22 +3461,171 @@ def build_source(
     )
 
 
-def default_build_id(name: str, config: BuildConfig, source_ids: Sequence[str]) -> str:
-    """Content-addressed build id so unchanged inputs resume instead of forking."""
+@dataclass(frozen=True)
+class _BuildSource:
+    source_id: str
+    path: Path
+    content_sha256: str
+
+
+def _verified_build_source(
+    paths: TasksetPaths,
+    source_id: str,
+    *,
+    expected_sha256: str | None = None,
+) -> _BuildSource:
+    _validate_identifier(source_id, "source id")
+    source_path = paths.source_dir(source_id)
+    if source_path.is_symlink():
+        raise BuildConfigurationError(
+            f"source bundle {source_id!r} must not be a symbolic link"
+        )
+    try:
+        bundle = load_bundle(source_path)
+        verified = verify_bundle(source_path)
+    except (BundleError, GhostlabError, OSError, SchemaError, ValueError) as error:
+        raise BuildConfigurationError(
+            f"source bundle {source_id!r} cannot be verified: {error}"
+        ) from error
+    if bundle.source_id != source_id:
+        raise BuildConfigurationError(
+            f"source bundle directory {source_id!r} contains manifest for "
+            f"{bundle.source_id!r}"
+        )
+    if not verified:
+        raise BuildConfigurationError(
+            f"source bundle {source_id!r} failed checksum verification"
+        )
+    digest = bundle.content_sha256
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise BuildConfigurationError(
+            f"source bundle {source_id!r} checksum {digest} does not match "
+            f"the active bundle report checksum {expected_sha256}"
+        )
+    return _BuildSource(source_id=source_id, path=source_path, content_sha256=digest)
+
+
+def _explicit_build_source(paths: TasksetPaths, source_id: str) -> _BuildSource:
+    _validate_identifier(source_id, "source id")
+    source_path = paths.source_dir(source_id)
+    if source_path.is_symlink() or not source_path.is_dir():
+        raise BuildConfigurationError(f"source bundle does not exist: {source_path}")
+    try:
+        digest = compute_content_hash(source_path)
+    except (BundleError, OSError, ValueError) as error:
+        raise BuildConfigurationError(
+            f"source bundle {source_id!r} cannot be hashed: {error}"
+        ) from error
+    return _BuildSource(source_id=source_id, path=source_path, content_sha256=digest)
+
+
+def _active_build_sources(paths: TasksetPaths) -> list[_BuildSource]:
+    report_path = paths.bundle_report_path()
+    if report_path.is_symlink() or not report_path.is_file():
+        raise BuildConfigurationError(
+            f"active bundle report is missing at {report_path}; run "
+            f"'retro benchmark taskset bundle --name {paths.name}' first or pass source_ids"
+        )
+    try:
+        payload = read_json(report_path, label="active bundle report")
+    except GhostlabError as error:
+        raise BuildConfigurationError(str(error)) from error
+    if not isinstance(payload, Mapping):
+        raise BuildConfigurationError("active bundle report is not a JSON object")
+    if payload.get("schema_version") != BUNDLE_REPORT_SCHEMA:
+        raise BuildConfigurationError(
+            "active bundle report declares "
+            f"schema_version={payload.get('schema_version')!r}, "
+            f"expected {BUNDLE_REPORT_SCHEMA!r}"
+        )
+    if payload.get("name") != paths.name:
+        raise BuildConfigurationError(
+            f"active bundle report is for {payload.get('name')!r}, not {paths.name!r}"
+        )
+    raw_sources = payload.get("sources")
+    if not isinstance(raw_sources, list):
+        raise BuildConfigurationError("active bundle report sources must be an array")
+
+    active: list[_BuildSource] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_sources):
+        where = f"active bundle report sources[{index}]"
+        if not isinstance(item, Mapping):
+            raise BuildConfigurationError(f"{where} must be an object")
+        source_id = item.get("source_id")
+        status = item.get("status")
+        if not isinstance(source_id, str):
+            raise BuildConfigurationError(f"{where}.source_id must be a string")
+        _validate_identifier(source_id, "source id")
+        if source_id in seen:
+            raise BuildConfigurationError(
+                f"active bundle report contains duplicate source id {source_id!r}"
+            )
+        seen.add(source_id)
+        if status == "skipped":
+            continue
+        if status not in ("bundled", "reused"):
+            raise BuildConfigurationError(
+                f"{where}.status={status!r} is not bundled, reused, or skipped"
+            )
+        expected = item.get("content_sha256")
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise BuildConfigurationError(
+                f"{where}.content_sha256 must be a lowercase SHA-256 digest"
+            )
+        reported_path = item.get("path")
+        source_path = paths.source_dir(source_id)
+        if not isinstance(reported_path, str) or not reported_path:
+            raise BuildConfigurationError(f"{where}.path must identify the source bundle")
+        if Path(reported_path).resolve() != source_path.resolve():
+            raise BuildConfigurationError(
+                f"{where}.path={reported_path!r} does not identify the current source "
+                f"bundle {source_path}"
+            )
+        active.append(
+            _verified_build_source(
+                paths, source_id, expected_sha256=expected
+            )
+        )
+    return sorted(active, key=lambda item: item.source_id)
+
+
+def default_build_id(
+    name: str,
+    config: BuildConfig,
+    source_ids: Sequence[str],
+    *,
+    source_digests: Mapping[str, str] | None = None,
+) -> str:
+    """Return an id covering every configured behavior and verified source digest."""
+    if source_digests is None:
+        raise BuildConfigurationError(
+            "default build ids require verified source bundle digests"
+        )
+    ids = sorted(source_ids)
+    if set(source_digests) != set(ids):
+        raise BuildConfigurationError(
+            "source_digests must contain exactly the source ids used by the build"
+        )
+    for source_id in ids:
+        digest = source_digests[source_id]
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise BuildConfigurationError(
+                f"source bundle {source_id!r} has invalid digest {digest!r}"
+            )
     digest = sha256_json(
         {
             "name": name,
             "config": config.fingerprint(),
             "agents": {
-                "task_definer": sha256_file(config.task_definer_agent),
-                "scorer_builder": sha256_file(config.scorer_builder_agent),
-                "scorer_auditor": (
-                    sha256_file(config.scorer_auditor_agent)
-                    if config.scorer_auditor_agent
-                    else None
-                ),
+                "task_definer": _agent_asset_record(config.task_definer_agent),
+                "scorer_builder": _agent_asset_record(config.scorer_builder_agent),
+                "scorer_auditor": _agent_asset_record(config.scorer_auditor_agent),
             },
-            "sources": sorted(source_ids),
+            "sources": [
+                {"source_id": source_id, "content_sha256": source_digests[source_id]}
+                for source_id in ids
+            ],
         }
     )
     return f"build-{digest[:16]}"
@@ -2939,25 +3640,42 @@ def build_sources(
 ) -> BuildResult:
     """Build every selected source into published tasks (spec section 14.3).
 
-    Low-level entry point. ``build_taskset`` is the CLI-facing wrapper.
+    Without an explicit source list, the latest ``bundles.json`` is authoritative;
+    stale directories left under ``sources/`` are never rediscovered implicitly.
+    ``build_taskset`` is the CLI-facing wrapper.
     """
     if source_ids is None:
-        sources_dir = paths.sources_dir()
-        resolved_ids = (
-            sorted(path.name for path in sources_dir.iterdir() if path.is_dir())
-            if sources_dir.is_dir()
-            else []
-        )
+        resolved_sources = _active_build_sources(paths)
     else:
-        resolved_ids = sorted(source_ids)
+        resolved_ids = sorted(set(source_ids))
+        for source_id in resolved_ids:
+            _validate_identifier(source_id, "source id")
+        resolved_sources = [
+            _explicit_build_source(paths, source_id) for source_id in resolved_ids
+        ]
+    resolved_ids = [source.source_id for source in resolved_sources]
     for source_id in resolved_ids:
         _validate_identifier(source_id, "source id")
 
-    resolved_build_id = build_id or default_build_id(paths.name, config, resolved_ids)
+    resolved_build_id = build_id or default_build_id(
+        paths.name,
+        config,
+        resolved_ids,
+        source_digests={
+            source.source_id: source.content_sha256 for source in resolved_sources
+        },
+    )
     _validate_identifier(resolved_build_id, "build id")
     results = [
-        build_source(paths, config, source_id, build_id=resolved_build_id)
-        for source_id in resolved_ids
+        build_source(
+            paths,
+            config,
+            source.source_id,
+            build_id=resolved_build_id,
+            source_dir=source.path,
+            expected_bundle_sha256=source.content_sha256 or None,
+        )
+        for source in resolved_sources
     ]
     result = BuildResult(name=paths.name, build_id=resolved_build_id, sources=tuple(results))
     write_json(paths.build_run_dir(resolved_build_id) / "build.json", result.to_dict())

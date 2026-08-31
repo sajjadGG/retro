@@ -195,6 +195,20 @@ def validate_score_report(
             warnings=(),
         )
 
+    for key, expected in (
+        ("task_id", expected_task_id),
+        ("attempt_id", expected_attempt_id),
+        ("scorer_package_sha256", expected_scorer_package_sha256),
+    ):
+        if expected is None:
+            continue
+        actual = report.get(key)
+        if key == "scorer_package_sha256" and isinstance(actual, str):
+            actual = actual.removeprefix("sha256:")
+            expected = expected.removeprefix("sha256:")
+        if actual != expected:
+            errors.append(f"{key} {actual!r} does not match expected {expected!r}")
+
     raw_components = report.get("components")
     components: list[ComponentOutcome] = []
     if isinstance(raw_components, list):
@@ -221,20 +235,6 @@ def validate_score_report(
             errors=tuple(errors),
             warnings=(f"status={status} produces no numeric task result",),
         )
-
-    for key, expected in (
-        ("task_id", expected_task_id),
-        ("attempt_id", expected_attempt_id),
-        ("scorer_package_sha256", expected_scorer_package_sha256),
-    ):
-        if expected is None:
-            continue
-        actual = report.get(key)
-        if key == "scorer_package_sha256" and isinstance(actual, str):
-            actual = actual.removeprefix("sha256:")
-            expected = expected.removeprefix("sha256:")
-        if actual != expected:
-            errors.append(f"{key} {actual!r} does not match expected {expected!r}")
 
     if not components:
         errors.append("a scored report must contain at least one component")
@@ -418,7 +418,7 @@ class AttemptRecord:
     source_id: str | None = None
     score: float | None = None
     passed: bool | None = None
-    pass_threshold: float = DEFAULT_PASS_THRESHOLD
+    pass_threshold: float | None = None
     components: tuple[ComponentOutcome, ...] = ()
     tokens: Mapping[str, int] = field(default_factory=dict)
     wall_time_ms: int = 0
@@ -453,6 +453,7 @@ class AttemptRecord:
                 "agent_config_sha256": self.agent_config_sha256,
                 "base_bundle_sha256": self.base_bundle_sha256,
                 "scorer_package_sha256": self.scorer_package_sha256,
+                "pass_threshold": self.pass_threshold,
             }
         )
 
@@ -488,7 +489,7 @@ class AttemptRecord:
             source_id=payload.get("source_id") if isinstance(payload.get("source_id"), str) else None,
             score=score,
             passed=payload.get("passed") if isinstance(payload.get("passed"), bool) else None,
-            pass_threshold=threshold if threshold is not None else DEFAULT_PASS_THRESHOLD,
+            pass_threshold=threshold,
             components=tuple(components),
             tokens=tokens,
             wall_time_ms=int(payload.get("wall_time_ms") or 0),
@@ -526,6 +527,11 @@ def validate_attempt_record(
         parsed = BenchmarkAttempt.from_dict(payload, where=where)
     except SchemaError as exc:
         raise ValueError(str(exc)) from exc
+    if "pass_threshold" not in payload:
+        raise ValueError(
+            f"{where}.pass_threshold is missing; legacy attempts without immutable "
+            "threshold provenance must be rerun"
+        )
 
     if not _SAFE_ID_RE.fullmatch(parsed.agent_id):
         raise ValueError(f"{where} has unsafe agent_id {parsed.agent_id!r}")
@@ -830,9 +836,17 @@ def aggregate_attempts(
     wall_time_budgets_ms: Sequence[float] = (),
     generated_at: str | None = None,
 ) -> BenchmarkAggregate:
-    """Compute source-normalized benchmark scores (spec section 16)."""
+    """Compute source-normalized benchmark scores (spec section 16).
+
+    ``task_thresholds`` is retained as a compatibility assertion for callers
+    that already supply it. Persisted attempt thresholds remain authoritative
+    and an inconsistent assertion is rejected rather than used as an override.
+    """
     materialized = list(attempts)
-    _validate_evaluation_compatibility(materialized)
+    _validate_evaluation_compatibility(
+        materialized,
+        asserted_task_thresholds=task_thresholds,
+    )
     by_agent: dict[str, list[AttemptRecord]] = {}
     for record in materialized:
         by_agent.setdefault(record.agent_id, []).append(record)
@@ -845,7 +859,6 @@ def aggregate_attempts(
                 agent_id,
                 records,
                 task_sources=task_sources,
-                task_thresholds=task_thresholds,
                 requested=(requested_attempts or {}).get(agent_id),
                 token_budgets=token_budgets,
                 wall_time_budgets_ms=wall_time_budgets_ms,
@@ -856,7 +869,11 @@ def aggregate_attempts(
     )
 
 
-def _validate_evaluation_compatibility(records: Sequence[AttemptRecord]) -> None:
+def _validate_evaluation_compatibility(
+    records: Sequence[AttemptRecord],
+    *,
+    asserted_task_thresholds: Mapping[str, float] | None = None,
+) -> None:
     """Reject provenance drift that would otherwise be averaged as one evaluation."""
 
     def check(
@@ -872,6 +889,7 @@ def _validate_evaluation_compatibility(records: Sequence[AttemptRecord]) -> None
     agent_configs: dict[str, set[str | None]] = {}
     task_bases: dict[str, set[str | None]] = {}
     task_scorers: dict[str, set[str | None]] = {}
+    task_thresholds: dict[str, set[float]] = {}
     evaluation_inputs: dict[tuple[str, str], set[str | None]] = {}
     for record in records:
         for label, value in (
@@ -884,16 +902,46 @@ def _validate_evaluation_compatibility(records: Sequence[AttemptRecord]) -> None
                 raise ValueError(
                     f"attempt {record.attempt_id!r} has missing or invalid {label} provenance"
                 )
+        threshold = record.pass_threshold
+        if (
+            threshold is None
+            or not math.isfinite(threshold)
+            or not 0.0 <= threshold <= 1.0
+        ):
+            raise ValueError(
+                f"attempt {record.attempt_id!r} has missing or invalid pass threshold provenance"
+            )
         agent_configs.setdefault(record.agent_id, set()).add(record.agent_config_sha256)
         task_bases.setdefault(record.task_id, set()).add(record.base_bundle_sha256)
         task_scorers.setdefault(record.task_id, set()).add(record.scorer_package_sha256)
+        task_thresholds.setdefault(record.task_id, set()).add(threshold)
         evaluation_inputs.setdefault((record.agent_id, record.task_id), set()).add(
             record.input_sha256
         )
     check(agent_configs, "agent configuration provenance")
     check(task_bases, "base bundle provenance")
     check(task_scorers, "scorer package provenance")
+    check(task_thresholds, "pass threshold provenance")
     check(evaluation_inputs, "input provenance")
+
+    for task_id, asserted in (asserted_task_thresholds or {}).items():
+        if (
+            isinstance(asserted, bool)
+            or not isinstance(asserted, (int, float))
+            or not math.isfinite(float(asserted))
+            or not 0.0 <= float(asserted) <= 1.0
+        ):
+            raise ValueError(
+                f"asserted pass threshold provenance for task {task_id!r} is invalid"
+            )
+        persisted = task_thresholds.get(task_id)
+        if persisted and any(
+            abs(value - float(asserted)) > TOTAL_MATCH_TOLERANCE for value in persisted
+        ):
+            raise ValueError(
+                f"asserted pass threshold for task {task_id!r} does not match immutable "
+                "attempt provenance"
+            )
 
 
 def _aggregate_agent(
@@ -901,7 +949,6 @@ def _aggregate_agent(
     records: Sequence[AttemptRecord],
     *,
     task_sources: Mapping[str, str] | None,
-    task_thresholds: Mapping[str, float] | None,
     requested: int | None,
     token_budgets: Sequence[float],
     wall_time_budgets_ms: Sequence[float],
@@ -922,9 +969,11 @@ def _aggregate_agent(
     tasks: list[TaskAggregate] = []
     for (source_id, task_id) in sorted(task_groups):
         group = task_groups[(source_id, task_id)]
-        threshold = (task_thresholds or {}).get(task_id)
+        threshold = group[0].pass_threshold
         if threshold is None:
-            threshold = group[0].pass_threshold
+            raise ValueError(
+                f"task {task_id!r} has no immutable pass threshold provenance"
+            )
         scores = [record.score for record in group if record.valid and record.score is not None]
         passes = [
             1.0 if (record.score or 0.0) + TOTAL_MATCH_TOLERANCE >= threshold else 0.0
