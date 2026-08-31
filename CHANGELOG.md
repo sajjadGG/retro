@@ -4,6 +4,9 @@
 
 ### Added
 
+- Git-backed rollout tasksets with exact repository-state provenance,
+  content-addressed source bundles, hidden executable scorers, resumable
+  Ghostlab agent runs, and source-normalized numeric reports.
 - GhostLab/OpenShell execution for time-consistent benchmark tasks, with
   independent sandboxes, exact repository snapshots, constrained Copilot tools
   and egress, a digest-pinned base image, private runner traces, and immutable

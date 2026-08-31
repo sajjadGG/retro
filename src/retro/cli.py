@@ -10,6 +10,7 @@ Commands:
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -24,6 +25,33 @@ from .benchmarks import (
     build_time_consistent_benchmark,
     evaluate_time_consistent_benchmark,
     run_ghostlab_benchmark,
+)
+from .benchmarks.task_scorer.build import (
+    BuildConfigurationError,
+    TasksetBuildSummary,
+    build_taskset,
+)
+from .benchmarks.task_scorer.bundle import BundleError, bundle_taskset
+from .benchmarks.task_scorer.environment import DockerContainerRuntime, resolve_environment
+from .benchmarks.task_scorer.ghostlab_cli import GhostlabError
+from .benchmarks.task_scorer.git_state import (
+    CaptureExistsError,
+    GitError,
+    capture_repository_state,
+)
+from .benchmarks.task_scorer.run import (
+    TasksetReportSummary,
+    TasksetRunSummary,
+    TaskVerificationError,
+    report_taskset,
+    run_taskset,
+)
+from .benchmarks.task_scorer.schema import ProjectEnvironment, SchemaError
+from .benchmarks.task_scorer.selection import (
+    EnvironmentResolver,
+    SelectionError,
+    SourceCandidate,
+    select_taskset,
 )
 from .config import (
     RetroConfig,
@@ -59,6 +87,12 @@ app = typer.Typer(
 import_app = typer.Typer(no_args_is_help=True, help="Import a session from a host.")
 app.add_typer(import_app, name="import")
 
+capture_app = typer.Typer(
+    no_args_is_help=True,
+    help="Capture immutable repository state at coding-session boundaries.",
+)
+app.add_typer(capture_app, name="capture")
+
 signal_app = typer.Typer(
     no_args_is_help=True,
     help="Compute, list, and inspect signal readings over captured sessions.",
@@ -70,6 +104,11 @@ benchmark_app = typer.Typer(
     help="Build and evaluate time-consistent private benchmarks from rollouts.",
 )
 app.add_typer(benchmark_app, name="benchmark")
+taskset_app = typer.Typer(
+    no_args_is_help=True,
+    help="Build and evaluate Git-backed implementation tasks with hidden scorers.",
+)
+benchmark_app.add_typer(taskset_app, name="taskset")
 
 dashboard_app = typer.Typer(
     no_args_is_help=True,
@@ -99,12 +138,79 @@ schedule_app = typer.Typer(no_args_is_help=True, help="Manage periodic local cap
 app.add_typer(schedule_app, name="schedule")
 
 console = Console()
+_SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
 
 
 def _layout(root: Optional[Path]) -> Layout:
     lay = default_layout(root)
     lay.ensure()
     return lay
+
+
+# ---- repository-state capture ------------------------------------------------
+
+
+@capture_app.command("start")
+def capture_start_cmd(
+    host: str = typer.Option(..., "--host", help="claude|codex|copilot"),
+    session_id: str = typer.Option(..., "--session-id", help="Host session identifier"),
+    cwd: Path = typer.Option(
+        ...,
+        "--cwd",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Repository working directory at session start",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Capture exact Git state before the first coding-agent action."""
+    _capture_session_repo_state("start", host, session_id, cwd, root)
+
+
+@capture_app.command("end")
+def capture_end_cmd(
+    host: str = typer.Option(..., "--host", help="claude|codex|copilot"),
+    session_id: str = typer.Option(..., "--session-id", help="Host session identifier"),
+    cwd: Path = typer.Option(
+        ...,
+        "--cwd",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Repository working directory after the final coding-agent action",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Capture exact Git state after the final coding-agent action."""
+    _capture_session_repo_state("end", host, session_id, cwd, root)
+
+
+def _capture_session_repo_state(
+    phase: str,
+    host: str,
+    session_id: str,
+    cwd: Path,
+    root: Optional[Path],
+) -> None:
+    if not _SAFE_SESSION_ID_RE.fullmatch(session_id):
+        raise typer.BadParameter("session id contains unsupported characters")
+    lay = _layout(root)
+    try:
+        record = capture_repository_state(
+            layout=lay,
+            host=_expand_host(host),
+            session_id=session_id,
+            cwd=cwd,
+            phase=phase,
+        )
+    except CaptureExistsError as exc:
+        console.print(f"[red]repository state already captured: {exc.path}[/red]")
+        raise typer.Exit(2) from exc
+    except GitError as exc:
+        console.print(f"[red]repository state capture failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True))
 
 
 # ---- list -------------------------------------------------------------------
@@ -577,6 +683,417 @@ def _mine_targets(
 
 
 # ---- benchmark ---------------------------------------------------------------
+
+
+@taskset_app.command("select")
+def taskset_select_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    host: Optional[str] = typer.Option(
+        None,
+        "--host",
+        help="claude|codex|copilot; omit to use selectors from the session file",
+    ),
+    session_file: Optional[Path] = typer.Option(
+        None,
+        "--session-file",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="One host/session-id selector per line",
+    ),
+    environment_file: Optional[Path] = typer.Option(
+        None,
+        "--environment-file",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Validated retro-project-environment-v1 contract",
+    ),
+    environment_config: Optional[Path] = typer.Option(
+        None,
+        "--environment-config",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="External retro-environment-config-v1 to build and validate",
+    ),
+    container_runtime_bin: str = typer.Option(
+        "docker",
+        "--container-runtime-bin",
+        help="Docker-compatible binary used to build and validate project environments",
+    ),
+    ci_base_image: Optional[str] = typer.Option(
+        None,
+        "--ci-base-image",
+        help="Pinned image digest used for CI-derived commands",
+    ),
+    repolaunch_bin: Optional[Path] = typer.Option(
+        None,
+        "--repolaunch-bin",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Explicit RepoLaunch executable used only as the final resolver",
+    ),
+    build_network_allowlist: str = typer.Option(
+        "",
+        "--build-network-allowlist",
+        help="Comma-separated environment-build egress destinations",
+    ),
+    build_network_name: Optional[str] = typer.Option(
+        None,
+        "--build-network-name",
+        help="Explicit egress-filtered Docker network enforcing the build allowlist",
+    ),
+    allow_unvalidated_environment: bool = typer.Option(
+        False,
+        "--allow-unvalidated-environment",
+        help="Record source eligibility without publishing buildable tasks",
+    ),
+    branch: str = typer.Option("HEAD", "--branch", help="Project branch containing durable outcomes"),
+    stability_horizon_days: int = typer.Option(
+        7,
+        "--stability-horizon-days",
+        min=0,
+        help="Days an outcome must survive without a revert",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Select exact, clean Git-backed rollouts and record every rejection."""
+    lay = _layout(root)
+    resolved_host = None if host is None or host in ("*", "all") else _expand_host(host)
+    if environment_file is not None and environment_config is not None:
+        raise typer.BadParameter(
+            "--environment-file and --environment-config are mutually exclusive"
+        )
+    environment_resolver: EnvironmentResolver | None = None
+    if environment_file is None and not allow_unvalidated_environment:
+        runtime = DockerContainerRuntime(
+            binary=container_runtime_bin,
+            allowlisted_network=build_network_name,
+        )
+        allowlist = tuple(
+            destination.strip()
+            for destination in build_network_allowlist.split(",")
+            if destination.strip()
+        )
+
+        def automatic_environment_resolver(candidate: SourceCandidate) -> ProjectEnvironment:
+            return resolve_environment(
+                candidate,
+                runtime=runtime,
+                explicit_config=environment_config,
+                repolaunch_binary=repolaunch_bin,
+                ci_base_image=ci_base_image,
+                network_allowlist=allowlist,
+                logs_dir=(
+                    lay.benchmark_taskset_dir(name)
+                    / "environment-runs"
+                    / candidate.source_id
+                ),
+            )
+
+        environment_resolver = automatic_environment_resolver
+
+    try:
+        result = select_taskset(
+            layout=lay,
+            name=name,
+            host=resolved_host,
+            session_file=session_file,
+            environment_file=environment_file,
+            environment_resolver=environment_resolver,
+            require_environment=not allow_unvalidated_environment,
+            branch=branch,
+            stability_horizon_days=stability_horizon_days,
+        )
+    except (SelectionError, SchemaError) as exc:
+        console.print(f"[red]taskset selection failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    counts = result.result.to_dict()["counts"]
+    console.print(
+        f"[green]selected {counts['selected']} source(s); "
+        f"rejected {counts['rejected']}[/green]"
+    )
+    if result.path is not None:
+        console.print(f"  selection: {result.path}")
+
+
+@taskset_app.command("bundle")
+def taskset_bundle_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    selected_only: bool = typer.Option(
+        True,
+        "--selected-only/--reselect",
+        help="Bundle the recorded selection or select inputs again",
+    ),
+    host: Optional[str] = typer.Option(None, "--host", help="Host used with --reselect"),
+    session_file: Optional[Path] = typer.Option(
+        None,
+        "--session-file",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Session selectors used with --reselect",
+    ),
+    environment_file: Optional[Path] = typer.Option(
+        None,
+        "--environment-file",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Validated environment contract; defaults to the selection's contract",
+    ),
+    allow_unvalidated_environment: bool = typer.Option(
+        False,
+        "--allow-unvalidated-environment",
+        help="Allow unvalidated diagnostic bundles that cannot be published",
+    ),
+    branch: str = typer.Option("HEAD", "--branch", help="Project branch containing outcomes"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Materialize deterministic immutable SourceBundles for selected rollouts."""
+    lay = _layout(root)
+    resolved_host = None if host is None or host in ("*", "all") else _expand_host(host)
+    try:
+        result = bundle_taskset(
+            layout=lay,
+            name=name,
+            selected_only=selected_only,
+            host=resolved_host,
+            session_file=session_file,
+            environment_file=environment_file,
+            require_environment=not allow_unvalidated_environment,
+            branch=branch,
+        )
+    except (BundleError, SelectionError, SchemaError) as exc:
+        console.print(f"[red]taskset bundling failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    counts = result.to_dict()["counts"]
+    console.print(
+        f"[green]bundled or reused {counts['bundled']} source(s); "
+        f"skipped {counts['skipped']}[/green]"
+    )
+    if result.path is not None:
+        console.print(f"  report: {result.path}")
+
+
+@taskset_app.command("build")
+def taskset_build_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    ghostlab_bin: Optional[str] = typer.Option(
+        None,
+        "--ghostlab-bin",
+        help="Ghostlab executable name/path; defaults to RETRO_GHOSTLAB_BIN or PATH",
+    ),
+    task_definer_agent: Path = typer.Option(
+        ...,
+        "--task-definer-agent",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
+    scorer_builder_agent: Path = typer.Option(
+        ...,
+        "--scorer-builder-agent",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
+    scorer_auditor_agent: Path = typer.Option(
+        ...,
+        "--scorer-auditor-agent",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+    ),
+    adjacent_per_replay: int = typer.Option(
+        0,
+        "--adjacent-per-replay",
+        min=0,
+        max=1,
+        help="Adjacent tasks per accepted replay task",
+    ),
+    source_id: Optional[list[str]] = typer.Option(
+        None,
+        "--source-id",
+        help="Build only these source IDs; may be repeated",
+    ),
+    build_id: Optional[str] = typer.Option(None, "--build-id", help="Explicit resumable build ID"),
+    repeatability_runs: int = typer.Option(
+        3,
+        "--repeatability-runs",
+        min=3,
+        help="Validation executions for deterministic, performance, and judge components",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Generate, lint, validate, audit, and publish hidden-scorer tasks."""
+    lay = _layout(root)
+    try:
+        result = build_taskset(
+            lay,
+            name,
+            ghostlab_bin,
+            task_definer_agent,
+            scorer_builder_agent,
+            scorer_auditor_agent,
+            adjacent_per_replay,
+            source_ids=source_id,
+            build_id=build_id,
+            repeatability_runs=repeatability_runs,
+        )
+    except (BuildConfigurationError, GhostlabError, TaskVerificationError) as exc:
+        console.print(f"[red]taskset build failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_taskset_build(result)
+
+
+@taskset_app.command("run")
+def taskset_run_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    agent: Path = typer.Option(
+        ...,
+        "--agent",
+        exists=True,
+        dir_okay=False,
+        resolve_path=True,
+        help="Candidate Ghostlab agent configuration",
+    ),
+    seeds: str = typer.Option("0", "--seeds", help="Comma-separated non-negative seeds"),
+    ghostlab_bin: Optional[str] = typer.Option(
+        None,
+        "--ghostlab-bin",
+        help="Ghostlab executable name/path; defaults to RETRO_GHOSTLAB_BIN or PATH",
+    ),
+    eval_id: Optional[str] = typer.Option(
+        None,
+        "--eval",
+        help="Evaluation ID; latest continues the latest, new starts a fresh evaluation",
+    ),
+    task_id: Optional[list[str]] = typer.Option(
+        None,
+        "--task-id",
+        help="Run only these task IDs; may be repeated",
+    ),
+    force: bool = typer.Option(False, "--force", help="Re-run existing hash-identical attempts"),
+    token_budget: Optional[list[float]] = typer.Option(
+        None,
+        "--token-budget",
+        min=0,
+        help="Report score under this token budget; may be repeated",
+    ),
+    wall_time_budget_ms: Optional[list[float]] = typer.Option(
+        None,
+        "--wall-time-budget-ms",
+        min=0,
+        help="Report score under this wall-time budget; may be repeated",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Run one candidate agent on fresh task bases and score every attempt."""
+    lay = _layout(root)
+    try:
+        result = run_taskset(
+            lay,
+            name,
+            agent,
+            seeds,
+            ghostlab_bin,
+            eval_id=eval_id,
+            task_ids=task_id,
+            force=force,
+            token_budgets=tuple(token_budget or ()),
+            wall_time_budgets_ms=tuple(wall_time_budget_ms or ()),
+        )
+    except (TaskVerificationError, BuildConfigurationError, GhostlabError) as exc:
+        console.print(f"[red]taskset run failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_taskset_run(result)
+
+
+@taskset_app.command("report")
+def taskset_report_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    eval_id: str = typer.Option("latest", "--eval", help="Evaluation ID or latest"),
+    token_budget: Optional[list[float]] = typer.Option(
+        None,
+        "--token-budget",
+        min=0,
+        help="Report score under this token budget; may be repeated",
+    ),
+    wall_time_budget_ms: Optional[list[float]] = typer.Option(
+        None,
+        "--wall-time-budget-ms",
+        min=0,
+        help="Report score under this wall-time budget; may be repeated",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the complete report as JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Render source-normalized scores and invalid-run accounting."""
+    lay = _layout(root)
+    try:
+        result = report_taskset(
+            lay,
+            name,
+            eval_id,
+            token_budgets=tuple(token_budget or ()),
+            wall_time_budgets_ms=tuple(wall_time_budget_ms or ()),
+        )
+    except (TaskVerificationError, BuildConfigurationError) as exc:
+        console.print(f"[red]taskset report failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    if json_output:
+        console.print_json(json.dumps(result.to_dict(), ensure_ascii=False))
+    else:
+        _print_taskset_report(result)
+
+
+def _print_rows(title: str, rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+    table = Table(title=title)
+    columns = list(rows[0])
+    for column in columns:
+        table.add_column(column.replace("_", " "))
+    for row in rows:
+        table.add_row(*(str(row.get(column, "")) for column in columns))
+    console.print(table)
+
+
+def _print_taskset_build(result: TasksetBuildSummary) -> None:
+    console.print(
+        f"[green]published {result.published} task(s) from "
+        f"{result.sources_ok}/{result.sources_total} source(s)[/green]"
+    )
+    _print_rows("Taskset build sources", result.source_rows())
+    _print_rows("Published tasks", result.task_rows())
+    _print_rows("Rejections", result.rejection_rows())
+    console.print(f"  build:  {result.build_dir}")
+    console.print(f"  report: {result.report_path}")
+
+
+def _print_taskset_run(result: TasksetRunSummary) -> None:
+    score = "n/a" if result.benchmark_score is None else f"{result.benchmark_score:.3f}"
+    console.print(
+        f"[green]evaluation {result.eval_id}: score {score}, "
+        f"coverage {result.coverage:.1%}, reused {result.reused_attempts}[/green]"
+    )
+    _print_rows("Attempts", result.attempt_rows())
+    _print_rows("Attempt errors", result.error_rows())
+    console.print(f"  report: {result.results_path}")
+
+
+def _print_taskset_report(result: TasksetReportSummary) -> None:
+    _print_rows(f"Taskset report: {result.eval_id}", result.agent_rows())
+    _print_rows("Sources", result.source_rows())
+    _print_rows("Tasks", result.task_rows())
+    _print_rows("Components", result.component_rows())
+    _print_rows("Resources", result.resource_rows())
+    _print_rows("Budget conditionals", result.budget_rows())
+    _print_rows("Invalid attempts", result.error_rows())
+    console.print(f"[green]wrote report to {result.results_path}[/green]")
 
 
 @benchmark_app.command("build")

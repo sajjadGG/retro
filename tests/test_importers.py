@@ -105,6 +105,54 @@ class TestClaudeImporter:
         result = imp.import_session(identifier="sess-100", force=True)
         assert result.event_count > 0
 
+    def test_import_preserves_pre_session_repo_state(
+        self, tmp_path: Path, claude_transcript: Path
+    ):
+        imp, layout = self._make_importer(tmp_path, claude_transcript)
+        raw_dir = layout.raw_dir("claude-code", "sess-100")
+        raw_dir.mkdir(parents=True)
+        state = '{"schema_version":"retro-repo-state-v1"}\n'
+        (raw_dir / "repo_start.json").write_text(state, encoding="utf-8")
+
+        imp.import_session(identifier="sess-100")
+
+        assert (raw_dir / "repo_start.json").read_text(encoding="utf-8") == state
+        assert (raw_dir / "transcript.jsonl").is_file()
+
+    def test_import_extracts_cwd_and_session_boundaries(self, tmp_path: Path):
+        layout = Layout(tmp_path / "rollout-memory")
+        layout.ensure()
+        claude_home = tmp_path / "claude-home"
+        transcript = claude_home / "projects" / "my-project" / "cwd-session.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(
+            "\n".join(
+                [
+                    '{"type":"user","uuid":"u1","timestamp":"2026-01-01T00:00:00Z",'
+                    '"cwd":"/tmp/project","message":{"content":"Fix it"}}',
+                    '{"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:01:00Z",'
+                    '"cwd":"/tmp/project","message":{"content":[{"type":"text","text":"Done"}]}}',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        importer = ClaudeImporter(layout, claude_home=claude_home)
+
+        session = importer.find_session("cwd-session")
+        assert session is not None
+        assert session.cwd == "/tmp/project"
+
+        result = importer.import_session(identifier="cwd-session")
+        meta = json.loads((result.raw_dir / "import_meta.json").read_text(encoding="utf-8"))
+        events = list(read_events(result.normalized_path))
+
+        assert meta["cwd"] == "/tmp/project"
+        assert events[0].event_type == "session_start"
+        assert events[0].payload["cwd"] == "/tmp/project"
+        assert events[-1].event_type == "session_end"
+        assert events[-1].payload["cwd"] == "/tmp/project"
+
     def test_latest(self, tmp_path: Path, claude_transcript: Path):
         imp, _ = self._make_importer(tmp_path, claude_transcript)
         latest = imp.latest()
@@ -285,6 +333,20 @@ class TestCodexImporter:
         result = imp.import_session(identifier="thread-001")
         assert result.event_count > 0
 
+    def test_import_preserves_pre_session_repo_state(
+        self, tmp_path: Path, codex_rollout: Path
+    ):
+        imp, layout = self._make_importer(tmp_path, codex_rollout)
+        raw_dir = layout.raw_dir("codex", "thread-001")
+        raw_dir.mkdir(parents=True)
+        state = '{"schema_version":"retro-repo-state-v1"}\n'
+        (raw_dir / "repo_start.json").write_text(state, encoding="utf-8")
+
+        imp.import_session(identifier="thread-001")
+
+        assert (raw_dir / "repo_start.json").read_text(encoding="utf-8") == state
+        assert (raw_dir / "rollout.jsonl").is_file()
+
 
 # ---- VS Code Copilot importer -----------------------------------------------
 
@@ -343,6 +405,22 @@ class TestVscodeCopilotImporter:
         )
         assert store["sessions"][0]["id"] == "copilot-session-001"
         assert store["turns"][0]["turn_index"] == 0
+
+    def test_import_preserves_pre_session_repo_state(
+        self,
+        tmp_path: Path,
+        vscode_copilot_user_data: Path,
+    ):
+        imp, layout = self._make_importer(tmp_path, vscode_copilot_user_data)
+        raw_dir = layout.raw_dir("vscode-copilot", "copilot-session-001")
+        raw_dir.mkdir(parents=True)
+        state = '{"schema_version":"retro-repo-state-v1"}\n'
+        (raw_dir / "repo_start.json").write_text(state, encoding="utf-8")
+
+        imp.import_session(identifier="copilot-session-001")
+
+        assert (raw_dir / "repo_start.json").read_text(encoding="utf-8") == state
+        assert (raw_dir / "session.jsonl").is_file()
 
     def test_transcript_normalization_preserves_tools_reasoning_and_parents(
         self,
@@ -567,6 +645,22 @@ class TestCopilotCliImporter:
         )
         assert meta["source_kind"] == "copilot-cli"
         assert meta["active"] is True
+
+    def test_import_preserves_pre_session_repo_state(
+        self,
+        tmp_path: Path,
+        copilot_cli_state: tuple[Path, Path],
+    ):
+        imp, layout = self._make_importer(tmp_path, copilot_cli_state)
+        raw_dir = layout.raw_dir("vscode-copilot", "cli-session-active")
+        raw_dir.mkdir(parents=True)
+        state = '{"schema_version":"retro-repo-state-v1"}\n'
+        (raw_dir / "repo_start.json").write_text(state, encoding="utf-8")
+
+        imp.import_session(identifier="cli-session-active")
+
+        assert (raw_dir / "repo_start.json").read_text(encoding="utf-8") == state
+        assert (raw_dir / "events.jsonl").is_file()
 
     def test_normalization_reconstructs_chunks_and_agent_lifecycle(
         self,

@@ -2,10 +2,14 @@
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+from retro.benchmarks.task_scorer.build import BuildConfigurationError
+from retro.benchmarks.task_scorer.run import TaskVerificationError
 from retro.cli import app, benchmark_run_cmd
 from retro.config import load_config
 
@@ -87,6 +91,8 @@ def test_global_archive_command_help():
         ["config", "--help"],
         ["archive", "--help"],
         ["benchmark", "--help"],
+        ["benchmark", "taskset", "--help"],
+        ["capture", "--help"],
         ["schedule", "--help"],
         ["setup", "--help"],
         ["sync", "--help"],
@@ -96,6 +102,65 @@ def test_global_archive_command_help():
         assert result.exit_code == 0, result.output
 
 
+def test_capture_commands_write_immutable_git_state(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Retro Test"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "retro@example.invalid"],
+        check=True,
+    )
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    root = tmp_path / "rollout-memory"
+    args = [
+        "capture",
+        "start",
+        "--host",
+        "codex",
+        "--session-id",
+        "session-1",
+        "--cwd",
+        str(repo),
+        "--root",
+        str(root),
+    ]
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    capture = root / "raw" / "codex" / "session-1" / "repo_start.json"
+    first_content = capture.read_text(encoding="utf-8")
+    payload = json.loads(first_content)
+    assert payload["schema_version"] == "retro-repo-state-v1"
+    assert payload["clean"] is True
+
+    duplicate = runner.invoke(app, args)
+
+    assert duplicate.exit_code == 2
+    assert capture.read_text(encoding="utf-8") == first_content
+
+    end = runner.invoke(
+        app,
+        [
+            "capture",
+            "end",
+            "--host",
+            "codex",
+            "--session-id",
+            "session-1",
+            "--cwd",
+            str(repo),
+            "--root",
+            str(root),
+        ],
+    )
+    assert end.exit_code == 0, end.output
+    assert (capture.parent / "repo_end.json").is_file()
+
+
 def test_benchmark_run_help():
     result = runner.invoke(app, ["benchmark", "run", "--help"])
     assert result.exit_code == 0
@@ -103,6 +168,87 @@ def test_benchmark_run_help():
 
     option = inspect.signature(benchmark_run_cmd).parameters["use_git_credential"]
     assert "--use-git-credential" in option.default.param_decls
+
+
+def test_taskset_command_help_exposes_complete_pipeline():
+    expected = {
+        "select": "--environment-config",
+        "bundle": "--selected-only",
+        "build": "--task-definer-agent",
+        "run": "--seeds",
+        "report": "--eval",
+    }
+    for command, option in expected.items():
+        result = runner.invoke(app, ["benchmark", "taskset", command, "--help"])
+        assert result.exit_code == 0, result.output
+        assert option in result.output
+
+
+def test_taskset_build_accepts_a_path_command_name(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_build(*args, **_kwargs):
+        captured["ghostlab_bin"] = args[2]
+        raise BuildConfigurationError("stop after option parsing")
+
+    monkeypatch.setattr("retro.cli.build_taskset", fake_build)
+    agents = []
+    for name in ("definer", "builder", "auditor"):
+        path = tmp_path / f"{name}.json"
+        path.write_text("{}", encoding="utf-8")
+        agents.append(path)
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "taskset",
+            "build",
+            "--name",
+            "pilot",
+            "--ghostlab-bin",
+            "ghostlab",
+            "--task-definer-agent",
+            str(agents[0]),
+            "--scorer-builder-agent",
+            str(agents[1]),
+            "--scorer-auditor-agent",
+            str(agents[2]),
+            "--root",
+            str(tmp_path / "archive"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert captured["ghostlab_bin"] == "ghostlab"
+
+
+def test_taskset_run_allows_ghostlab_environment_fallback(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def fake_run(*args, **_kwargs):
+        captured["ghostlab_bin"] = args[4]
+        raise TaskVerificationError("stop after option parsing")
+
+    monkeypatch.setattr("retro.cli.run_taskset", fake_run)
+    agent = tmp_path / "agent.json"
+    agent.write_text("{}", encoding="utf-8")
+    result = runner.invoke(
+        app,
+        [
+            "benchmark",
+            "taskset",
+            "run",
+            "--name",
+            "pilot",
+            "--agent",
+            str(agent),
+            "--root",
+            str(tmp_path / "archive"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert captured["ghostlab_bin"] is None
 
 
 def test_config_set_and_show(tmp_path):

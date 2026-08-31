@@ -20,7 +20,7 @@ from urllib.parse import unquote, urlparse
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, truncate_summary
-from .base import ImportResult
+from .base import ImportResult, has_only_repo_state_capture
 
 VSCODE_COPILOT_USER_DIRS_ENV = "VSCODE_COPILOT_USER_DIRS"
 
@@ -325,7 +325,12 @@ class VscodeCopilotImporter:
 
         raw_dir = self.layout.raw_dir(self.host, session.session_id)
         fingerprint = _capture_fingerprint(session)
-        if raw_dir.exists() and not force and not _source_is_newer(raw_dir, fingerprint):
+        if (
+            raw_dir.exists()
+            and not force
+            and not has_only_repo_state_capture(raw_dir)
+            and not _source_is_newer(raw_dir, fingerprint)
+        ):
             raise FileExistsError(
                 f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
             )

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retro.local/schemas/retro-scorer-audit-v1.json",
+  "title": "Retro scorer audit",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "decision",
+    "leakage",
+    "overfit_checks",
+    "missing_observables",
+    "mutants",
+    "evidence"
+  ],
+  "properties": {
+    "decision": {"enum": ["accept", "revise", "reject"]},
+    "leakage": {
+      "type": "array",
+      "items": {"type": ["string", "object"]}
+    },
+    "overfit_checks": {
+      "type": "array",
+      "items": {"type": ["string", "object"]}
+    },
+    "missing_observables": {
+      "type": "array",
+      "items": {"type": ["string", "object"]}
+    },
+    "mutants": {
+      "type": "array",
+      "items": {"type": ["string", "object"]}
+    },
+    "evidence": {
+      "type": "array",
+      "items": {"type": ["string", "object"]}
+    }
+  }
+}

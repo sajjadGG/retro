@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retro.local/schemas/retro-task-definitions-v1.json",
+  "title": "Retro task definitions",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_id", "tasks", "rejections"],
+  "properties": {
+    "schema_version": {"const": "retro-task-definitions-v1"},
+    "source_id": {"type": "string", "minLength": 1},
+    "tasks": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {"$ref": "#/$defs/task"}
+    },
+    "rejections": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rejection"}
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_id",
+        "kind",
+        "prompt",
+        "prompt_provenance",
+        "goal_segment",
+        "repo_evidence",
+        "scorer_brief",
+        "base_failure_claim",
+        "outcome_success_claim",
+        "adjacency",
+        "confidence"
+      ],
+      "properties": {
+        "candidate_id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["replay", "adjacent"]},
+        "prompt": {"type": "string", "minLength": 1, "maxLength": 4000},
+        "prompt_provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["user_event_ids", "mode"],
+          "properties": {
+            "user_event_ids": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1},
+              "uniqueItems": true
+            },
+            "mode": {"const": "resolved_user_messages"}
+          }
+        },
+        "goal_segment": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["introduced_event_id", "closed_event_id", "summary"],
+          "properties": {
+            "introduced_event_id": {"type": "string", "minLength": 1},
+            "closed_event_id": {
+              "type": ["string", "null"],
+              "minLength": 1
+            },
+            "summary": {"type": "string", "minLength": 1}
+          }
+        },
+        "repo_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["state", "path", "reason"],
+            "properties": {
+              "state": {"enum": ["base", "outcome"]},
+              "path": {"type": "string", "minLength": 1},
+              "reason": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "scorer_brief": {"$ref": "#/$defs/scorer_brief"},
+        "base_failure_claim": {"type": "string", "minLength": 1},
+        "outcome_success_claim": {"type": "string", "minLength": 1},
+        "adjacency": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/adjacency"}
+          ]
+        },
+        "confidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["goal", "state", "scorability"],
+          "properties": {
+            "goal": {"type": "number", "minimum": 0, "maximum": 1},
+            "state": {"type": "number", "minimum": 0, "maximum": 1},
+            "scorability": {"type": "number", "minimum": 0, "maximum": 1}
+          }
+        }
+      }
+    },
+    "scorer_brief": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observables",
+        "regressions_to_protect",
+        "performance",
+        "residual_judgment",
+        "forbidden_shortcuts"
+      ],
+      "properties": {
+        "observables": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "description", "importance", "evidence"],
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "description": {"type": "string", "minLength": 1},
+              "importance": {"enum": ["gate", "soft"]},
+              "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "regressions_to_protect": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "performance": {
+          "type": "array",
+          "items": {"type": "object"}
+        },
+        "residual_judgment": {
+          "type": "array",
+          "items": {"type": "object"}
+        },
+        "forbidden_shortcuts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "adjacency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["parent_candidate_id", "operator", "transformed_object", "base_failure_reason"],
+      "properties": {
+        "parent_candidate_id": {"type": "string", "minLength": 1},
+        "operator": {
+          "enum": [
+            "sibling_transfer",
+            "boundary_extension",
+            "correction_regression",
+            "performance_constraint"
+          ]
+        },
+        "transformed_object": {"type": "string", "minLength": 1},
+        "base_failure_reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "rejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal_event_ids", "code", "detail"],
+      "properties": {
+        "goal_event_ids": {
+          "type": "array",
+          "items": {"type": "string", "minLength": 1}
+        },
+        "code": {"type": "string", "minLength": 1},
+        "detail": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

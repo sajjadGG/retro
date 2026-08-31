@@ -48,6 +48,48 @@ class Layout:
         root = self.root / "benchmark-runs"
         return root / benchmark_id if benchmark_id else root
 
+    # ---- rollout-to-task/scorer taskset artifacts ---------------------------
+
+    def benchmark_taskset_dir(self, name: str) -> Path:
+        return self.benchmark_dir(name) / "task-scorer"
+
+    def benchmark_taskset_sources_dir(self, name: str) -> Path:
+        return self.benchmark_taskset_dir(name) / "sources"
+
+    def benchmark_taskset_source_dir(self, name: str, source_id: str) -> Path:
+        return self.benchmark_taskset_sources_dir(name) / source_id
+
+    def benchmark_taskset_tasks_dir(self, name: str) -> Path:
+        return self.benchmark_taskset_dir(name) / "tasks"
+
+    def benchmark_taskset_task_dir(self, name: str, task_id: str) -> Path:
+        return self.benchmark_taskset_tasks_dir(name) / task_id
+
+    def benchmark_taskset_build_run_dir(self, name: str, build_id: str) -> Path:
+        return self.benchmark_taskset_dir(name) / "builds" / build_id
+
+    def benchmark_taskset_eval_dir(self, name: str, eval_id: str) -> Path:
+        return self.benchmark_taskset_dir(name) / "evals" / eval_id
+
+    def benchmark_taskset_attempt_dir(
+        self,
+        name: str,
+        eval_id: str,
+        task_id: str,
+        agent_id: str,
+        seed: int,
+    ) -> Path:
+        return (
+            self.benchmark_taskset_eval_dir(name, eval_id)
+            / "attempts"
+            / task_id
+            / agent_id
+            / f"seed-{seed}"
+        )
+
+    def benchmark_taskset_results_path(self, name: str, eval_id: str) -> Path:
+        return self.benchmark_taskset_eval_dir(name, eval_id) / "results.json"
+
     def ensure(self) -> None:
         for sub in (
             "raw",

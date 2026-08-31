@@ -21,7 +21,7 @@ from typing import Any
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, iter_jsonl, truncate_summary
-from .base import ImportResult
+from .base import ImportResult, has_only_repo_state_capture
 
 CLAUDE_HOME = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_HOME / "projects"
@@ -49,9 +49,18 @@ class ClaudeSession:
     session_id: str
     transcript_path: Path
     project_slug: str
+    cwd: str
     size_bytes: int
     mtime: float
     claude_home: Path
+
+
+def _read_transcript_cwd(path: Path) -> str:
+    for _, event in iter_jsonl(path):
+        cwd = event.get("cwd")
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
+    return ""
 
 
 def _resolve_claude_roots(explicit: tuple[Path, ...] | None = None) -> list[Path]:
@@ -133,6 +142,7 @@ class ClaudeImporter:
                             session_id=jsonl.stem,
                             transcript_path=jsonl,
                             project_slug=proj_dir.name,
+                            cwd=_read_transcript_cwd(jsonl),
                             size_bytes=st.st_size,
                             mtime=st.st_mtime,
                             claude_home=root,
@@ -180,7 +190,7 @@ class ClaudeImporter:
                     raise FileExistsError(
                         f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
                     )
-            else:
+            elif not has_only_repo_state_capture(raw_dir):
                 raise FileExistsError(
                     f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
                 )
@@ -192,6 +202,7 @@ class ClaudeImporter:
             "host": self.host,
             "session_id": session.session_id,
             "project_slug": session.project_slug,
+            "cwd": session.cwd,
             "source_transcript": str(session.transcript_path),
             "claude_home": str(session.claude_home),
             "size_bytes": session.size_bytes,
@@ -249,17 +260,44 @@ class ClaudeImporter:
         tool_use_types: dict[str, EventType] = {}  # tool_use_id -> event_type
         tool_use_names: dict[str, str] = {}
         seq = 0
+        session_started = False
+        last_timestamp: str | None = None
+        last_raw_ref: RawRef | None = None
+        last_cwd = _read_transcript_cwd(transcript_path)
 
         for line_no, raw_event in iter_jsonl(transcript_path):
             seq += 1
             etype = raw_event.get("type")
             ts = raw_event.get("timestamp")
+            cwd = raw_event.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                last_cwd = cwd
             uuid = raw_event.get("uuid") or f"{session_id}:{line_no}"
             parent = raw_event.get("parentUuid")
             raw_ref = RawRef(
                 path=artifact_ref(transcript_path, self.layout.root),
                 line=line_no,
             )
+            last_timestamp = ts if isinstance(ts, str) else last_timestamp
+            last_raw_ref = raw_ref
+
+            if not session_started:
+                events.append(
+                    NormalizedEvent(
+                        event_id=f"{session_id}:session-start",
+                        session_id=session_id,
+                        host="claude-code",
+                        sequence=0,
+                        timestamp=ts,
+                        parent_event_id=None,
+                        raw_ref=raw_ref,
+                        actor="system",
+                        event_type="session_start",
+                        summary=f"claude-code session start cwd={last_cwd or None}",
+                        payload={"cwd": last_cwd} if last_cwd else {},
+                    )
+                )
+                session_started = True
 
             common: dict[str, Any] = dict(
                 session_id=session_id,
@@ -340,6 +378,23 @@ class ClaudeImporter:
                         **common,
                     )
                 )
+
+        if session_started and last_raw_ref is not None:
+            events.append(
+                NormalizedEvent(
+                    event_id=f"{session_id}:session-end",
+                    session_id=session_id,
+                    host="claude-code",
+                    sequence=seq + 1,
+                    timestamp=last_timestamp,
+                    parent_event_id=None,
+                    raw_ref=last_raw_ref,
+                    actor="system",
+                    event_type="session_end",
+                    summary="claude-code session end",
+                    payload={"cwd": last_cwd} if last_cwd else {},
+                )
+            )
 
         return events, unknown, sorted(gaps)
 

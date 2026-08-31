@@ -1083,9 +1083,12 @@ ghostlab scorer-run \
 Behavior:
 
 1. create a new scorer sandbox, never reuse the AUT sandbox;
-2. materialize the candidate read-only at `/candidate/repo`;
-3. mount scorer files read-only at `/scorer` and fixtures at `/fixtures`;
-4. provide a writable `/output` and `/tmp` only;
+2. materialize the candidate at the read-only path carried by
+   `score-input.json` and `GHOSTLAB_CANDIDATE_ROOT`;
+3. expose scorer files, fixtures, and input through their `GHOSTLAB_*_ROOT`
+   paths; OpenShell implementations may map the logical `/candidate`,
+   `/scorer`, `/fixtures`, `/input`, and `/output` roots below `/sandbox`;
+4. provide only the reported output root and `/tmp` as writable;
 5. run deterministic entrypoint first;
 6. delete the deterministic sandbox after downloading its component report;
 7. if mode is `hybrid`, create a second judge sandbox containing the read-only candidate files, task, rubric, and deterministic report, but no executable candidate environment;
@@ -1095,7 +1098,14 @@ Behavior:
 11. download the report and logs;
 12. delete the judge sandbox.
 
-The deterministic scorer sandbox has no network or model credentials even though its tests may execute candidate code. The judge sandbox has provider access but cannot execute candidate code: `bash`, subprocesses, and project test commands are denied. This separation prevents a malicious candidate implementation from exfiltrating judge credentials.
+The deterministic scorer sandbox has no network or model credentials even
+though its tests may execute candidate code. A deterministic scorer that starts
+candidate code must use `GHOSTLAB_SECURE_EXEC` or an equivalent nested sandbox
+that withholds scorer files, fixtures, task input, and score-report output from
+that child. The judge sandbox has provider access but cannot execute candidate
+code: `bash`, subprocesses, and project test commands are denied. This
+separation prevents a malicious candidate implementation from exfiltrating
+judge credentials or forging its deterministic score report.
 
 ### 13.4 Ghostlab code changes
 
