@@ -169,9 +169,10 @@ def artifact_run(argv):
             exports.append({"path": local, "sha256": sha256_file(destination)})
 
     if args.export_workspace:
-        target = run_dir / args.export_workspace
+        workspace_export_name = entry.get("workspace_export_name", args.export_workspace)
+        target = run_dir / workspace_export_name
         pack(sandbox, target)
-        exports.append({"path": args.export_workspace, "sha256": sha256_file(target)})
+        exports.append({"path": workspace_export_name, "sha256": sha256_file(target)})
 
     (run_dir / "events.jsonl").write_text(
         json.dumps({"type": "user.message", "text": Path(args.prompt_file).read_text()}) + "\n"

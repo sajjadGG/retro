@@ -389,16 +389,25 @@ class ArtifactRunRequest:
     extra_args: tuple[str, ...] = ()
     label: str = "artifact-run"
 
+    def workspace_exports(self) -> tuple[str, ...]:
+        if not self.export_workspace:
+            return ()
+        requested = self.export_workspace
+        names = [requested]
+        if requested.endswith(".tar.zst"):
+            names.append(requested[: -len(".tar.zst")] + ".tar.gz")
+        elif requested.endswith(".tgz"):
+            names.append(requested[: -len(".tgz")] + ".tar.gz")
+        elif not requested.endswith((".tar.gz", ".tar")):
+            names.append(requested + ".tar.gz")
+        return tuple(dict.fromkeys(names))
+
     def required_exports(self) -> tuple[str, ...]:
-        names = [spec.local_name for spec in self.exports if spec.required]
-        if self.export_workspace:
-            names.append(self.export_workspace)
-        return tuple(sorted(names))
+        return tuple(sorted(spec.local_name for spec in self.exports if spec.required))
 
     def declared_exports(self) -> tuple[str, ...]:
         names = [spec.local_name for spec in self.exports]
-        if self.export_workspace:
-            names.append(self.export_workspace)
+        names.extend(self.workspace_exports())
         return tuple(sorted(names))
 
 
@@ -1144,6 +1153,18 @@ class GhostlabCli:
                 )
             exports[name] = path
             export_sha256[name] = digest
+        workspace_exports = request.workspace_exports()
+        if (
+            workspace_exports
+            and status == "completed"
+            and not any(name in exports for name in workspace_exports)
+        ):
+            raise GhostlabContractError(
+                "artifact-run did not produce a requested workspace export "
+                f"({', '.join(workspace_exports)})",
+                argv=argv,
+                run_dir=run_dir,
+            )
         return exports, export_sha256
 
 
