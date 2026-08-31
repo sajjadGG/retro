@@ -10,7 +10,15 @@ from typer.testing import CliRunner
 
 from retro.benchmarks.task_scorer.build import BuildConfigurationError
 from retro.benchmarks.task_scorer.run import TaskVerificationError
-from retro.cli import app, benchmark_run_cmd
+from retro.cli import (
+    app,
+    benchmark_run_cmd,
+    taskset_build_cmd,
+    taskset_bundle_cmd,
+    taskset_report_cmd,
+    taskset_run_cmd,
+    taskset_select_cmd,
+)
 from retro.config import load_config
 
 runner = CliRunner()
@@ -172,20 +180,21 @@ def test_benchmark_run_help():
 
 def test_taskset_command_help_exposes_complete_pipeline():
     expected = {
-        "select": "--environment-config",
-        "bundle": "--selected-only",
-        "build": "--task-definer-agent",
-        "run": "--seeds",
-        "report": "--eval",
+        "select": (taskset_select_cmd, "environment_config", "--environment-config"),
+        "bundle": (
+            taskset_bundle_cmd,
+            "selected_only",
+            "--selected-only/--reselect",
+        ),
+        "build": (taskset_build_cmd, "task_definer_agent", "--task-definer-agent"),
+        "run": (taskset_run_cmd, "seeds", "--seeds"),
+        "report": (taskset_report_cmd, "eval_id", "--eval"),
     }
-    for command, option in expected.items():
-        result = runner.invoke(
-            app,
-            ["benchmark", "taskset", command, "--help"],
-            terminal_width=240,
-        )
+    for command, (callback, parameter_name, option) in expected.items():
+        result = runner.invoke(app, ["benchmark", "taskset", command, "--help"])
         assert result.exit_code == 0, result.output
-        assert option in result.output
+        parameter = inspect.signature(callback).parameters[parameter_name]
+        assert option in parameter.default.param_decls
 
 
 def test_taskset_build_accepts_a_path_command_name(monkeypatch, tmp_path):
