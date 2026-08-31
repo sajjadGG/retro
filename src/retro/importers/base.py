@@ -6,6 +6,7 @@ from typing import Protocol
 
 GHOSTLAB_ORIGINATOR = "ghostlab"
 GHOSTLAB_COPILOT_SESSION_ID_PREFIX = "67686f73-746c-"
+_REPO_STATE_FILES = frozenset({"repo_start.json", "repo_end.json"})
 
 
 def is_ghostlab_originator(value: object) -> bool:
@@ -35,3 +36,12 @@ class Importer(Protocol):
     def discover(self) -> list[dict]:
         """Return a list of session descriptors visible to this host."""
         ...
+
+
+def has_only_repo_state_capture(raw_dir: Path) -> bool:
+    if not raw_dir.is_dir():
+        return False
+    entries = list(raw_dir.iterdir())
+    return bool(entries) and all(
+        entry.is_file() and entry.name in _REPO_STATE_FILES for entry in entries
+    )

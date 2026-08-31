@@ -25,7 +25,7 @@ from typing import Any, Literal
 from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, iter_jsonl, truncate_summary
-from .base import ImportResult, is_ghostlab_originator
+from .base import ImportResult, has_only_repo_state_capture, is_ghostlab_originator
 
 CODEX_HOME = Path.home() / ".codex"
 STATE_DB = CODEX_HOME / "state_5.sqlite"
@@ -280,7 +280,7 @@ class CodexImporter:
                     raise FileExistsError(
                         f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
                     )
-            else:
+            elif not has_only_repo_state_capture(raw_dir):
                 raise FileExistsError(
                     f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
                 )
@@ -335,6 +335,10 @@ class CodexImporter:
         gaps: set[str] = set()
         call_id_to_event_type: dict[str, EventType] = {}
         call_id_to_name: dict[str, str] = {}
+        last_sequence = 0
+        last_timestamp: str | None = None
+        last_raw_ref: RawRef | None = None
+        session_cwd = ""
 
         for line_no, raw in iter_jsonl(rollout_path):
             seq = line_no
@@ -348,6 +352,9 @@ class CodexImporter:
                 path=artifact_ref(rollout_path, self.layout.root),
                 line=line_no,
             )
+            last_sequence = seq
+            last_timestamp = ts if isinstance(ts, str) else last_timestamp
+            last_raw_ref = raw_ref
             common: dict[str, Any] = dict(
                 event_id=event_id,
                 session_id=thread_id,
@@ -359,6 +366,9 @@ class CodexImporter:
             )
 
             if etype == "session_meta":
+                cwd = payload.get("cwd")
+                if isinstance(cwd, str):
+                    session_cwd = cwd
                 events.append(
                     NormalizedEvent(
                         actor="system",
@@ -416,6 +426,23 @@ class CodexImporter:
                         **common,
                     )
                 )
+
+        if events and last_raw_ref is not None:
+            events.append(
+                NormalizedEvent(
+                    event_id=f"{thread_id}:session-end",
+                    session_id=thread_id,
+                    host="codex",
+                    sequence=last_sequence + 1,
+                    timestamp=last_timestamp,
+                    parent_event_id=None,
+                    raw_ref=last_raw_ref,
+                    actor="system",
+                    event_type="session_end",
+                    summary="codex session end",
+                    payload={"cwd": session_cwd} if session_cwd else {},
+                )
+            )
 
         return events, unknown, sorted(gaps)
 

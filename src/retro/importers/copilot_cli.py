@@ -12,7 +12,11 @@ from typing import Any
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, truncate_summary
-from .base import ImportResult, is_ghostlab_copilot_session_id
+from .base import (
+    ImportResult,
+    has_only_repo_state_capture,
+    is_ghostlab_copilot_session_id,
+)
 from .vscode_copilot import (
     _completion_event_type,
     _copy_stable,
@@ -188,7 +192,12 @@ class CopilotCliImporter:
 
         raw_dir = self.layout.raw_dir(self.host, session.session_id)
         fingerprint = _capture_fingerprint(session)
-        if raw_dir.exists() and not force and not _source_is_newer(raw_dir, fingerprint):
+        if (
+            raw_dir.exists()
+            and not force
+            and not has_only_repo_state_capture(raw_dir)
+            and not _source_is_newer(raw_dir, fingerprint)
+        ):
             raise FileExistsError(
                 f"Raw capture already exists at {raw_dir} (pass force=True to overwrite)"
             )

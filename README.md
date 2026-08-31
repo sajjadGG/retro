@@ -217,6 +217,14 @@ rollout-memory/
     private/historical-localization-predictions.jsonl
     knowledge/eligible-event-refs.jsonl        # pre-cutoff evidence boundary
 
+  benchmarks/<name>/task-scorer/               # Git-backed implementation taskset
+    selections.json                            # accepted sources and explicit rejections
+    sources/<source-id>/                       # immutable rollout/base/outcome evidence
+    tasks/<task-id>/public/                    # prompt, base bundle, environment
+    tasks/<task-id>/private/                   # scorer, oracle, provenance, validation
+    builds/<build-id>/                         # resumable builder stage records
+    evals/<eval-id>/                           # attempts and source-normalized report
+
   benchmark-runs/<benchmark-id>/<run-id>/      # immutable evaluation result
     run-manifest.json
     predictions.jsonl
@@ -590,6 +598,77 @@ The runner:
 `--use-git-credential` is opt-in because it grants the isolated model process
 access to the retrieved token for the duration of the run. The value is removed
 from Retro's process environment afterward and never included in run metadata.
+
+### Build implementation tasks with hidden scorers
+
+`retro benchmark taskset` is separate from the file-localization benchmark
+above. It turns a Git-backed rollout with an exact clean base and durable
+accepted outcome into a single-message implementation task, a hidden executable
+scorer, and numeric `[0, 1]` results.
+
+Capture repository state from the coding host's lifecycle hook before the first
+agent action and after the final action:
+
+```bash
+retro capture start --host codex --session-id <session-id> --cwd /path/to/repo
+retro capture end --host codex --session-id <session-id> --cwd /path/to/repo
+```
+
+The capture records `HEAD`, its tree, porcelain-v2 status, and recursive
+submodule status. Existing files are never overwritten. Historical rollouts are
+accepted only when equivalent base evidence exists in the rollout; Retro never
+uses a commit selected only by timestamp.
+
+Construct and run a taskset through Ghostlab's public artifact and scorer
+commands:
+
+```bash
+retro benchmark taskset select \
+  --name personal-git-v1 \
+  --host codex \
+  --session-file sessions.txt \
+  --environment-config /outside/repo/retro-environment.json
+
+retro benchmark taskset bundle \
+  --name personal-git-v1 \
+  --selected-only
+
+retro benchmark taskset build \
+  --name personal-git-v1 \
+  --ghostlab-bin /path/to/ghostlab \
+  --task-definer-agent agents/task-definer.json \
+  --scorer-builder-agent agents/scorer-builder.json \
+  --scorer-auditor-agent agents/scorer-auditor.json
+
+retro benchmark taskset run \
+  --name personal-git-v1 \
+  --agent candidate-agents/codex.json \
+  --seeds 0,1,2 \
+  --ghostlab-bin /path/to/ghostlab
+
+retro benchmark taskset report \
+  --name personal-git-v1 \
+  --eval latest
+```
+
+Every stage is content-addressed and resumable. The evaluated agent receives
+only the prompt, immutable base repository, and public environment contract.
+`taskset run` overrides the agent's sandbox image with that contract's pinned
+image and executes its argument-array setup command before the agent turn.
+The outcome, rollout, reference solution, scorer, and provenance remain private.
+Scorers reward observable behavior rather than patch similarity. Reports
+macro-average tasks within each rollout source and then sources within the
+benchmark, so sources that yield multiple tasks do not receive extra weight.
+Agent failure, harness failure, scorer failure, and a correctly observed task
+failure remain distinct statuses.
+
+The environment resolver prioritizes an explicit external config, then a
+project Dockerfile/devcontainer declaration, validated CI commands, and an
+explicit RepoLaunch executable. It validates fresh base and outcome checkouts
+twice and records only digest-pinned images. Validation and agent/scorer runs
+have network disabled. Dependency builds also default to no network; an
+allowlist is accepted only when paired with a named, externally egress-filtered
+container network.
 
 ---
 

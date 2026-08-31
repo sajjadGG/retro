@@ -53,6 +53,51 @@ Registered filters:
 
 - `risk_aware`
 
+## Git-Backed Task And Scorer Benchmarks
+
+Capture the exact clean commit state from the coding host's lifecycle hook.
+These commands must run before the first agent action and after the final one;
+Retro never reconstructs a missing base from commit timestamps.
+
+```bash
+retro capture start --host codex --session-id <id> --cwd /path/to/repo
+retro capture end --host codex --session-id <id> --cwd /path/to/repo
+```
+
+Build and evaluate a taskset:
+
+```bash
+retro benchmark taskset select --name personal-git-v1 --host codex --session-file sessions.txt
+retro benchmark taskset bundle --name personal-git-v1 --selected-only
+retro benchmark taskset build --name personal-git-v1 \
+  --ghostlab-bin /path/to/ghostlab \
+  --task-definer-agent agents/task-definer.json \
+  --scorer-builder-agent agents/scorer-builder.json \
+  --scorer-auditor-agent agents/scorer-auditor.json
+retro benchmark taskset run --name personal-git-v1 \
+  --agent candidate-agents/codex.json \
+  --seeds 0,1,2 \
+  --ghostlab-bin /path/to/ghostlab
+retro benchmark taskset report --name personal-git-v1 --eval latest
+```
+
+Selection requires a validated project environment. Provide a prevalidated
+`retro-project-environment-v1` contract with `--environment-file`, or let Retro
+resolve and validate one with `--environment-config`, repository container
+metadata, CI commands plus `--ci-base-image`, or an explicit
+`--repolaunch-bin`. Container validation runs against fresh base and outcome
+trees twice with network disabled. Image builds use no network unless both a
+destination `--build-network-allowlist` and an externally egress-filtered
+`--build-network-name` are supplied.
+
+During `taskset run`, Retro passes the published digest-pinned image and setup
+argument array to Ghostlab. Those values override the candidate agent's ambient
+sandbox image and run before its single task turn.
+
+Selection and construction write explicit rejection records. A rollout with no
+replayable goal is a valid zero-task result. Scorer or harness failures remain
+invalid attempts and are never converted into numeric zeroes.
+
 ## Memory
 
 ```bash

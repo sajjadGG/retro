@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://retro.local/schemas/retro-score-report-v1.json",
+  "title": "Retro score report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "attempt_id",
+    "status",
+    "valid",
+    "components",
+    "hard_gate_failures",
+    "commands",
+    "judge",
+    "warnings",
+    "scorer_package_sha256",
+    "duration_ms"
+  ],
+  "properties": {
+    "schema_version": {"const": "retro-score-report-v1"},
+    "task_id": {"type": "string", "minLength": 1},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "status": {
+      "enum": [
+        "scored",
+        "invalid_candidate_artifact",
+        "scorer_error",
+        "scorer_timeout",
+        "judge_unavailable"
+      ]
+    },
+    "score_total": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+    "passed": {"type": ["boolean", "null"]},
+    "valid": {"type": "boolean"},
+    "pass_threshold": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "unscored_weight": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "value",
+          "weight",
+          "hard_gate",
+          "gate_passed",
+          "evidence"
+        ],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "value": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 1
+          },
+          "weight": {"type": "number", "minimum": 0, "maximum": 1},
+          "hard_gate": {"type": "boolean"},
+          "gate_passed": {"type": ["boolean", "null"]},
+          "evidence": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    },
+    "hard_gate_failures": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1}
+    },
+    "commands": {"type": "array", "items": {"type": "object"}},
+    "judge": {"type": ["object", "null"]},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "scorer_package_sha256": {"type": "string", "minLength": 1},
+    "duration_ms": {"type": "integer", "minimum": 0},
+    "repeatability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runs",
+        "deterministic_stable",
+        "unstable_components",
+        "max_total_spread",
+        "totals"
+      ],
+      "properties": {
+        "runs": {"type": "integer", "minimum": 2},
+        "deterministic_stable": {"type": "boolean"},
+        "unstable_components": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "max_total_spread": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "totals": {
+          "type": "array",
+          "minItems": 2,
+          "items": {"type": "number", "minimum": 0, "maximum": 1}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"status": {"const": "scored"}},
+        "required": ["status"]
+      },
+      "then": {
+        "required": ["score_total", "passed"],
+        "properties": {
+          "score_total": {"type": "number"},
+          "passed": {"type": "boolean"}
+        }
+      },
+      "else": {
+        "properties": {
+          "score_total": {"type": "null"},
+          "passed": {"type": "null"},
+          "valid": {"const": false}
+        }
+      }
+    }
+  ]
+}

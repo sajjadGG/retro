@@ -25,6 +25,7 @@ dev = [
 
 [project.scripts]
 retro = "retro.cli:app"
+retro-context = "retro.benchmarks.task_scorer.context_cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sajjadGG/retro"
