@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .schema import Host
+from .schema import Host, validate_host_id, validate_session_id
 
 
 @dataclass(frozen=True)
@@ -12,18 +12,26 @@ class Layout:
     root: Path
 
     def raw_dir(self, host: Host, session_id: str) -> Path:
-        return self.root / "raw" / host / session_id
+        return self.root / "raw" / validate_host_id(host) / validate_session_id(session_id)
 
     def normalized_path(self, host: Host, session_id: str) -> Path:
+        host = validate_host_id(host)
+        session_id = validate_session_id(session_id)
         return self.root / "normalized" / host / f"{session_id}.events.jsonl"
 
     def rendered_path(self, host: Host, session_id: str) -> Path:
+        host = validate_host_id(host)
+        session_id = validate_session_id(session_id)
         return self.root / "rendered" / host / f"{session_id}.md"
 
     def mined_json_path(self, host: Host, session_id: str, method: str) -> Path:
+        host = validate_host_id(host)
+        session_id = validate_session_id(session_id)
         return self.root / "mined" / method / host / f"{session_id}.json"
 
     def mined_prompt_path(self, host: Host, session_id: str, method: str) -> Path:
+        host = validate_host_id(host)
+        session_id = validate_session_id(session_id)
         return self.root / "mined" / method / host / f"{session_id}.prompt.md"
 
     def memories_dir(self) -> Path:
@@ -103,17 +111,36 @@ class Layout:
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 
     def list_imported(self, host: Host) -> list[str]:
-        host_dir = self.root / "raw" / host
+        host_dir = self.root / "raw" / validate_host_id(host)
         if not host_dir.exists():
             return []
         return sorted(p.name for p in host_dir.iterdir() if p.is_dir())
 
     def list_normalized(self, host: Host) -> list[str]:
-        host_dir = self.root / "normalized" / host
+        host_dir = self.root / "normalized" / validate_host_id(host)
         if not host_dir.exists():
             return []
         suffix = ".events.jsonl"
         return sorted(p.name[: -len(suffix)] for p in host_dir.glob(f"*{suffix}") if p.is_file())
+
+    def list_imported_hosts(self) -> list[Host]:
+        return self._list_host_dirs(self.root / "raw")
+
+    def list_normalized_hosts(self) -> list[Host]:
+        return self._list_host_dirs(self.root / "normalized")
+
+    def list_hosts(self) -> list[Host]:
+        return sorted(set(self.list_imported_hosts()) | set(self.list_normalized_hosts()))
+
+    @staticmethod
+    def _list_host_dirs(root: Path) -> list[Host]:
+        if not root.exists():
+            return []
+        return sorted(
+            validate_host_id(path.name)
+            for path in root.iterdir()
+            if path.is_dir()
+        )
 
 
 def default_layout(root: Path | str | None = None) -> Layout:

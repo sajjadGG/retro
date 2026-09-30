@@ -42,6 +42,8 @@ COST_MODE_AUTO = "auto"
 COST_MODE_CALCULATE = "calculate"
 COST_MODE_DISPLAY = "display"
 COST_MODES = (COST_MODE_AUTO, COST_MODE_CALCULATE, COST_MODE_DISPLAY)
+DASHBOARD_SESSION_LIMIT = 1_000
+DASHBOARD_MEMORY_CANDIDATE_LIMIT = 2_000
 
 # Rough, editable defaults. Rates are USD per 1M tokens and mirror the
 # ccusage-style split between uncached input, cache creation, cache reads, and output.
@@ -177,6 +179,7 @@ def build(
     sessions = collect_sessions(pricing=pricing, cost_mode=mode)
     signal_readings_by_session, signal_aggregates = load_signal_data()
     attach_signals_to_sessions(sessions, signal_readings_by_session)
+    dashboard_sessions = sessions[:DASHBOARD_SESSION_LIMIT]
 
     # Load quest state
     quest_state_path = ARTIFACT_ROOT / "quests" / "state.json"
@@ -191,21 +194,35 @@ def build(
     from retro.analyzer import analyze_operator_portfolio
     operator_profile = analyze_operator_portfolio(sessions)
 
+    summary = summarize_portfolio(sessions)
+    summary["sessions_in_payload"] = len(dashboard_sessions)
+    summary["session_limit"] = DASHBOARD_SESSION_LIMIT
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "rate_note": pricing.source_note(),
         "rates_usd_per_million": DEFAULT_RATES,
         "pricing_meta": pricing.meta,
         "cost_mode": mode,
-        "summary": summarize_portfolio(sessions),
-        "memory": summarize_memory(sessions),
+        "summary": summary,
+        "memory": summarize_memory(
+            sessions,
+            candidate_limit=DASHBOARD_MEMORY_CANDIDATE_LIMIT,
+        ),
         "signals": signal_aggregates,
-        "sessions": sessions,
+        "sessions": dashboard_sessions,
         "quests": quest_state,
         "operator_profile": operator_profile,
     }
     data_path = DATA_DIR / "rollouts.json"
     data_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    rendered_link = OUT_DIR / "rendered"
+    if rendered_link.is_symlink():
+        rendered_link.unlink()
+    if not rendered_link.exists():
+        rendered_link.symlink_to(
+            ARTIFACT_ROOT / "rendered",
+            target_is_directory=True,
+        )
     index_path = OUT_DIR / "index.html"
     index_path.write_text(render_html(payload), encoding="utf-8")
     print(f"wrote {data_path}")
@@ -443,7 +460,11 @@ def analyze_session(
         "cost_note": pricing.source_note(),
         "normalized_path": rel(normalized_path),
         "rendered_path": rel(rendered_path) if rendered_path.exists() else None,
-        "rendered_markdown": read_text(rendered_path, limit=1_000_000) if rendered_path.exists() else "",
+        "rendered_href": (
+            f"rendered/{host}/{session_id}.md"
+            if rendered_path.exists()
+            else None
+        ),
         "raw_dir": rel(ARTIFACT_ROOT / "raw" / host / session_id),
         "mined": mined,
         "project_name": project_name,
@@ -464,6 +485,7 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             "sessions_claude": 0,
             "sessions_codex": 0,
             "sessions_copilot": 0,
+            "sessions_by_host": {},
             "cost_input": 0.0,
             "cost_cache_create": 0.0,
             "cost_cache_read": 0.0,
@@ -480,6 +502,9 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     for session in sessions:
         day = session["date"]
         by_day[day]["sessions"] += 1
+        host = session["host"]
+        sessions_by_host = by_day[day]["sessions_by_host"]
+        sessions_by_host[host] = sessions_by_host.get(host, 0) + 1
         if session["host"] == "claude-code":
             by_day[day]["sessions_claude"] += 1
         elif session["host"] == "codex":
@@ -589,7 +614,11 @@ def summarize_portfolio(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_memory(
+    sessions: list[dict[str, Any]],
+    *,
+    candidate_limit: int = DASHBOARD_MEMORY_CANDIDATE_LIMIT,
+) -> dict[str, Any]:
     """Roll up mined memory across every imported session.
 
     Surfaces:
@@ -665,6 +694,14 @@ def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             c.get("kind") or "",
         )
     )
+    all_candidates.sort(
+        key=lambda c: (
+            -(c.get("priority") or 0),
+            -(c.get("confidence") or 0),
+            c.get("kind") or "",
+        )
+    )
+    dashboard_candidates = all_candidates[:candidate_limit]
 
     return {
         "sessions_with_memory": sessions_with_memory,
@@ -676,7 +713,9 @@ def summarize_memory(sessions: list[dict[str, Any]]) -> dict[str, Any]:
         "by_method_kind": {m: dict(c.most_common()) for m, c in by_method_kind.items()},
         "method_session_counts": dict(method_session_counts.most_common()),
         "top_candidates": top[:12],
-        "all_candidates": all_candidates,  # full list for the "All Memories" tab
+        "all_candidates": dashboard_candidates,
+        "candidates_in_payload": len(dashboard_candidates),
+        "candidate_limit": candidate_limit,
     }
 
 
@@ -1583,7 +1622,7 @@ def render_html(payload: dict[str, Any]) -> str:
     .kpi .label {{ font-size: 12px; color: var(--muted); }}
     .kpi .value {{ margin-top: 6px; font-size: 23px; font-weight: 720; }}
     .kpi.sessions-total {{ border-top: 3px solid var(--accent); }}
-    .session-split {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 9px; }}
+    .session-split {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 8px; margin-top: 9px; }}
     .session-split .item {{ border-radius: 6px; padding: 6px 7px; border: 1px solid var(--line); background: #fbfbf8; }}
     .session-split .item.claude-code {{ background: var(--host-claude-soft); border-color: var(--host-claude-line); }}
     .session-split .item.codex {{ background: var(--host-codex-soft); border-color: var(--host-codex-line); }}
@@ -1613,6 +1652,7 @@ def render_html(payload: dict[str, Any]) -> str:
     tr.host-codex td:first-child {{ box-shadow: inset 3px 0 0 var(--host-codex); }}
     tr.host-claude-code td:first-child {{ box-shadow: inset 3px 0 0 var(--host-claude); }}
     tr.host-vscode-copilot td:first-child {{ box-shadow: inset 3px 0 0 var(--host-copilot); }}
+    tr.host-row td:first-child {{ box-shadow: inset 3px 0 0 var(--host-color, var(--accent)); }}
     .kpi.host-codex {{ border-top: 3px solid var(--host-codex); }}
     .kpi.host-claude-code {{ border-top: 3px solid var(--host-claude); }}
     .kpi.host-vscode-copilot {{ border-top: 3px solid var(--host-copilot); }}
@@ -1765,11 +1805,7 @@ def render_html(payload: dict[str, Any]) -> str:
 
     <section class="panel" id="memoryPanel">
       <h2>Memory · Mined Across Portfolio</h2>
-      <div class="legend">
-        <span><span class="dot claude-code"></span> Claude Code</span>
-        <span><span class="dot codex"></span> Codex</span>
-        <span><span class="dot vscode-copilot"></span> VS Code Copilot</span>
-      </div>
+      <div class="legend" id="hostLegend"></div>
       <div class="mem-grid" id="memoryGrid"></div>
     </section>
     <section class="panel" id="allMemoriesPanel">
@@ -1778,9 +1814,6 @@ def render_html(payload: dict[str, Any]) -> str:
       <div class="all-mem-controls">
         <select id="amHost">
           <option value="all">All hosts</option>
-          <option value="claude-code">Claude Code</option>
-          <option value="codex">Codex</option>
-          <option value="vscode-copilot">VS Code Copilot</option>
         </select>
         <select id="amScope">
           <option value="all">All scopes</option>
@@ -1811,7 +1844,7 @@ def render_html(payload: dict[str, Any]) -> str:
       <div class="signal-aggs" id="signalAggs"></div>
     </section>
     <section class="panel">
-      <h2>Activity By Day · <span style="color:var(--host-claude)">Claude</span> + <span style="color:var(--host-codex)">Codex</span> + <span style="color:var(--host-copilot)">Copilot</span></h2>
+      <h2>Activity By Day</h2>
       <div class="bars" id="dayBars"></div>
     </section>
     <section class="panel" id="accountingPanel">
@@ -1910,9 +1943,6 @@ def render_html(payload: dict[str, Any]) -> str:
       <input id="search" placeholder="Search title, id, host, file..." />
       <select id="hostFilter">
         <option value="all">All hosts</option>
-        <option value="codex">Codex</option>
-        <option value="claude-code">Claude Code</option>
-        <option value="vscode-copilot">VS Code Copilot</option>
       </select>
       <select id="projectFilter">
         <option value="all">All projects</option>
@@ -1963,20 +1993,46 @@ def render_html(payload: dict[str, Any]) -> str:
     const fmt = new Intl.NumberFormat();
     const money = v => v == null ? 'n/a' : '$' + Number(v).toFixed(4);
     const dur = s => s == null ? 'n/a' : (s < 60 ? s + 's' : Math.floor(s/60) + 'm ' + (s%60) + 's');
+    const HOST_LABELS = {{
+      'claude-code': 'Claude Code',
+      'codex': 'Codex',
+      'vscode-copilot': 'VS Code Copilot',
+    }};
+    const HOST_COLORS = {{
+      'claude-code': '#ea580c',
+      'codex': '#2563eb',
+      'vscode-copilot': '#8250df',
+    }};
+    const HOST_PALETTE = ['#0f766e', '#b45309', '#be123c', '#0369a1', '#6d28d9', '#3f6212'];
+
+    function hostLabel(host) {{
+      return HOST_LABELS[host] || host.replace(/(^|-)([a-z])/g, (_, sep, ch) => (sep ? ' ' : '') + ch.toUpperCase());
+    }}
+
+    function hostColor(host) {{
+      if (HOST_COLORS[host]) return HOST_COLORS[host];
+      let hash = 0;
+      for (const ch of host) hash = ((hash * 31) + ch.charCodeAt(0)) >>> 0;
+      return HOST_PALETTE[hash % HOST_PALETTE.length];
+    }}
 
     function kpi(label, value, klass='') {{
       return `<div class="kpi ${{klass}}"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`;
     }}
 
-    function sessionKpi(total, claudeCount, codexCount, copilotCount) {{
+    function sessionKpi(total, byHost) {{
+      const hostItems = Object.entries(byHost)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([host, count]) => `
+          <div class="item ${{host}}" style="border-color:${{hostColor(host)}}">
+            <span class="name">${{escapeHtml(hostLabel(host))}}</span>
+            <span class="count">${{fmt.format(count)}}</span>
+          </div>
+        `).join('');
       return `<div class="kpi sessions-total">
         <div class="label">Sessions</div>
         <div class="value">${{fmt.format(total)}}</div>
-        <div class="session-split">
-          <div class="item claude-code"><span class="name">Claude</span><span class="count">${{fmt.format(claudeCount)}}</span></div>
-          <div class="item codex"><span class="name">Codex</span><span class="count">${{fmt.format(codexCount)}}</span></div>
-          <div class="item vscode-copilot"><span class="name">Copilot</span><span class="count">${{fmt.format(copilotCount)}}</span></div>
-        </div>
+        <div class="session-split">${{hostItems}}</div>
       </div>`;
     }}
 
@@ -2050,13 +2106,10 @@ def render_html(payload: dict[str, Any]) -> str:
     function renderKpis() {{
       const t = DATA.summary.totals;
       const byHost = DATA.summary.by_host || {{}};
-      const claudeCount = byHost['claude-code'] || 0;
-      const codexCount = byHost['codex'] || 0;
-      const copilotCount = byHost['vscode-copilot'] || 0;
       const secretAgg = DATA.signals?.by_signal?.secret_exposure_signal || {{}};
       const mem = DATA.memory || {{}};
       document.getElementById('kpis').innerHTML = [
-        sessionKpi(DATA.summary.sessions_used_for_stats || DATA.summary.session_count, claudeCount, codexCount, copilotCount),
+        sessionKpi(DATA.summary.sessions_used_for_stats || DATA.summary.session_count, byHost),
         kpi('Memory candidates', fmt.format(mem.candidate_count || 0)),
         kpi('With token data', fmt.format(DATA.summary.sessions_with_token_usage || 0)),
         kpi('With cost estimate', fmt.format(DATA.summary.sessions_with_cost_estimate || 0)),
@@ -2073,21 +2126,24 @@ def render_html(payload: dict[str, Any]) -> str:
     function renderDayBars() {{
       const days = Object.entries(DATA.summary.by_day || {{}});
       const max = Math.max(1, ...days.map(([,d]) => d.sessions));
+      const hosts = Object.keys(DATA.summary.by_host || {{}}).sort();
+      document.getElementById('hostLegend').innerHTML = hosts.map(host =>
+        `<span><span class="dot" style="background:${{hostColor(host)}}"></span>${{escapeHtml(hostLabel(host))}}</span>`
+      ).join('');
       document.getElementById('dayBars').innerHTML = days.map(([day,d]) => {{
-        const claude = d.sessions_claude || 0;
-        const codex = d.sessions_codex || 0;
-        const copilot = d.sessions_copilot || 0;
-        const claudePct = 100 * claude / max;
-        const codexPct = 100 * codex / max;
-        const copilotPct = 100 * copilot / max;
+        const counts = d.sessions_by_host || {{
+          'claude-code': d.sessions_claude || 0,
+          'codex': d.sessions_codex || 0,
+          'vscode-copilot': d.sessions_copilot || 0,
+        }};
+        const segments = hosts.map(host =>
+          `<span class="seg" style="width:${{100 * (counts[host] || 0) / max}}%;background:${{hostColor(host)}}"></span>`
+        ).join('');
+        const countLabel = hosts.map(host => counts[host] || 0).join('+');
         return `<div class="barrow">
           <span>${{day}}</span>
-          <div class="stacked-bar">
-            <span class="seg claude-code" style="width:${{claudePct}}%"></span>
-            <span class="seg codex" style="width:${{codexPct}}%"></span>
-            <span class="seg vscode-copilot" style="width:${{copilotPct}}%"></span>
-          </div>
-          <span title="claude / codex / copilot">${{claude}}+${{codex}}+${{copilot}}</span>
+          <div class="stacked-bar">${{segments}}</div>
+          <span title="${{hosts.map(hostLabel).join(' / ')}}">${{countLabel}}</span>
         </div>`;
       }}).join('');
     }}
@@ -2264,7 +2320,7 @@ def render_html(payload: dict[str, Any]) -> str:
         const hostClass = `host-${{s.host}}`;
         const isSelected = selected && selected.session_id === s.session_id && selected.host === s.host;
         return `
-        <tr data-id="${{s.host}}/${{s.session_id}}" class="${{hostClass}} ${{isSelected ? 'selected' : ''}}">
+        <tr data-id="${{s.host}}/${{s.session_id}}" class="host-row ${{hostClass}} ${{isSelected ? 'selected' : ''}}" style="--host-color:${{hostColor(s.host)}}">
           <td><span class="badge ${{s.host}}">${{s.host}}</span></td>
           <td>${{s.date}}</td>
           <td class="title-cell">
@@ -2323,10 +2379,52 @@ def render_html(payload: dict[str, Any]) -> str:
         textEl.style.display = 'none';
         htmlEl.style.display = 'block';
         htmlEl.innerHTML = memoryHtml(selected);
+      }} else if (activeTab === 'transcript') {{
+        textEl.style.display = 'none';
+        htmlEl.style.display = 'block';
+        htmlEl.innerHTML = transcriptHtml(selected);
+        const loadButton = document.getElementById('loadTranscript');
+        if (loadButton) {{
+          loadButton.addEventListener('click', () => loadTranscript(selected));
+        }}
       }} else {{
         textEl.style.display = '';
         htmlEl.style.display = 'none';
         textEl.textContent = detailText(selected);
+      }}
+    }}
+
+    function transcriptHtml(s) {{
+      if (!s.rendered_href) {{
+        return '<div class="mem-meta">No rendered transcript found for this session.</div>';
+      }}
+      const href = escapeHtml(s.rendered_href);
+      return `<div style="padding:12px">
+        <a href="${{href}}" target="_blank" rel="noopener">Open full rendered transcript</a>
+        <button id="loadTranscript" style="margin-left:8px">Load transcript here</button>
+        <div class="mem-meta" style="margin-top:8px">
+          Transcript text is loaded on demand so large archives keep the dashboard responsive.
+        </div>
+        <pre id="transcriptBody" style="margin-top:10px;display:none"></pre>
+      </div>`;
+    }}
+
+    async function loadTranscript(s) {{
+      const body = document.getElementById('transcriptBody');
+      const button = document.getElementById('loadTranscript');
+      if (!body || !button || !s.rendered_href) return;
+      button.disabled = true;
+      button.textContent = 'Loading…';
+      body.style.display = 'block';
+      body.textContent = 'Loading transcript…';
+      try {{
+        const response = await fetch(s.rendered_href);
+        if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+        body.textContent = await response.text();
+        button.textContent = 'Transcript loaded';
+      }} catch (error) {{
+        body.textContent = 'Inline loading is unavailable from this browser. Use “Open full rendered transcript” above.\\n\\n' + String(error);
+        button.textContent = 'Load failed';
       }}
     }}
 
@@ -2391,6 +2489,25 @@ def render_html(payload: dict[str, Any]) -> str:
     }}
 
     // ---- All Memories browser --------------------------------------------
+
+    function populateHostFilters() {{
+      const memoryHosts = ((DATA.memory || {{}}).all_candidates || []).map(c => c.host);
+      const hosts = [...new Set([
+        ...DATA.sessions.map(session => session.host),
+        ...memoryHosts,
+      ])].filter(Boolean).sort();
+      for (const id of ['hostFilter', 'amHost']) {{
+        const select = document.getElementById(id);
+        if (select.dataset.populated === 'true') continue;
+        for (const host of hosts) {{
+          const option = document.createElement('option');
+          option.value = host;
+          option.textContent = hostLabel(host);
+          select.appendChild(option);
+        }}
+        select.dataset.populated = 'true';
+      }}
+    }}
 
     function initAllMemoriesFilters() {{
       const mem = DATA.memory || {{}};
@@ -2461,7 +2578,7 @@ def render_html(payload: dict[str, Any]) -> str:
       );
 
       document.getElementById('amCount').textContent =
-        `${{fmt.format(filtered.length)}} of ${{fmt.format(all.length)}} memories`;
+        `${{fmt.format(filtered.length)}} matching displayed · ${{fmt.format(mem.candidate_count || all.length)}} total`;
       document.getElementById('allMemoriesList').innerHTML =
         filtered.length
           ? filtered.map(c => renderMemCard(c, {{showMethod: true, showSession: true}})).join('')
@@ -2494,7 +2611,6 @@ def render_html(payload: dict[str, Any]) -> str:
 
     function metric(label, value) {{ return `<div class="metric"><div class="label">${{label}}</div><div class="value">${{value}}</div></div>`; }}
     function detailText(s) {{
-      if (activeTab === 'transcript') return s.rendered_markdown || 'No rendered transcript found.';
       // activeTab === 'memory' is handled in renderDetail() via memoryHtml.
       if (activeTab === 'models') {{
         const tokens = s.tokens_by_model || {{}};
@@ -2798,6 +2914,7 @@ def render_html(payload: dict[str, Any]) -> str:
     }}
 
     function renderAll() {{ populateProjects(); renderInsights(); renderKpis(); renderQuests(); renderOperatorProfile(); renderProjects(); renderMemoryAggregates(); renderAllMemories(); renderSignalAggregates(); renderDayBars(); renderAccounting(); renderCeilingHeatmap(); renderRows(); renderDetail(); }}
+    populateHostFilters();
     initAllMemoriesFilters();
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);

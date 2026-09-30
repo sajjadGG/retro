@@ -11,7 +11,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
-from .schema import HOSTS, NormalizedEvent, read_events
+from .schema import BUILTIN_HOSTS, NormalizedEvent, read_events
 from .storage import Layout
 
 console = Console()
@@ -120,6 +120,7 @@ def _is_failed(ev: NormalizedEvent) -> bool:
 
 def analyze_sessions(layout: Layout) -> dict[str, Any]:
     """Scan all normalized rollout events and extract statistics."""
+    hosts = sorted(set(BUILTIN_HOSTS) | set(layout.list_normalized_hosts()))
     stats: dict[str, Any] = {
         host: {
             "sessions": 0,
@@ -127,7 +128,7 @@ def analyze_sessions(layout: Layout) -> dict[str, Any]:
             "tools": [],
             "transitions": Counter(),
         }
-        for host in HOSTS
+        for host in hosts
     }
     stats["total"] = {
         "sessions": 0,
@@ -136,7 +137,7 @@ def analyze_sessions(layout: Layout) -> dict[str, Any]:
         "transitions": Counter(),
     }
 
-    for host in HOSTS:
+    for host in hosts:
         session_ids = layout.list_normalized(host)
         stats[host]["sessions"] = len(session_ids)
         stats["total"]["sessions"] += len(session_ids)
@@ -219,6 +220,10 @@ def analyze_sessions(layout: Layout) -> dict[str, Any]:
     return stats
 
 
+def _host_keys(stats: dict[str, Any]) -> list[str]:
+    return sorted(host for host in stats if host != "total")
+
+
 def generate_report(stats: dict[str, Any], output_path: Path) -> None:
     """Generate the markdown report at rollout-memory/analysis_report.md."""
     lines = []
@@ -234,7 +239,8 @@ def generate_report(stats: dict[str, Any], output_path: Path) -> None:
         "| Host | Sessions | Total Commands | Command Failure Rate | Total Tool Calls | Tool Failure Rate |"
     )
     lines.append("|---|---|---|---|---|---|")
-    for host in (*HOSTS, "total"):
+    hosts = _host_keys(stats)
+    for host in (*hosts, "total"):
         h_data = stats[host]
         cmds = h_data["commands"]
         tools = h_data["tools"]
@@ -256,7 +262,7 @@ def generate_report(stats: dict[str, Any], output_path: Path) -> None:
 
     base_counts: dict[tuple[str, str], int] = defaultdict(int)
     base_fails: dict[tuple[str, str], int] = defaultdict(int)
-    for host in HOSTS:
+    for host in hosts:
         h_cmds = stats[host]["commands"]
         for c in h_cmds:
             key = (c["base_cmd"], host)
@@ -277,7 +283,7 @@ def generate_report(stats: dict[str, Any], output_path: Path) -> None:
 
     cmd_counts: dict[tuple[str, str], int] = defaultdict(int)
     cmd_fails: dict[tuple[str, str], int] = defaultdict(int)
-    for host in HOSTS:
+    for host in hosts:
         h_cmds = stats[host]["commands"]
         for c in h_cmds:
             key = (c["cmd_line"], host)
@@ -299,7 +305,7 @@ def generate_report(stats: dict[str, Any], output_path: Path) -> None:
 
     tool_counts: dict[tuple[str, str], int] = defaultdict(int)
     tool_fails: dict[tuple[str, str], int] = defaultdict(int)
-    for host in HOSTS:
+    for host in hosts:
         h_tools = stats[host]["tools"]
         for t in h_tools:
             key = (t["name"], host)
@@ -339,7 +345,8 @@ def render_console_report(stats: dict[str, Any]) -> None:
     summary_table.add_column("Total Tool Calls", justify="right")
     summary_table.add_column("Tool Failure Rate", justify="right")
 
-    for host in (*HOSTS, "total"):
+    hosts = _host_keys(stats)
+    for host in (*hosts, "total"):
         h_data = stats[host]
         cmds = h_data["commands"]
         tools = h_data["tools"]
@@ -368,7 +375,7 @@ def render_console_report(stats: dict[str, Any]) -> None:
 
     base_counts: dict[tuple[str, str], int] = defaultdict(int)
     base_fails: dict[tuple[str, str], int] = defaultdict(int)
-    for host in HOSTS:
+    for host in hosts:
         for c in stats[host]["commands"]:
             key = (c["base_cmd"], host)
             base_counts[key] += 1
@@ -391,7 +398,7 @@ def render_console_report(stats: dict[str, Any]) -> None:
 
     tool_counts: dict[tuple[str, str], int] = defaultdict(int)
     tool_fails: dict[tuple[str, str], int] = defaultdict(int)
-    for host in HOSTS:
+    for host in hosts:
         for t in stats[host]["tools"]:
             key = (t["name"], host)
             tool_counts[key] += 1

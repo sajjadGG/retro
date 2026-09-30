@@ -10,7 +10,7 @@ raw/ -> normalized/ -> signals/ -> mined/ -> memories/ -> dashboard/
 
 | Layer | Purpose |
 | --- | --- |
-| `raw/` | Immutable source copies of Claude Code and Codex session logs. |
+| `raw/` | Immutable or revision-preserved source copies from registered hosts. |
 | `normalized/` | Common `NormalizedEvent` JSONL stream. |
 | `signals/` | Evidence-linked readings and aggregates. |
 | `mined/` | Prompt-time memory candidates per method. |
@@ -35,7 +35,18 @@ Derived artifacts can be rebuilt:
 
 ## Source Discovery
 
-Importers exclude synthetic Ghostlab evaluation traffic before it enters the
+Built-in and installed source providers register through the `retro.sources`
+Python entry-point group. Retro discovers entry points without importing their
+modules, checks extension API compatibility when loaded, and routes list,
+import, sync, analysis, and derived rebuilds through validated host IDs.
+
+Imports execute against a staging `Layout`. Retro validates that a provider
+wrote the expected raw directory and normalized JSONL, then replaces both
+published artifacts atomically while holding the archive lock. Providers
+cannot select arbitrary publication paths through their returned
+`ImportResult`.
+
+Built-in providers exclude synthetic Ghostlab evaluation traffic before it enters the
 archive. Codex sessions are identified by `session_meta.originator: ghostlab`;
 Copilot CLI sessions use Ghostlab's reserved UUID prefix. The marker is attached
 to session metadata rather than prompts, so excluding it does not change the
@@ -47,6 +58,8 @@ recorded conversation.
 | --- | --- |
 | `src/retro/schema.py` | Canonical event dataclasses and readers. |
 | `src/retro/storage.py` | Filesystem layout conventions. |
+| `src/retro/sdk/` | Stable extension API, source contracts, and lazy entry-point registry. |
+| `src/retro/extensions.py` | Built-in adapters, diagnostics, staging, validation, and publication. |
 | `src/retro/importers/` | Host-specific importers. |
 | `src/retro/signals/` | Signal registry and evaluators. |
 | `src/retro/mining/` | Mining method and filter registries. |
@@ -55,6 +68,11 @@ recorded conversation.
 | `src/retro/cli.py` | Typer command surface. |
 
 ## Plugin Pattern
+
+Source packages expose one adapter class through `retro.sources`. The class
+accepts a `Layout`, returns `SessionDescriptor` objects from `discover()`, and
+returns an `ImportResult` from `import_session()`. Extension packages declare
+API version `1` and import public types from `retro.sdk`.
 
 Signals and mining methods self-register with decorators.
 

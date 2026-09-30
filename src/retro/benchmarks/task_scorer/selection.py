@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from ...schema import HOSTS, Host, NormalizedEvent, read_events
+from ...schema import BUILTIN_HOSTS, Host, NormalizedEvent, read_events
 from ...storage import Layout
 from ...utils import atomic_write_text
 from . import git_state
@@ -466,7 +466,7 @@ def normalize_host(value: str) -> Host:
     try:
         return _HOST_ALIASES[value.strip().lower()]
     except KeyError as error:
-        expected = ", ".join(HOSTS)
+        expected = ", ".join(BUILTIN_HOSTS)
         raise SelectionError(f"unknown host {value!r}; expected one of {expected}") from error
 
 
@@ -530,7 +530,9 @@ def load_session_file(path: Path, *, host: str | None = None) -> list[tuple[str,
 
 def discover_sessions(layout: Layout, *, host: str | None = None) -> list[tuple[str, str]]:
     """Every normalized session under ``layout``, optionally filtered by ``--host``."""
-    hosts: tuple[Host, ...] = (normalize_host(host),) if host is not None else HOSTS
+    hosts: tuple[Host, ...] = (
+        (normalize_host(host),) if host is not None else BUILTIN_HOSTS
+    )
     found: list[tuple[str, str]] = []
     for name in hosts:
         directory = layout.root / "normalized" / name

@@ -22,7 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from ..locking import exclusive_lock
-from ..schema import HOSTS, Host, NormalizedEvent, read_events
+from ..schema import BUILTIN_HOSTS, Host, NormalizedEvent, read_events
 from ..storage import Layout
 from ..utils import event_command_text, event_file_paths, event_text
 from .metrics import (
@@ -171,7 +171,7 @@ def build_time_consistent_benchmark(
     project_root: Path,
     cutoff_time: str,
     end_time: str,
-    hosts: Sequence[Host] = HOSTS,
+    hosts: Sequence[Host] = BUILTIN_HOSTS,
 ) -> BenchmarkBuildResult:
     """Build an immutable rollout-derived localization benchmark."""
     _validate_identifier(benchmark_id, "benchmark id")
@@ -181,7 +181,7 @@ def build_time_consistent_benchmark(
         raise ValueError("cutoff_time must be earlier than end_time")
     if not hosts:
         raise ValueError("at least one host is required")
-    unknown_hosts = sorted(set(hosts) - set(HOSTS))
+    unknown_hosts = sorted(set(hosts) - set(BUILTIN_HOSTS))
     if unknown_hosts:
         raise ValueError(f"unknown hosts: {unknown_hosts}")
 

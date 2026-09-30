@@ -1,0 +1,6 @@
+{"type":"session_start","session_id":"oc-session-001","title":"Implement adapter support","cwd":"/tmp/demo","model":"gpt-5","project":"demo","timestamp":"2026-09-29T20:00:00Z"}
+{"type":"message","id":"m1","role":"user","content":"Add a source adapter.","timestamp":"2026-09-29T20:00:01Z"}
+{"type":"tool_call","id":"c1","name":"bash","input":{"command":"pytest -q"},"timestamp":"2026-09-29T20:00:02Z"}
+{"type":"tool_result","id":"r1","call_id":"c1","output":"1 passed","timestamp":"2026-09-29T20:00:03Z"}
+{"type":"future_record","id":"u1","payload":{"preserve":true},"timestamp":"2026-09-29T20:00:04Z"}
+not valid json

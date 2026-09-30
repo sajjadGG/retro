@@ -48,7 +48,7 @@ def publish_dashboard_generation(
         + f"-{os.getpid()}"
     )
     generation = builds / generation_name
-    shutil.copytree(staging, generation)
+    os.replace(staging, generation)
 
     current = output_dir / "current"
     temporary_link = output_dir / f".current.{generation_name}"
@@ -67,6 +67,14 @@ def publish_dashboard_generation(
         backup_dir=backup_dir,
         output_dir=output_dir,
     )
+    rendered = generation / "rendered"
+    if rendered.exists():
+        _ensure_compatibility_link(
+            output_dir / "rendered",
+            Path("current") / "rendered",
+            backup_dir=backup_dir,
+            output_dir=output_dir,
+        )
     trajectory = generation / "trajectory_experiments.html"
     if trajectory.exists():
         _ensure_compatibility_link(
@@ -76,7 +84,7 @@ def publish_dashboard_generation(
             output_dir=output_dir,
         )
 
-    _trim_generations(builds, current.resolve(), keep=3)
+    _trim_generations(builds, current.resolve(), keep=2)
     return output_dir / "index.html"
 
 
@@ -105,7 +113,10 @@ def _ensure_compatibility_link(
     temporary = path.with_name(f".{path.name}.link")
     if temporary.exists() or temporary.is_symlink():
         temporary.unlink()
-    temporary.symlink_to(target, target_is_directory=target.name == "data")
+    temporary.symlink_to(
+        target,
+        target_is_directory=target.name in {"data", "rendered"},
+    )
     os.replace(temporary, path)
 
 

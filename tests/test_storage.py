@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from retro.storage import Layout, default_layout
 
 
@@ -51,6 +53,26 @@ def test_list_imported(tmp_path: Path):
     (tmp_path / "rollout-memory" / "raw" / "codex" / "thread-2").mkdir(parents=True)
     imported = lay.list_imported("codex")
     assert imported == ["thread-1", "thread-2"]
+
+
+def test_list_hosts_includes_external_artifacts(tmp_path: Path):
+    lay = Layout(tmp_path / "rollout-memory")
+    (lay.root / "raw" / "opencode" / "session-1").mkdir(parents=True)
+    normalized = lay.normalized_path("hermes", "session-2")
+    normalized.parent.mkdir(parents=True)
+    normalized.write_text("", encoding="utf-8")
+
+    assert lay.list_imported_hosts() == ["opencode"]
+    assert lay.list_normalized_hosts() == ["hermes"]
+    assert lay.list_hosts() == ["hermes", "opencode"]
+
+
+def test_layout_rejects_unsafe_path_components(tmp_path: Path):
+    lay = Layout(tmp_path)
+    with pytest.raises(ValueError, match="invalid host ID"):
+        lay.raw_dir("../escape", "session")
+    with pytest.raises(ValueError, match="invalid session ID"):
+        lay.raw_dir("opencode", "../escape")
 
 
 def test_default_layout():

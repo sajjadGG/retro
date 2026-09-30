@@ -9,7 +9,8 @@ from retro.analyzer import (
     generate_report,
     get_base_command,
 )
-from retro.schema import NormalizedEvent, RawRef
+from retro.schema import NormalizedEvent, RawRef, write_events
+from retro.storage import Layout
 
 
 def test_get_base_command():
@@ -108,3 +109,34 @@ def test_analyze_sessions(claude_imported, tmp_path):
     content = report_file.read_text(encoding="utf-8")
     assert "# Command & Tool Use Analysis Report" in content
     assert "Overview Summary" in content
+
+
+def test_analyze_sessions_includes_extension_hosts(tmp_path):
+    layout = Layout(tmp_path / "archive")
+    write_events(
+        layout.normalized_path("opencode", "session-1"),
+        [
+            NormalizedEvent(
+                event_id="call-1",
+                session_id="session-1",
+                host="opencode",
+                sequence=1,
+                actor="assistant",
+                event_type="command",
+                summary="bash(command=pytest)",
+                raw_ref=RawRef(
+                    path="raw/opencode/session-1/session.jsonl",
+                    line=1,
+                ),
+                payload={"name": "bash", "input": {"command": "pytest"}},
+            )
+        ],
+    )
+
+    stats = analyze_sessions(layout)
+    report_file = tmp_path / "report.md"
+    generate_report(stats, report_file)
+
+    assert stats["opencode"]["sessions"] == 1
+    assert stats["total"]["sessions"] == 1
+    assert "opencode" in report_file.read_text(encoding="utf-8")

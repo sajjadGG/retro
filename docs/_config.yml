@@ -8,6 +8,7 @@ header_pages:
   - guides.md
   - cli.md
   - architecture.md
+  - extensions.md
   - memory-backend.md
   - dashboard.md
   - contributing.md

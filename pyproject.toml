@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retro-ai"
-version = "0.3.0"
+version = "0.4.0"
 description = "Capture, analyze, and mine Codex, Claude Code, and VS Code Copilot rollouts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -26,6 +26,10 @@ dev = [
 [project.scripts]
 retro = "retro.cli:app"
 retro-context = "retro.benchmarks.task_scorer.context_cli:main"
+
+[tool.retro.extensions]
+api-version = "1"
+source-entry-point-group = "retro.sources"
 
 [project.urls]
 Homepage = "https://github.com/sajjadGG/retro"
