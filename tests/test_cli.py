@@ -6,11 +6,13 @@ import json
 import subprocess
 from pathlib import Path
 
+import typer
 from typer.testing import CliRunner
 
 from retro.benchmarks.task_scorer.build import BuildConfigurationError
 from retro.benchmarks.task_scorer.run import TaskVerificationError
 from retro.cli import (
+    _make_extension_import_command,
     app,
     benchmark_run_cmd,
     taskset_build_cmd,
@@ -20,6 +22,8 @@ from retro.cli import (
     taskset_select_cmd,
 )
 from retro.config import load_config
+from retro.schema import NormalizedEvent, RawRef, write_events
+from retro.sdk import ImportResult, SessionDescriptor
 
 runner = CliRunner()
 
@@ -78,6 +82,89 @@ def test_show_unknown_host():
 def test_list_command(tmp_path):
     result = runner.invoke(app, ["list", "--root", str(tmp_path / "rollout-memory")])
     assert result.exit_code == 0
+
+
+def test_extensions_commands():
+    listed = runner.invoke(app, ["extensions", "list"])
+    checked = runner.invoke(app, ["extensions", "doctor"])
+
+    assert listed.exit_code == 0, listed.output
+    assert "claude-code" in listed.output
+    assert "vscode-copilot" in listed.output
+    assert checked.exit_code == 0, checked.output
+    assert "source provider checks passed" in checked.output
+
+
+def test_extension_import_command_routes_provider(monkeypatch, tmp_path: Path):
+    class FakeSource:
+        host = "opencode"
+        display_name = "OpenCode"
+
+        def __init__(self, layout):
+            self.layout = layout
+
+        def discover(self):
+            return [
+                SessionDescriptor(
+                    host=self.host,
+                    session_id="session-1",
+                    title="Latest",
+                )
+            ]
+
+        def import_session(self, *, identifier: str, force: bool = False):
+            raw_dir = self.layout.raw_dir(self.host, identifier)
+            raw_dir.mkdir(parents=True)
+            normalized_path = self.layout.normalized_path(self.host, identifier)
+            count = write_events(
+                normalized_path,
+                [
+                    NormalizedEvent(
+                        event_id=f"{identifier}:1",
+                        session_id=identifier,
+                        host=self.host,
+                        sequence=1,
+                        actor="system",
+                        event_type="unknown",
+                        summary="preserved",
+                        raw_ref=RawRef(
+                            path=f"raw/{self.host}/{identifier}/source.jsonl",
+                            line=1,
+                        ),
+                    )
+                ],
+            )
+            return ImportResult(
+                host=self.host,
+                session_id=identifier,
+                raw_dir=raw_dir,
+                normalized_path=normalized_path,
+                event_count=count,
+            )
+
+    monkeypatch.setattr(
+        "retro.cli.create_source",
+        lambda host, layout: FakeSource(layout),
+    )
+    test_app = typer.Typer()
+    test_app.command("opencode")(_make_extension_import_command("opencode"))
+    test_app.command("other")(lambda: None)
+    root = tmp_path / "rollout-memory"
+
+    result = runner.invoke(
+        test_app,
+        [
+            "opencode",
+            "--latest",
+            "--no-render",
+            "--root",
+            str(root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "captured opencode/session-1" in result.output
+    assert (root / "normalized/opencode/session-1.events.jsonl").is_file()
 
 
 def test_dashboard_view_non_interactive():

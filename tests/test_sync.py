@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 from shutil import _ntuple_diskusage
 
+from retro.extensions import SourceHandle
 from retro.importers.copilot_cli import CopilotCliSession
+from retro.schema import NormalizedEvent, RawRef, write_events
+from retro.sdk import ImportResult, SessionDescriptor, SourceRegistry
 from retro.storage import Layout
 from retro.sync import _preserve_rewritten_raw, run_sync
 
@@ -21,15 +25,21 @@ class _EmptyImporter:
         return []
 
 
+def _patch_empty_sources(monkeypatch) -> None:
+    monkeypatch.setattr("retro.sync.source_host_names", lambda: ["codex"])
+    monkeypatch.setattr(
+        "retro.sync.create_source",
+        lambda host, layout: _EmptyImporter(layout),
+    )
+
+
 def test_noop_sync_does_not_rebuild_dashboard(monkeypatch, tmp_path: Path):
     layout = Layout(tmp_path / "archive")
     layout.ensure()
     dashboard = tmp_path / "dashboard"
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
-    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    _patch_empty_sources(monkeypatch)
     monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
 
     def write_signals(layout, readings):
@@ -109,9 +119,7 @@ def test_sync_report_is_structured(monkeypatch, tmp_path: Path):
     layout = Layout(tmp_path / "archive")
     layout.ensure()
     dashboard = tmp_path / "dashboard"
-    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    _patch_empty_sources(monkeypatch)
     monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
     monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
@@ -126,13 +134,90 @@ def test_sync_report_is_structured(monkeypatch, tmp_path: Path):
     assert saved["archive_root"] == str(layout.root)
 
 
+def test_sync_imports_registered_extension_source(monkeypatch, tmp_path: Path):
+    source_path = tmp_path / "opencode-session.jsonl"
+    source_path.write_text('{"type":"message"}\n', encoding="utf-8")
+
+    class ExternalSource:
+        RETRO_EXTENSION_API = "1"
+        host = "opencode"
+        display_name = "OpenCode"
+
+        def __init__(self, layout: Layout):
+            self.layout = layout
+
+        def discover(self):
+            return [
+                SessionDescriptor(
+                    host=self.host,
+                    session_id="session-1",
+                    source_path=source_path,
+                    metadata={"raw_filename": "session.jsonl"},
+                )
+            ]
+
+        def import_session(self, *, identifier: str, force: bool = False):
+            raw_dir = self.layout.raw_dir(self.host, identifier)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, raw_dir / "session.jsonl")
+            normalized = self.layout.normalized_path(self.host, identifier)
+            count = write_events(
+                normalized,
+                [
+                    NormalizedEvent(
+                        event_id="message-1",
+                        session_id=identifier,
+                        host=self.host,
+                        sequence=1,
+                        actor="user",
+                        event_type="message",
+                        summary="hello",
+                        raw_ref=RawRef(
+                            path=f"raw/{self.host}/{identifier}/session.jsonl",
+                            line=1,
+                        ),
+                    )
+                ],
+            )
+            return ImportResult(
+                host=self.host,
+                session_id=identifier,
+                raw_dir=raw_dir,
+                normalized_path=normalized,
+                event_count=count,
+            )
+
+    registry = SourceRegistry(include_entry_points=False)
+    registry.register_builtin("opencode", ExternalSource, source="test")
+    record = registry.get_record("opencode")
+    monkeypatch.setattr("retro.sync.source_host_names", lambda: ["opencode"])
+    monkeypatch.setattr(
+        "retro.sync.create_source",
+        lambda host, layout: SourceHandle(record, layout),
+    )
+    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
+    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
+    monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
+    monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
+    layout = Layout(tmp_path / "archive")
+
+    report = run_sync(
+        layout,
+        dashboard_dir=tmp_path / "dashboard",
+        force_derived=True,
+    )
+
+    assert report.status == "success"
+    assert report.imported == ["opencode/session-1"]
+    assert report.rendered == ["opencode/session-1"]
+    assert layout.normalized_path("opencode", "session-1").is_file()
+
+
 def test_low_space_only_blocks_scheduled_sync(monkeypatch, tmp_path: Path):
     layout = Layout(tmp_path / "archive")
     layout.ensure()
     dashboard = tmp_path / "dashboard"
-    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    _patch_empty_sources(monkeypatch)
     monkeypatch.setattr(
         "retro.sync.shutil.disk_usage",
         lambda path: _ntuple_diskusage(10 * 1024**3, 9 * 1024**3, 1024**3),
@@ -180,9 +265,7 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    _patch_empty_sources(monkeypatch)
     monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
     monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
@@ -225,9 +308,7 @@ def test_scheduled_sync_defers_derived_work_until_interval(
         ),
         encoding="utf-8",
     )
-    monkeypatch.setattr("retro.sync.ClaudeImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CodexImporter", _EmptyImporter)
-    monkeypatch.setattr("retro.sync.CopilotImporter", _EmptyImporter)
+    _patch_empty_sources(monkeypatch)
     monkeypatch.setattr("retro.sync._signal_signature", lambda: "same")
     monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "same")
     raw_state = json.loads(state.read_text(encoding="utf-8"))

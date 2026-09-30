@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from retro.schema import NormalizedEvent, RawRef, read_events, write_events
 
 
@@ -60,3 +62,33 @@ def test_to_dict():
     assert d["event_id"] == "ev-1"
     assert d["raw_ref"] == {"path": "p", "line": 3}
     assert d["host"] == "codex"
+
+
+@pytest.mark.parametrize("host", ["", "OpenCode", "../escape", "two words"])
+def test_event_rejects_invalid_host_ids(host: str):
+    with pytest.raises(ValueError, match="invalid host ID"):
+        NormalizedEvent(
+            event_id="ev-1",
+            session_id="s",
+            host=host,
+            sequence=1,
+            actor="system",
+            event_type="unknown",
+            summary="invalid",
+            raw_ref=RawRef(path="p", line=1),
+        )
+
+
+@pytest.mark.parametrize("session_id", ["", "../escape", "two words", "/absolute"])
+def test_event_rejects_invalid_session_ids(session_id: str):
+    with pytest.raises(ValueError, match="invalid session ID"):
+        NormalizedEvent(
+            event_id="ev-1",
+            session_id=session_id,
+            host="opencode",
+            sequence=1,
+            actor="system",
+            event_type="unknown",
+            summary="invalid",
+            raw_ref=RawRef(path="p", line=1),
+        )

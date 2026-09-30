@@ -237,8 +237,6 @@ def render_html(payload: dict[str, Any]) -> str:
       <input id="search" placeholder="Search title, id, host, badge..." />
       <select id="hostFilter">
         <option value="all">All hosts</option>
-        <option value="codex">Codex</option>
-        <option value="claude-code">Claude Code</option>
       </select>
       <select id="riskFilter">
         <option value="all">All risk states</option>
@@ -276,6 +274,15 @@ def render_html(payload: dict[str, Any]) -> str:
     function agg(name) {{ return DATA.signals.by_signal[name] || {{}}; }}
     function aggMean(name) {{ const a=agg(name); return a.mean == null ? 'n/a' : Number(a.mean).toFixed(2); }}
     function aggBool(name) {{ const a=agg(name); return `${{a.true_count || 0}} true`; }}
+    function populateHosts() {{
+      const select = document.getElementById('hostFilter');
+      [...new Set(DATA.sessions.map(session => session.host))].sort().forEach(host => {{
+        const option = document.createElement('option');
+        option.value = host;
+        option.textContent = host;
+        select.appendChild(option);
+      }});
+    }}
     function renderKpis() {{
       const s = DATA.summary;
       document.getElementById('kpis').innerHTML = [
@@ -359,6 +366,7 @@ def render_html(payload: dict[str, Any]) -> str:
     document.getElementById('search').addEventListener('input', renderRows);
     document.getElementById('hostFilter').addEventListener('change', renderRows);
     document.getElementById('riskFilter').addEventListener('change', renderRows);
+    populateHosts();
     renderAll();
   </script>
 </body>

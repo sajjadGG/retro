@@ -2,7 +2,11 @@
 
 ![Retro logo](assets/retro_logo.png)
 
-Capture **Codex**, **Claude Code**, and **VS Code GitHub Copilot Chat** rollouts into durable local artifacts, evaluate them with signals, mine them into prompt-time memory, and report on cost and behavior via a static dashboard. Local-first, no cloud, evidence-linked.
+Capture **Codex**, **Claude Code**, **VS Code GitHub Copilot Chat**, and
+installed source extensions such as **OpenCode** into durable local artifacts,
+evaluate them with signals, mine them into prompt-time memory, and report on
+cost and behavior via a static dashboard. Local-first, no cloud,
+evidence-linked.
 
 Project wiki and onboarding guides: <https://sajjadgg.github.io/retro/>
 
@@ -29,6 +33,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Install](#install)
 - [Global setup and periodic capture](#global-setup-and-periodic-capture)
 - [Architecture at a glance](#architecture-at-a-glance)
+- [Source extensions](#source-extensions)
 - [Storage layout](#storage-layout)
 - [Capture](#capture)
 - [Signals](#signals)
@@ -171,6 +176,49 @@ directory before its old path becomes a compatibility symlink.
 ```
 
 Each stage is independent — you can re-render markdown, recompute signals, re-mine, rebuild the memory index, or rebuild the dashboard from whatever `rollout-memory/` already has on disk.
+
+---
+
+## Source extensions
+
+Retro extension API `1` lets an installed package add a source host without
+editing Retro. Source packages register one adapter through the
+`retro.sources` Python entry-point group. Retro loads providers lazily and
+keeps the canonical `Layout`, `NormalizedEvent`, raw evidence, signals, mining,
+memory, and dashboard pipeline in core.
+
+Inspect the active provider set:
+
+```bash
+retro extensions list
+retro extensions doctor
+```
+
+Built-in Claude Code, Codex, and VS Code Copilot integrations use the same
+runtime as installed providers. Imports run in a staging layout; Retro
+validates the provider result and atomically promotes the raw and normalized
+artifacts while holding the archive lock. A broken optional provider does not
+prevent built-in providers from loading. Duplicate host names fail closed and
+are reported by `extensions doctor`.
+
+The repository includes an installable OpenCode reference adapter:
+
+```bash
+python -m pip install -e "./adapters/retro-opencode"
+retro extensions doctor
+retro list --host opencode
+retro import opencode --latest
+```
+
+OpenCode support is fixture-backed and intentionally conservative. See
+[`adapters/retro-opencode/COMPATIBILITY.md`](adapters/retro-opencode/COMPATIBILITY.md)
+before using it with a new OpenCode release.
+
+Provider authors should import only from `retro.sdk`, declare
+`RETRO_EXTENSION_API = "1"`, return `SessionDescriptor` values from
+`discover()`, and write captures only through the `Layout` supplied to the
+adapter constructor. See [`docs/extensions.md`](docs/extensions.md) and
+[`specs/source_extension_api_spec.md`](specs/source_extension_api_spec.md).
 
 ---
 
@@ -748,6 +796,14 @@ A static, local HTML dashboard reads everything under `rollout-memory/` and prod
 
 The **Models** tab shows the per-model token + cost breakdown (input / cache_create / cache_read / output / total / cost) for each session.
 
+Portfolio totals and host/day aggregates cover every normalized session. To
+keep large archives responsive, the interactive table carries the 1,000 newest
+session details and the memory browser carries the 2,000 highest-ranked
+candidates. The table reports this explicitly as “showing N of total.”
+Transcripts are linked from the archive and loaded only when requested from a
+session's **Transcript** tab; they are not duplicated into every dashboard
+generation. Atomic publication retains the current and previous generations.
+
 ### Preview
 
 ![Retro dashboard overview](assets/dashboard%20top.png)
@@ -816,9 +872,17 @@ To add a model: add an empty entry under its name in the snapshot, then re-run `
 
 ## Release and publishing
 
-CI lives in `.github/workflows/ci.yml`. It runs on pushes and pull requests to `main`, installs the package across Python 3.9-3.13, compiles `src/retro`, smoke-tests the CLI, builds the wheel/sdist, and validates them with `twine check`.
+CI lives in `.github/workflows/ci.yml`. It runs on pushes and pull requests to
+`main`, installs core plus the OpenCode reference adapter across Python
+3.9-3.13, compiles the packages, smoke-tests extension diagnostics, runs both
+test suites, builds both wheel/sdist pairs, and validates them with
+`twine check`.
 
 Publishing lives in `.github/workflows/publish.yml`. It runs when a GitHub release is published, builds the package, publishes it to PyPI with trusted publishing, and attaches the wheel/sdist to the GitHub release.
+
+The core publishing workflow publishes `retro-ai` only. The
+`retro-opencode` reference package remains repository-local until it has its
+own release and trusted-publisher configuration.
 
 One-time PyPI setup:
 
@@ -831,8 +895,8 @@ Release flow:
 
 ```bash
 # bump version in pyproject.toml first
-git tag v0.3.0
-git push origin v0.3.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 Then publish a GitHub release for that tag. The release event triggers the PyPI publish job.

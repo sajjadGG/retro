@@ -26,6 +26,8 @@ Key packages under `src/retro/`:
 | `schema.py` | `NormalizedEvent` dataclass — the canonical event type everything consumes |
 | `storage.py` | `Layout` — filesystem path conventions for `rollout-memory/` |
 | `utils.py` | Shared helpers: `iter_jsonl`, `event_text`, `iter_messages`, `truncate` |
+| `sdk/` | Stable public contracts and lazy registry for installed source adapters |
+| `extensions.py` | Built-in provider adapters and managed staged publication |
 | `importers/` | Host-specific importers (Claude Code, Codex, VS Code Copilot) that produce normalized events |
 | `signals/` | Evaluators that emit readings (numeric/boolean/categorical) about a session |
 | `mining/` | Methods that extract reusable memory candidates from normalized events |
@@ -33,6 +35,12 @@ Key packages under `src/retro/`:
 | `cli.py` | Typer CLI entry point |
 
 ## Plugin system
+
+Source adapters register installable provider classes through the
+`retro.sources` Python entry-point group. Public contracts live in `retro.sdk`;
+providers must not import Retro internals. Add external adapters as independent
+packages under `adapters/`, register one canonical path-safe host ID, and cover
+the installed entry point plus capture/normalization with fixtures.
 
 Signals and mining methods use decorator-based registration. To add a new one:
 
@@ -45,9 +53,11 @@ Signals and mining methods use decorator-based registration. To add a new one:
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -e "./adapters/retro-opencode[dev]"
 
 # Run tests
 .venv/bin/pytest tests/ -v
+.venv/bin/pytest adapters/retro-opencode/tests/ -v
 
 # Lint
 .venv/bin/ruff check src/retro/ tests/
@@ -59,6 +69,7 @@ python3 -m venv .venv
 .venv/bin/retro --help
 .venv/bin/retro methods
 .venv/bin/retro signal list
+.venv/bin/retro extensions doctor
 ```
 
 ## Conventions
@@ -73,6 +84,7 @@ python3 -m venv .venv
 - **Everything is evidence-linked.** Signal readings and mined memories carry `event_id` references back to source events.
 - **The default archive is per-user, not cwd-local.** Resolve paths through `config.py` / `default_layout()` and keep tests isolated with `RETRO_DATA_DIR`.
 - **Archive publication is atomic.** Migration, sync, signal, normalized-event, and dashboard writes must stage and replace rather than expose partial files.
+- **Source providers write only to their supplied `Layout`.** The extension runtime stages and atomically publishes provider output.
 
 ## Decision-relevant communication
 
@@ -89,6 +101,14 @@ python3 -m venv .venv
 1. Add the type string to `EventType` in `schema.py`.
 2. Handle it in the relevant importer's `_normalize()` method.
 3. Add a test case with a fixture JSONL line in `tests/fixtures/`.
+
+### Adding a source adapter
+
+1. Create an installable package under `adapters/`.
+2. Implement the contracts exported by `retro.sdk`.
+3. Register the provider in the `retro.sources` entry-point group.
+4. Preserve unknown records and artifact-relative raw references.
+5. Add package-local fixtures and an installed-entry-point CLI test.
 
 ### Adding a new signal
 
@@ -107,6 +127,7 @@ python3 -m venv .venv
 
 - Don't add cloud dependencies. This is a local-first tool.
 - Don't mutate files in `raw/` after import.
+- Don't publish a source provider that collides with a built-in host ID.
 - Don't add `event_text` / `iter_jsonl` / `truncate` helpers locally — use `utils.py`.
 - Don't skip tests for new functionality.
 - Don't hardcode model pricing — add entries to `dashboard/pricing/litellm-pricing.json` and run `refresh.py`.
@@ -120,4 +141,5 @@ Design documents live in `specs/`. Read these for deeper context:
 - `rollout_mining_methods.md` — mining method catalog
 - `rollout_dashboard_spec.md` — dashboard design
 - `ccusage_comparison_spec.md` — how retro compares to ccusage
+- `source_extension_api_spec.md` — source adapter API, staging, and compatibility
 - `learning/rollout_task_scorer_pipeline_spec.md` — Git-backed rollout-to-task, scorer, and Ghostlab execution contract

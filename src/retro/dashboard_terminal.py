@@ -106,16 +106,20 @@ def format_duration(seconds: int | None) -> str:
 
 
 def format_host(host: str) -> str:
-    color = {
-        "claude-code": "orange3",
-        "codex": "blue",
-        "vscode-copilot": "purple",
-    }.get(host, "white")
+    color = _host_color(host)
     return f"[{color}]{host}[/{color}]"
 
 
-def cycle_host_filter(current: str) -> str:
-    hosts = ("all", "claude-code", "codex", "vscode-copilot")
+def _host_color(host: str) -> str:
+    return {
+        "claude-code": "orange3",
+        "codex": "blue",
+        "vscode-copilot": "purple",
+    }.get(host, "cyan")
+
+
+def cycle_host_filter(current: str, available_hosts: list[str] | tuple[str, ...] = ()) -> str:
+    hosts = ("all", *sorted(set(available_hosts)))
     return hosts[(hosts.index(current) + 1) % len(hosts)] if current in hosts else "all"
 
 
@@ -129,42 +133,45 @@ def render_activity_histogram(by_day: dict[str, Any]) -> None:
     max_sessions = max((by_day[day].get("sessions", 0) for day in days), default=1)
     max_width = 30  # Max bar length in terminal chars
 
-    console.print(
-        "[bold]ACTIVITY BY DAY[/bold] "
-        "(Claude: [orange3]█[/orange3], Codex: [blue]█[/blue], Copilot: [purple]█[/purple])"
+    hosts = sorted(
+        {
+            host
+            for metrics in by_day.values()
+            for host in (metrics.get("sessions_by_host") or {})
+        }
     )
+    if not hosts:
+        hosts = ["claude-code", "codex", "vscode-copilot"]
+    legend = ", ".join(
+        f"{host}: [{_host_color(host)}]█[/{_host_color(host)}]"
+        for host in hosts
+    )
+    console.print(f"[bold]ACTIVITY BY DAY[/bold] ({legend})")
     console.print("─" * 60)
 
     for day in days:
         d = by_day[day]
-        claude = d.get("sessions_claude", 0)
-        codex = d.get("sessions_codex", 0)
-        copilot = d.get("sessions_copilot", 0)
-        total = claude + codex + copilot
-
-        if max_sessions > 0:
-            claude_len = int((claude / max_sessions) * max_width)
-            codex_len = int((codex / max_sessions) * max_width)
-            copilot_len = int((copilot / max_sessions) * max_width)
-        else:
-            claude_len = codex_len = copilot_len = 0
-
-        # Guarantee at least 1 block if count > 0 but rounded to 0
-        if claude > 0 and claude_len == 0:
-            claude_len = 1
-        if codex > 0 and codex_len == 0:
-            codex_len = 1
-        if copilot > 0 and copilot_len == 0:
-            copilot_len = 1
-
-        claude_bar = "[orange3]█[/orange3]" * claude_len
-        codex_bar = "[blue]█[/blue]" * codex_len
-        copilot_bar = "[purple]█[/purple]" * copilot_len
-        bar = claude_bar + codex_bar + copilot_bar
+        counts = d.get("sessions_by_host") or {
+            "claude-code": d.get("sessions_claude", 0),
+            "codex": d.get("sessions_codex", 0),
+            "vscode-copilot": d.get("sessions_copilot", 0),
+        }
+        total = sum(int(counts.get(host, 0)) for host in hosts)
+        bar_parts = []
+        count_parts = []
+        for host in hosts:
+            count = int(counts.get(host, 0))
+            length = int((count / max_sessions) * max_width) if max_sessions > 0 else 0
+            if count > 0 and length == 0:
+                length = 1
+            color = _host_color(host)
+            bar_parts.append(f"[{color}]█[/{color}]" * length)
+            count_parts.append(str(count))
+        bar = "".join(bar_parts)
 
         console.print(
             f"  {day:<10}  {bar:<{max_width}}  "
-            f"{claude}+{codex}+{copilot} (total {total})"
+            f"{'+'.join(count_parts)} (total {total})"
         )
     console.print()
 
@@ -181,10 +188,6 @@ def show_portfolio_kpis(data: dict[str, Any]) -> None:
         .get("secret_exposure_signal", {})
     )
 
-    claude_count = by_host.get("claude-code", 0)
-    codex_count = by_host.get("codex", 0)
-    copilot_count = by_host.get("vscode-copilot", 0)
-
     # We build a grid of stats
     kpi_table = Table.grid(expand=True, padding=1)
     kpi_table.add_column(ratio=1)
@@ -192,11 +195,13 @@ def show_portfolio_kpis(data: dict[str, Any]) -> None:
     kpi_table.add_column(ratio=1)
 
     s_count = summary.get("session_count", 0)
+    host_summary = " / ".join(
+        f"[{_host_color(host)}]{count} {host}[/{_host_color(host)}]"
+        for host, count in sorted(by_host.items())
+    )
     sessions_panel = Panel(
         f"[bold]{s_count}[/bold] Total Sessions\n"
-        f"[orange3]{claude_count} Claude[/orange3] / "
-        f"[blue]{codex_count} Codex[/blue] / "
-        f"[purple]{copilot_count} Copilot[/purple]",
+        f"{host_summary or '[dim]No hosts[/dim]'}",
         title="Sessions",
     )
     c_count = mem.get("candidate_count", 0)
@@ -352,7 +357,10 @@ def show_session_list(data: dict[str, Any], project_filter: str | None = None) -
         elif choice == "p":
             page = max(page - 1, 0)
         elif choice == "f":
-            host_filter = cycle_host_filter(host_filter)
+            host_filter = cycle_host_filter(
+                host_filter,
+                [str(session.get("host", "")) for session in sessions],
+            )
             page = 0
         elif choice == "s":
             search_query = input("Search text (press Enter to clear): ").strip()
@@ -870,7 +878,10 @@ def show_all_memories_browser(data: dict[str, Any]) -> None:
         elif choice == "p":
             page = max(page - 1, 0)
         elif choice == "h":
-            host_filter = cycle_host_filter(host_filter)
+            host_filter = cycle_host_filter(
+                host_filter,
+                [str(candidate.get("host", "")) for candidate in all_candidates],
+            )
             page = 0
         elif choice == "o":
             scopes = ("all", "user", "repo", "task", "global")

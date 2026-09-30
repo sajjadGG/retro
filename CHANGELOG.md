@@ -4,6 +4,16 @@
 
 ### Added
 
+- Versioned `retro.sources` extension API with lazy entry-point discovery,
+  `retro extensions list/doctor`, managed staged imports, and atomic raw plus
+  normalized publication.
+- Dynamic extension-host support across periodic sync, signals, mining,
+  archive rebuilds, analysis, and static/terminal dashboards.
+- Fixture-backed `retro-opencode` reference adapter with Python 3.9-3.13 CI
+  coverage.
+- Bounded dashboard detail payloads with exact full-archive aggregates,
+  on-demand transcript loading, and two-generation atomic retention, avoiding
+  multi-gigabyte dashboard copies for large archives.
 - Git-backed rollout tasksets with exact repository-state provenance,
   content-addressed source bundles, hidden executable scorers, resumable
   Ghostlab agent runs, and source-normalized numeric reports.

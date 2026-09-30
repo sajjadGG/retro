@@ -12,15 +12,16 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_config, resolve_dashboard_dir, user_state_dir
-from .importers.claude import ClaudeImporter, ClaudeSession
-from .importers.codex import CodexImporter, CodexThread
-from .importers.copilot import CopilotImporter
+from .extensions import create_source, source_host_names
+from .importers.claude import ClaudeSession
+from .importers.codex import CodexThread
 from .importers.copilot_cli import CopilotCliSession
 from .importers.vscode_copilot import CopilotSession
 from .locking import LockUnavailableError, exclusive_lock
 from .memory_store import reindex as reindex_memory
 from .renderer import render_file
-from .schema import HOSTS, Host
+from .schema import Host, validate_host_id, validate_session_id
+from .sdk import SessionDescriptor
 from .signals import REGISTRY as SIGNAL_REGISTRY
 from .signals import (
     read_signal_readings,
@@ -92,29 +93,36 @@ def run_sync(
                 )
 
             layout.ensure()
-            importers: list[Any] = [
-                ClaudeImporter(layout),
-                CodexImporter(layout),
-                CopilotImporter(layout),
-            ]
             changed: set[tuple[Host, str]] = set()
-            for importer in importers:
-                for session in importer.discover():
+            for host in source_host_names():
+                try:
+                    source = create_source(host, layout)
+                    sessions = source.discover()
+                except Exception as exc:
+                    report.failures.append(
+                        {
+                            "session": f"{host}/*",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                    continue
+                for session in sessions:
                     session_id = _session_id(session)
-                    key = f"{importer.host}/{session_id}"
-                    raw_dir = layout.raw_dir(importer.host, session_id)
+                    key = f"{source.host}/{session_id}"
+                    raw_dir = layout.raw_dir(source.host, session_id)
                     try:
                         revision = _preserve_rewritten_raw(
                             layout,
-                            importer.host,
+                            source.host,
                             session,
                             raw_dir,
                         )
                         if revision is not None:
                             report.revisions.append(str(revision))
-                        result = importer.import_session(
+                        result = source.import_session(
                             identifier=session_id,
                             force=False,
+                            acquire_lock=False,
                         )
                     except FileExistsError:
                         report.unchanged.append(key)
@@ -127,7 +135,7 @@ def run_sync(
                             }
                         )
                         continue
-                    changed.add((importer.host, result.session_id))
+                    changed.add((source.host, result.session_id))
                     report.imported.append(key)
 
             signal_signature = _signal_signature()
@@ -138,12 +146,22 @@ def run_sync(
                 if isinstance(value, str) and "/" in value
             }
             pending.update(changed)
-            pending_typed: set[tuple[Host, str]] = {
-                (host, session_id)
-                for host in HOSTS
-                for pending_host, session_id in pending
-                if pending_host == host
-            }
+            pending_typed: set[tuple[Host, str]] = set()
+            for pending_host, session_id in pending:
+                try:
+                    pending_typed.add(
+                        (
+                            validate_host_id(pending_host),
+                            validate_session_id(session_id),
+                        )
+                    )
+                except ValueError as exc:
+                    report.failures.append(
+                        {
+                            "session": f"{pending_host}/{session_id}",
+                            "error": f"invalid pending session: {exc}",
+                        }
+                    )
             signal_schema_changed = (
                 previous_state.get("signal_signature") != signal_signature
             )
@@ -172,7 +190,7 @@ def run_sync(
                 render_targets = (
                     {
                         (host, session_id)
-                        for host in HOSTS
+                        for host in layout.list_normalized_hosts()
                         for session_id in layout.list_normalized(host)
                     }
                     if force_derived
@@ -318,6 +336,11 @@ def _preserve_rewritten_raw(
 
 
 def _primary_source_pair(session: Any, raw_dir: Path) -> tuple[Path, Path] | None:
+    if isinstance(session, SessionDescriptor):
+        raw_filename = session.metadata.get("raw_filename")
+        if session.source_path is not None and isinstance(raw_filename, str):
+            return session.source_path, raw_dir / raw_filename
+        return None
     if isinstance(session, ClaudeSession):
         return session.transcript_path, raw_dir / "transcript.jsonl"
     if isinstance(session, CodexThread):

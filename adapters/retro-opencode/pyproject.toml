@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "retro-opencode"
+version = "0.1.0"
+description = "OpenCode session source adapter for Retro"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["retro-ai>=0.4.0,<0.5"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "ruff>=0.4",
+]
+
+[project.entry-points."retro.sources"]
+opencode = "retro_opencode:OpenCodeSource"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/retro_opencode"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

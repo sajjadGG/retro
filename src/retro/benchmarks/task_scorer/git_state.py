@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ...schema import HOSTS, Host, NormalizedEvent
+from ...schema import BUILTIN_HOSTS, Host, NormalizedEvent
 from ...storage import Layout
 from ...utils import atomic_write_text, event_command_text, event_text, iter_jsonl
 from .schema import SchemaError, require_hex40
@@ -489,8 +489,10 @@ def capture_repository_state(
     the exact-base proof after a post-hoc import.
     """
     require_capture_phase(phase)
-    if host not in HOSTS:
-        raise GitError(f"capture host must be one of {HOSTS}, got {host!r}")
+    if host not in BUILTIN_HOSTS:
+        raise GitError(
+            f"capture host must be one of {BUILTIN_HOSTS}, got {host!r}"
+        )
     if not _SAFE_CAPTURE_ID_RE.fullmatch(session_id):
         raise GitError("capture session id contains unsupported characters")
     raw_dir = layout.raw_dir(host, session_id)

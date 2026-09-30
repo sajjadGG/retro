@@ -3,15 +3,24 @@
 ## Discovery And Import
 
 ```bash
-retro list [--host claude|codex] [--limit 50]
+retro list [--host <registered-host>] [--limit 50]
+retro extensions list
+retro extensions doctor
 retro import claude --session-id <id>
 retro import claude --latest
 retro import claude --all
 retro import codex --thread-id <id>
 retro import codex --latest
 retro import codex --all
+retro import copilot --latest
+retro import <extension-host> --latest
 retro import all [--limit-per-host 20]
 ```
+
+`retro import all` and `retro sync` include every healthy registered source
+provider. Extension host commands are added from installed `retro.sources`
+entry points. Provider collisions and incompatible API versions are reported
+by `retro extensions doctor`.
 
 ## Rendering And Inspection
 
@@ -27,7 +36,7 @@ retro analyze
 
 ```bash
 retro signal list [--group activity|outcome|cost|risk]
-retro signal run [--host claude|codex] [--session-id <id>] [--signal <name,name>]
+retro signal run [--host <host>] [--session-id <id>] [--signal <name,name>]
 retro signal show claude <session-id>
 retro signal show codex <thread-id>
 ```
@@ -41,6 +50,9 @@ retro mine claude <session-id> --method skill_pro
 retro mine codex <thread-id> --method all --filter risk_aware
 retro mine '*' '*' --method all --filter risk_aware
 ```
+
+The `*` mining selector scans every host represented in normalized artifacts,
+including extension hosts.
 
 Registered methods:
 

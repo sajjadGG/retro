@@ -16,7 +16,6 @@ from .config import user_data_dir, user_state_dir
 from .locking import exclusive_lock
 from .memory_store import reindex as reindex_memory
 from .renderer import render_file
-from .schema import HOSTS
 from .signals import run_signals, write_signal_artifacts
 from .storage import Layout
 from .utils import atomic_write_text, resolve_artifact_ref
@@ -234,7 +233,7 @@ def rebuild_derived_artifacts(
         plan["status"] = "rebuilding"
         _write_plan(plan_path, plan)
         render_count = 0
-        for host in HOSTS:
+        for host in layout.list_normalized_hosts():
             for session_id in layout.list_normalized(host):
                 render_file(
                     layout.normalized_path(host, session_id),

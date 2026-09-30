@@ -13,6 +13,7 @@ import json
 import re
 import shutil
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -60,9 +61,14 @@ from .config import (
     resolve_dashboard_dir,
     save_config,
 )
-from .importers.claude import ClaudeImporter
-from .importers.codex import CodexImporter
-from .importers.copilot import CopilotImporter
+from .extensions import (
+    SourceHandle,
+    canonical_source_host,
+    create_source,
+    doctor_sources,
+    extension_records,
+    source_host_names,
+)
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -74,7 +80,8 @@ from .mining import (
     write_mining_artifacts,
 )
 from .renderer import render_file
-from .schema import HOSTS, Host, read_events
+from .schema import BUILTIN_HOSTS, Host, read_events
+from .sdk import SessionDescriptor
 from .signals import REGISTRY as SIGNAL_REGISTRY
 from .signals import run_signals, write_signal_artifacts
 from .storage import Layout, default_layout
@@ -136,6 +143,12 @@ app.add_typer(archive_app, name="archive")
 
 schedule_app = typer.Typer(no_args_is_help=True, help="Manage periodic local capture.")
 app.add_typer(schedule_app, name="schedule")
+
+extensions_app = typer.Typer(
+    no_args_is_help=True,
+    help="Inspect built-in and installed source providers.",
+)
+app.add_typer(extensions_app, name="extensions")
 
 console = Console()
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -218,7 +231,7 @@ def _capture_session_repo_state(
 
 @app.command("list")
 def list_cmd(
-    host: Optional[str] = typer.Option(None, help="Filter to one host: claude|codex|copilot"),
+    host: Optional[str] = typer.Option(None, help="Filter to one registered source host"),
     limit: int = typer.Option(20, help="Max rows per host"),
     root: Optional[Path] = typer.Option(
         None,
@@ -227,42 +240,61 @@ def list_cmd(
 ):
     """List sessions discoverable on this machine."""
     lay = _layout(root)
-    host_full = _expand_host(host) if host else None
-    if host_full in (None, "claude-code"):
-        _print_claude_table(ClaudeImporter(lay), limit, lay)
-    if host_full in (None, "codex"):
-        _print_codex_table(CodexImporter(lay), limit, lay)
-    if host_full in (None, "vscode-copilot"):
-        _print_copilot_table(CopilotImporter(lay), limit, lay)
+    hosts = [_expand_host(host)] if host else source_host_names()
+    failures = 0
+    for source_host in hosts:
+        try:
+            source = create_source(source_host, lay)
+            _print_source_table(source, limit, lay)
+        except Exception as exc:
+            failures += 1
+            console.print(
+                f"[red]Unable to list {source_host!r}: {type(exc).__name__}: {exc}[/red]"
+            )
+    if host and failures:
+        raise typer.Exit(1)
 
 
-def _print_claude_table(imp: ClaudeImporter, limit: int, lay: Layout) -> None:
-    all_sessions = imp.discover()
+def _print_source_table(source: SourceHandle, limit: int, lay: Layout) -> None:
+    all_sessions = source.discover()
     sessions = all_sessions[:limit]
-    imported = set(lay.list_imported("claude-code"))
-    table = Table(title=f"Claude Code  ({len(sessions)} shown)")
+    imported = set(lay.list_imported(source.host))
+    table = Table(
+        title=f"{source.display_name}  ({len(sessions)}/{len(all_sessions)} shown)"
+    )
     table.add_column("imported", justify="center")
     table.add_column("session_id")
-    table.add_column("project")
-    table.add_column("size")
-    for s in sessions:
-        mark = "✓" if s.session_id in imported else ""
-        table.add_row(mark, s.session_id, s.project_slug, f"{s.size_bytes:,}")
+    table.add_column("cwd")
+    table.add_column("title")
+    for session in sessions:
+        mark = "✓" if session.session_id in imported else ""
+        table.add_row(
+            mark,
+            session.session_id,
+            session.cwd or "",
+            session.title,
+        )
     console.print(table)
-    _print_claude_retention_note(all_sessions)
+    if source.host == "claude-code":
+        _print_claude_retention_note(all_sessions)
 
 
-def _print_claude_retention_note(sessions) -> None:
+def _print_claude_retention_note(sessions: list[SessionDescriptor]) -> None:
     """Surface Claude's ~30-day log retention if logs are aging out.
 
     Claude Code retains transcripts for ~30 days by default (`cleanupPeriodDays`
     in Claude settings). Warn so users know to capture before logs disappear.
     """
-    if not sessions:
+    timestamps = [
+        float(session.updated_at)
+        for session in sessions
+        if isinstance(session.updated_at, (int, float))
+    ]
+    if not timestamps:
         return
     import time
 
-    oldest = min(s.mtime for s in sessions)
+    oldest = min(timestamps)
     age_days = (time.time() - oldest) / 86400
     if age_days >= 25:
         console.print(
@@ -273,42 +305,56 @@ def _print_claude_retention_note(sessions) -> None:
         )
 
 
-def _print_codex_table(imp: CodexImporter, limit: int, lay: Layout) -> None:
-    threads = imp.discover()[:limit]
-    imported = set(lay.list_imported("codex"))
-    table = Table(title=f"Codex  ({len(threads)} shown)")
-    table.add_column("imported", justify="center")
-    table.add_column("thread_id")
-    table.add_column("cwd")
-    table.add_column("title")
-    for t in threads:
-        mark = "✓" if t.thread_id in imported else ""
-        table.add_row(mark, t.thread_id, t.cwd, t.display_title)
-    console.print(table)
-
-
-def _print_copilot_table(imp: CopilotImporter, limit: int, lay: Layout) -> None:
-    all_sessions = imp.discover()
-    sessions = all_sessions[:limit]
-    imported = set(lay.list_imported("vscode-copilot"))
-    table = Table(title=f"VS Code Copilot  ({len(sessions)}/{len(all_sessions)} shown)")
-    table.add_column("imported", justify="center")
-    table.add_column("session_id")
+@extensions_app.command("list")
+def extensions_list() -> None:
+    """List source providers without importing optional extension modules."""
+    records = extension_records()
+    collisions = {
+        name
+        for name, count in Counter(record.name for record in records).items()
+        if count > 1
+    }
+    table = Table(title=f"Retro source providers ({len(records)})")
+    table.add_column("host")
     table.add_column("source")
-    table.add_column("workspace")
-    table.add_column("model")
-    table.add_column("title")
-    for session in sessions:
-        mark = "✓" if session.session_id in imported else ""
+    table.add_column("API")
+    table.add_column("status")
+    for record in sorted(records, key=lambda item: (item.name, item.source)):
+        status = "collision" if record.name in collisions else record.status
         table.add_row(
-            mark,
-            session.session_id,
-            session.source_kind + (" (active)" if getattr(session, "active", False) else ""),
-            session.workspace_name,
-            session.display_model,
-            session.display_title,
+            record.name,
+            record.source,
+            record.api_version or "—",
+            status,
         )
     console.print(table)
+
+
+@extensions_app.command("doctor")
+def extensions_doctor() -> None:
+    """Validate provider imports, API versions, names, and required methods."""
+    results = doctor_sources()
+    table = Table(title="Retro source extension doctor")
+    table.add_column("status")
+    table.add_column("host")
+    table.add_column("source")
+    table.add_column("detail")
+    for result in sorted(
+        results,
+        key=lambda item: (item.record.name, item.record.source),
+    ):
+        table.add_row(
+            "✓" if result.ok else "✗",
+            result.record.name,
+            result.record.source,
+            result.message,
+        )
+    console.print(table)
+    failures = sum(not result.ok for result in results)
+    if failures:
+        console.print(f"[red]{failures} source extension check(s) failed[/red]")
+        raise typer.Exit(1)
+    console.print(f"[green]All {len(results)} source provider checks passed.[/green]")
 
 
 # ---- import claude / codex / copilot ----------------------------------------
@@ -326,11 +372,14 @@ def import_claude(
 ):
     """Import a Claude Code session."""
     lay = _layout(root)
-    imp = ClaudeImporter(lay)
+    source = create_source("claude-code", lay)
     if all_sessions:
         _import_many(
-            imp,
-            [(s.session_id, s.session_id) for s in imp.discover()[:limit]],
+            source,
+            [
+                (session.session_id, session.title or session.session_id)
+                for session in source.discover()[:limit]
+            ],
             force=force,
             lay=lay,
             render=not no_render,
@@ -339,13 +388,13 @@ def import_claude(
     if not session_id and not latest:
         raise typer.BadParameter("Pass --session-id <id>, --latest, or --all")
     if latest:
-        s = imp.latest()
-        if s is None:
+        sessions = source.discover()
+        if not sessions:
             console.print("[red]No Claude Code sessions found.[/red]")
             raise typer.Exit(1)
-        session_id = s.session_id
+        session_id = sessions[0].session_id
     assert session_id is not None  # guaranteed by the --session-id/--latest check above
-    _do_import(imp, session_id, force=force, lay=lay, render=not no_render)
+    _do_import(source, session_id, force=force, lay=lay, render=not no_render)
 
 
 @import_app.command("codex")
@@ -360,11 +409,14 @@ def import_codex(
 ):
     """Import a Codex thread."""
     lay = _layout(root)
-    imp = CodexImporter(lay)
+    source = create_source("codex", lay)
     if all_sessions:
         _import_many(
-            imp,
-            [(t.thread_id, t.display_title) for t in imp.discover()[:limit]],
+            source,
+            [
+                (session.session_id, session.title or session.session_id)
+                for session in source.discover()[:limit]
+            ],
             force=force,
             lay=lay,
             render=not no_render,
@@ -373,13 +425,13 @@ def import_codex(
     if not thread_id and not latest:
         raise typer.BadParameter("Pass --thread-id <id>, --latest, or --all")
     if latest:
-        t = imp.latest()
-        if t is None:
+        sessions = source.discover()
+        if not sessions:
             console.print("[red]No Codex threads found.[/red]")
             raise typer.Exit(1)
-        thread_id = t.thread_id
+        thread_id = sessions[0].session_id
     assert thread_id is not None  # guaranteed by the --thread-id/--latest check above
-    _do_import(imp, thread_id, force=force, lay=lay, render=not no_render)
+    _do_import(source, thread_id, force=force, lay=lay, render=not no_render)
 
 
 @import_app.command("copilot")
@@ -408,15 +460,19 @@ def import_copilot(
 ):
     """Import a VS Code GitHub Copilot or Agent Host session."""
     lay = _layout(root)
-    imp = CopilotImporter(
+    source = create_source(
+        "vscode-copilot",
         lay,
         user_data_dir=user_data_dir,
         session_state_dir=session_state_dir,
     )
     if all_sessions:
         _import_many(
-            imp,
-            [(session.session_id, session.display_title) for session in imp.discover()[:limit]],
+            source,
+            [
+                (session.session_id, session.title or session.session_id)
+                for session in source.discover()[:limit]
+            ],
             force=force,
             lay=lay,
             render=not no_render,
@@ -425,13 +481,13 @@ def import_copilot(
     if not session_id and not latest:
         raise typer.BadParameter("Pass --session-id <id>, --latest, or --all")
     if latest:
-        session = imp.latest()
-        if session is None:
+        sessions = source.discover()
+        if not sessions:
             console.print("[red]No local VS Code Copilot sessions found.[/red]")
             raise typer.Exit(1)
-        session_id = session.session_id
+        session_id = sessions[0].session_id
     assert session_id is not None
-    _do_import(imp, session_id, force=force, lay=lay, render=not no_render)
+    _do_import(source, session_id, force=force, lay=lay, render=not no_render)
 
 
 @import_app.command("all")
@@ -443,57 +499,53 @@ def import_all(
         None, "--limit-per-host", help="Optional max sessions per host"
     ),
 ):
-    """Import every discoverable session from all supported hosts."""
+    """Import every discoverable session from all registered source providers."""
     lay = _layout(root)
-    claude = ClaudeImporter(lay)
-    codex = CodexImporter(lay)
-    copilot = CopilotImporter(lay)
-    failures = []
-    failures.extend(
-        _import_many(
-            claude,
-            [(s.session_id, s.session_id) for s in claude.discover()[:limit_per_host]],
-            force=force,
-            lay=lay,
-            render=not no_render,
-            exit_on_failure=False,
+    failures: list[str] = []
+    for host in source_host_names():
+        try:
+            source = create_source(host, lay)
+            sessions = source.discover()[:limit_per_host]
+        except Exception as exc:
+            message = f"{host}: {type(exc).__name__}: {exc}"
+            failures.append(message)
+            console.print(f"[red]failed {message}[/red]")
+            continue
+        failures.extend(
+            _import_many(
+                source,
+                [
+                    (session.session_id, session.title or session.session_id)
+                    for session in sessions
+                ],
+                force=force,
+                lay=lay,
+                render=not no_render,
+                exit_on_failure=False,
+            )
         )
-    )
-    failures.extend(
-        _import_many(
-            codex,
-            [(t.thread_id, t.display_title) for t in codex.discover()[:limit_per_host]],
-            force=force,
-            lay=lay,
-            render=not no_render,
-            exit_on_failure=False,
-        )
-    )
-    failures.extend(
-        _import_many(
-            copilot,
-            [
-                (session.session_id, session.display_title)
-                for session in copilot.discover()[:limit_per_host]
-            ],
-            force=force,
-            lay=lay,
-            render=not no_render,
-            exit_on_failure=False,
-        )
-    )
     if failures:
         raise typer.Exit(1)
 
 
-def _do_import(imp, identifier: str, *, force: bool, lay: Layout, render: bool) -> None:
+def _do_import(
+    source: SourceHandle,
+    identifier: str,
+    *,
+    force: bool,
+    lay: Layout,
+    render: bool,
+) -> None:
     try:
-        result = imp.import_session(identifier=identifier, force=force)
+        result = source.import_session(identifier=identifier, force=force)
     except FileExistsError as e:
         console.print(f"[yellow]{e}[/yellow]")
         raise typer.Exit(2) from None
     except FileNotFoundError as e:
         console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from None
+    except Exception as e:
+        console.print(f"[red]{type(e).__name__}: {e}[/red]")
         raise typer.Exit(1) from None
     console.print(f"[green]captured {result.host}/{result.session_id}[/green]")
     console.print(f"  raw:        {result.raw_dir}")
@@ -510,16 +562,20 @@ def _do_import(imp, identifier: str, *, force: bool, lay: Layout, render: bool) 
 
     try:
         from .analyzer import check_operator_diagnostics
+
         events = list(read_events(result.normalized_path))
         tips = check_operator_diagnostics(events)
         for tip in tips:
             console.print(f"[yellow]{tip}[/yellow]")
-    except Exception:
-        pass
+    except Exception as exc:
+        console.print(
+            f"[yellow]operator diagnostics unavailable: "
+            f"{type(exc).__name__}: {exc}[/yellow]"
+        )
 
 
 def _import_many(
-    imp,
+    source: SourceHandle,
     targets: list[tuple[str, str]],
     *,
     force: bool,
@@ -535,7 +591,7 @@ def _import_many(
     failures: list[str] = []
     for identifier, label in targets:
         try:
-            _do_import(imp, identifier, force=force, lay=lay, render=render)
+            _do_import(source, identifier, force=force, lay=lay, render=render)
             imported += 1
         except typer.Exit as e:
             if e.exit_code == 2 and not force:
@@ -561,12 +617,102 @@ def _import_many(
     return failures
 
 
+def _make_extension_import_command(host: Host):
+    def import_extension(
+        session_id: Optional[str] = typer.Option(
+            None,
+            "--session-id",
+            help="Specific session id",
+        ),
+        latest: bool = typer.Option(False, "--latest", help="Import the most-recent session"),
+        all_sessions: bool = typer.Option(
+            False,
+            "--all",
+            help="Import every discoverable session",
+        ),
+        limit: Optional[int] = typer.Option(
+            None,
+            "--limit",
+            help="Optional max sessions with --all",
+        ),
+        force: bool = typer.Option(
+            False,
+            "--force",
+            help="Overwrite an existing raw capture",
+        ),
+        root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+        no_render: bool = typer.Option(False, "--no-render", help="Skip markdown render"),
+    ) -> None:
+        lay = _layout(root)
+        try:
+            source = create_source(host, lay)
+            sessions = source.discover()
+        except Exception as exc:
+            console.print(
+                f"[red]Unable to load source provider {host!r}: "
+                f"{type(exc).__name__}: {exc}[/red]"
+            )
+            raise typer.Exit(1) from None
+        if all_sessions:
+            _import_many(
+                source,
+                [
+                    (session.session_id, session.title or session.session_id)
+                    for session in sessions[:limit]
+                ],
+                force=force,
+                lay=lay,
+                render=not no_render,
+            )
+            return
+        if not session_id and not latest:
+            raise typer.BadParameter("Pass --session-id <id>, --latest, or --all")
+        if latest:
+            if not sessions:
+                console.print(f"[red]No {source.display_name} sessions found.[/red]")
+                raise typer.Exit(1)
+            session_id = sessions[0].session_id
+        assert session_id is not None
+        _do_import(
+            source,
+            session_id,
+            force=force,
+            lay=lay,
+            render=not no_render,
+        )
+
+    import_extension.__name__ = f"import_{host.replace('-', '_')}"
+    import_extension.__doc__ = f"Import a session using the installed {host} provider."
+    return import_extension
+
+
+def _register_extension_import_commands() -> None:
+    records = extension_records()
+    collisions = {
+        name
+        for name, count in Counter(record.name for record in records).items()
+        if count > 1
+    }
+    for record in records:
+        if record.builtin or record.name in collisions:
+            continue
+        try:
+            if canonical_source_host(record.name) != record.name:
+                continue
+        except ValueError:
+            continue
+        import_app.command(record.name)(_make_extension_import_command(record.name))
+
+
+_register_extension_import_commands()
+
+
 # ---- render / show ----------------------------------------------------------
 
 
 @app.command("mine")
 def mine_cmd(
-    host: str = typer.Argument(..., help="claude|codex|copilot|*"),
+    host: str = typer.Argument(..., help="registered or archived host ID, or *"),
     session_id: str = typer.Argument(..., help="session id, thread id, or *"),
     method: str = typer.Option(
         "reme_refine_poc",
@@ -671,7 +817,11 @@ def _mine_targets(
     *,
     all_sessions: bool,
 ) -> list[tuple[Host, str]]:
-    hosts = _expand_hosts(host)
+    hosts = (
+        lay.list_normalized_hosts()
+        if host.lower() in ("*", "all")
+        else [_expand_host(host)]
+    )
     if all_sessions or session_id == "*":
         targets: list[tuple[Host, str]] = []
         for h in hosts:
@@ -761,7 +911,11 @@ def taskset_select_cmd(
 ) -> None:
     """Select exact, clean Git-backed rollouts and record every rejection."""
     lay = _layout(root)
-    resolved_host = None if host is None or host in ("*", "all") else _expand_host(host)
+    resolved_host = (
+        None
+        if host is None or host in ("*", "all")
+        else _expand_builtin_host(host)
+    )
     if environment_file is not None and environment_config is not None:
         raise typer.BadParameter(
             "--environment-file and --environment-config are mutually exclusive"
@@ -854,7 +1008,11 @@ def taskset_bundle_cmd(
 ) -> None:
     """Materialize deterministic immutable SourceBundles for selected rollouts."""
     lay = _layout(root)
-    resolved_host = None if host is None or host in ("*", "all") else _expand_host(host)
+    resolved_host = (
+        None
+        if host is None or host in ("*", "all")
+        else _expand_builtin_host(host)
+    )
     try:
         result = bundle_taskset(
             layout=lay,
@@ -1132,7 +1290,7 @@ def benchmark_build_cmd(
         project_root=project,
         cutoff_time=cutoff,
         end_time=end,
-        hosts=_expand_hosts(host),
+        hosts=_expand_builtin_hosts(host),
     )
     console.print(
         f"[green]built {result.benchmark_id} with {result.task_count} tasks[/green]"
@@ -1352,7 +1510,7 @@ def benchmark_list_cmd(
 
 @app.command("render")
 def render_cmd(
-    host: str = typer.Argument(..., help="claude|codex|copilot"),
+    host: str = typer.Argument(..., help="registered or archived host ID"),
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
@@ -1370,7 +1528,7 @@ def render_cmd(
 
 @app.command("show")
 def show_cmd(
-    host: str = typer.Argument(..., help="claude|codex|copilot"),
+    host: str = typer.Argument(..., help="registered or archived host ID"),
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
@@ -1380,6 +1538,9 @@ def show_cmd(
     raw_dir = lay.raw_dir(host_full, session_id)
     normalized = lay.normalized_path(host_full, session_id)
     rendered = lay.rendered_path(host_full, session_id)
+    if not any((raw_dir.exists(), normalized.exists(), rendered.exists())):
+        console.print(f"[red]No artifacts found for {host_full}/{session_id}[/red]")
+        raise typer.Exit(1)
 
     table = Table(title=f"{host_full}/{session_id}")
     table.add_column("artifact")
@@ -1402,21 +1563,27 @@ def show_cmd(
 
 
 def _expand_host(host: str) -> Host:
-    h = host.lower()
-    if h in ("claude", "claude-code", "cc"):
-        return "claude-code"
-    if h in ("codex", "cx"):
-        return "codex"
-    if h in ("copilot", "vscode", "vscode-copilot", "gh-copilot"):
-        return "vscode-copilot"
-    raise typer.BadParameter(f"unknown host {host!r}; use claude|codex|copilot")
+    try:
+        return canonical_source_host(host)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
-def _expand_hosts(host: str) -> list[Host]:
+def _expand_builtin_host(host: str) -> Host:
+    resolved = _expand_host(host)
+    if resolved not in BUILTIN_HOSTS:
+        expected = "|".join(BUILTIN_HOSTS)
+        raise typer.BadParameter(
+            f"unsupported benchmark host {host!r}; use {expected}"
+        )
+    return resolved
+
+
+def _expand_builtin_hosts(host: str) -> list[Host]:
     h = host.lower()
     if h in ("*", "all"):
-        return list(HOSTS)
-    return [_expand_host(host)]
+        return list(BUILTIN_HOSTS)
+    return [_expand_builtin_host(host)]
 
 
 # ---- global config / archive / sync -----------------------------------------
@@ -1677,7 +1844,6 @@ def schedule_uninstall() -> None:
 @app.command("doctor")
 def doctor_cmd() -> None:
     """Report global archive, source, disk, and scheduler health."""
-    from .importers.copilot import CopilotImporter
     from .schedule import schedule_status
 
     layout = default_layout()
@@ -1692,9 +1858,22 @@ def doctor_cmd() -> None:
     table.add_row("free space", f"{free / 1024**3:.1f} GiB")
     table.add_row(
         "normalized sessions",
-        str(sum(len(layout.list_normalized(host)) for host in HOSTS)),
+        str(
+            sum(
+                len(layout.list_normalized(host))
+                for host in layout.list_normalized_hosts()
+            )
+        ),
     )
-    table.add_row("discoverable Copilot", str(len(CopilotImporter(layout).discover())))
+    for host in source_host_names():
+        try:
+            count = len(create_source(host, layout).discover())
+            table.add_row(f"discoverable {host}", str(count))
+        except Exception as exc:
+            table.add_row(
+                f"discoverable {host}",
+                f"ERROR: {type(exc).__name__}: {exc}",
+            )
     status = schedule_status()
     table.add_row("schedule installed", str(status.get("installed")))
     table.add_row("schedule loaded", str(status.get("loaded")))
@@ -1726,7 +1905,7 @@ def signal_list(
 
 @signal_app.command("run")
 def signal_run(
-    host: Optional[str] = typer.Option(None, help="Restrict to one host: claude|codex|copilot"),
+    host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
     session_id: Optional[str] = typer.Option(
         None, "--session-id", help="Restrict to one session id (repeatable via comma)"
     ),
@@ -1756,7 +1935,7 @@ def signal_run(
 
 @signal_app.command("show")
 def signal_show(
-    host: str = typer.Argument(..., help="claude|codex|copilot"),
+    host: str = typer.Argument(..., help="registered or archived host ID"),
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
