@@ -13,6 +13,7 @@ from rich.table import Table
 
 from .schema import BUILTIN_HOSTS, NormalizedEvent, read_events
 from .storage import Layout
+from .utils import event_tool_input, event_tool_output
 
 console = Console()
 
@@ -68,28 +69,21 @@ def extract_command_line(ev: NormalizedEvent) -> str | None:
         return None
     payload = ev.payload or {}
 
-    val = payload.get("input")
+    val = event_tool_input(ev)
     if isinstance(val, dict):
         cmd = val.get("command") or val.get("cmd")
         if isinstance(cmd, str):
             return cmd
-    elif isinstance(val, str):
-        return val
 
-    args = payload.get("arguments")
-    if isinstance(args, dict):
-        cmd = args.get("cmd") or args.get("command") or args.get("command_line")
-        if isinstance(cmd, str):
-            return cmd
-    elif isinstance(args, str):
+    if isinstance(val, str):
         try:
-            parsed = json.loads(args)
+            parsed = json.loads(val)
             if isinstance(parsed, dict):
                 cmd = parsed.get("cmd") or parsed.get("command") or parsed.get("command_line")
                 if isinstance(cmd, str):
                     return cmd
         except json.JSONDecodeError:
-            return args
+            return val
 
     cmd_direct = payload.get("command") or payload.get("cmd")
     if isinstance(cmd_direct, str):
@@ -106,7 +100,7 @@ def _is_failed(ev: NormalizedEvent) -> bool:
     status = payload.get("status")
     if isinstance(status, str) and status.lower() in {"failed", "error"}:
         return True
-    output = payload.get("output")
+    output = event_tool_output(ev)
     if isinstance(output, str):
         m = re.search(r'"exit_code"\s*:\s*(\d+)', output)
         if m and int(m.group(1)) != 0:

@@ -24,7 +24,7 @@ from typing import Any, Literal
 
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
-from ..utils import artifact_ref, iter_jsonl, truncate_summary
+from ..utils import artifact_ref, iter_jsonl, payload_tool_output, truncate_summary
 from .base import (
     ImportResult,
     has_only_repo_state_capture,
@@ -49,7 +49,7 @@ _FUNCTION_TYPE_OVERRIDES: dict[str, EventType] = {
 _CUSTOM_TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "apply_patch": "file_edit",
 }
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 
 @dataclass
@@ -351,7 +351,7 @@ class CodexImporter:
         gaps: set[str] = set()
         call_id_to_name: dict[str, str] = {}
         call_id_to_event_id: dict[str, str] = {}
-        represented_messages: set[tuple[Actor, str]] = set()
+        represented_messages: dict[tuple[Actor, str], str] = {}
         last_sequence = 0
         last_timestamp: str | None = None
         last_raw_ref: RawRef | None = None
@@ -527,6 +527,7 @@ class CodexImporter:
             call_id = event.payload.get("call_id")
             if call_id:
                 event.parent_event_id = call_id_to_event_id.get(str(call_id))
+        _deduplicate_tool_results(events)
 
         if events and last_raw_ref is not None:
             events.append(
@@ -555,40 +556,41 @@ class CodexImporter:
         *,
         timestamp_inferred: bool,
         assistant_actor: Actor,
-        represented_messages: set[tuple[Actor, str]],
+        represented_messages: dict[tuple[Actor, str], str],
         call_id_to_name: dict[str, str],
         call_id_to_event_id: dict[str, str],
     ) -> NormalizedEvent | None:
         if ptype == "user_message":
             text = str(payload.get("message") or "")
             actor: Actor = "subagent" if assistant_actor == "subagent" else "user"
-            duplicate = (actor, text) in represented_messages
-            represented_messages.add((actor, text))
+            duplicate_of = represented_messages.get((actor, text))
+            represented_messages.setdefault((actor, text), str(common["event_id"]))
             return NormalizedEvent(
                 actor=actor,
-                event_type="metadata" if duplicate else "message",
+                event_type="metadata" if duplicate_of else "message",
                 summary=truncate_summary(text),
-                payload=normalized_payload(
+                payload=_message_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    text=text,
-                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                    duplicate_of=duplicate_of,
                 ),
                 **common,
             )
         if ptype == "agent_message":
             text = str(payload.get("message") or "")
-            duplicate = (assistant_actor, text) in represented_messages
-            represented_messages.add((assistant_actor, text))
+            duplicate_of = represented_messages.get((assistant_actor, text))
+            represented_messages.setdefault(
+                (assistant_actor, text),
+                str(common["event_id"]),
+            )
             return NormalizedEvent(
                 actor=assistant_actor,
-                event_type="metadata" if duplicate else "message",
+                event_type="metadata" if duplicate_of else "message",
                 summary=truncate_summary(text),
-                payload=normalized_payload(
+                payload=_message_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    text=text,
-                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                    duplicate_of=duplicate_of,
                 ),
                 **common,
             )
@@ -601,7 +603,6 @@ class CodexImporter:
                 payload=normalized_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    thinking=text,
                 ),
                 **common,
             )
@@ -652,15 +653,6 @@ class CodexImporter:
             name = call_id_to_name.get(call_id or "", ptype.removesuffix("_end"))
             result_common = dict(common)
             result_common["parent_event_id"] = call_id_to_event_id.get(call_id or "")
-            output = (
-                payload.get("aggregated_output")
-                if ptype == "exec_command_end"
-                else payload.get("result")
-                if ptype == "mcp_tool_call_end"
-                else payload.get("results")
-                if ptype == "web_search_end"
-                else payload.get("stdout") or payload.get("changes")
-            )
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
@@ -670,7 +662,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name=name,
                     call_id=call_id,
-                    output=output,
                     **normalized_result_fields(payload),
                 ),
                 **result_common,
@@ -759,7 +750,7 @@ class CodexImporter:
         *,
         timestamp_inferred: bool,
         assistant_actor: Actor,
-        represented_messages: set[tuple[Actor, str]],
+        represented_messages: dict[tuple[Actor, str], str],
         call_id_to_name: dict[str, str],
         call_id_to_event_id: dict[str, str],
     ) -> NormalizedEvent:
@@ -774,7 +765,6 @@ class CodexImporter:
                     payload=normalized_payload(
                         payload,
                         timestamp_inferred=timestamp_inferred,
-                        text=text,
                     ),
                     **common,
                 )
@@ -785,17 +775,16 @@ class CodexImporter:
                 if role == "user"
                 else "assistant"
             )
-            duplicate = (actor, text) in represented_messages
-            represented_messages.add((actor, text))
+            duplicate_of = represented_messages.get((actor, text))
+            represented_messages.setdefault((actor, text), str(common["event_id"]))
             return NormalizedEvent(
                 actor=actor,
-                event_type="metadata" if duplicate else "message",
+                event_type="metadata" if duplicate_of else "message",
                 summary=truncate_summary(text),
-                payload=normalized_payload(
+                payload=_message_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    text=text,
-                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                    duplicate_of=duplicate_of,
                 ),
                 **common,
             )
@@ -808,7 +797,6 @@ class CodexImporter:
                 payload=normalized_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    **({"thinking": text} if text else {}),
                 ),
                 **common,
             )
@@ -829,9 +817,6 @@ class CodexImporter:
                 payload=normalized_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    name=name,
-                    arguments=args,
-                    input=args,
                     call_id=call_id,
                 ),
                 **common,
@@ -851,7 +836,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name=name,
                     call_id=call_id,
-                    output=payload.get("output"),
                     **normalized_result_fields(payload),
                 ),
                 **result_common,
@@ -871,8 +855,6 @@ class CodexImporter:
                 payload=normalized_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    name=name,
-                    input=payload.get("input"),
                     call_id=call_id,
                 ),
                 **common,
@@ -892,7 +874,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name=name,
                     call_id=call_id,
-                    output=payload.get("output"),
                     **normalized_result_fields(payload),
                 ),
                 **result_common,
@@ -910,7 +891,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name="web_search",
                     call_id=call_id,
-                    input=payload.get("action"),
                 ),
                 **common,
             )
@@ -928,7 +908,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name="tool_search",
                     call_id=call_id,
-                    input=payload.get("arguments"),
                 ),
                 **common,
             )
@@ -946,7 +925,6 @@ class CodexImporter:
                     timestamp_inferred=timestamp_inferred,
                     name="tool_search",
                     call_id=call_id,
-                    output=payload.get("tools"),
                     **normalized_result_fields(payload),
                 ),
                 **result_common,
@@ -964,7 +942,6 @@ class CodexImporter:
                 payload=normalized_payload(
                     payload,
                     timestamp_inferred=timestamp_inferred,
-                    text=text,
                 ),
                 **common,
             )
@@ -978,6 +955,83 @@ class CodexImporter:
             ),
             **common,
         )
+
+
+def _message_payload(
+    payload: dict[str, Any],
+    *,
+    timestamp_inferred: bool,
+    duplicate_of: str | None,
+) -> dict[str, Any]:
+    if duplicate_of is not None:
+        return normalized_payload(
+            {
+                "metadata_kind": "duplicate_message",
+                "duplicate_of": duplicate_of,
+                "source_payload_in_raw": True,
+            },
+            timestamp_inferred=timestamp_inferred,
+        )
+    return normalized_payload(
+        payload,
+        timestamp_inferred=timestamp_inferred,
+    )
+
+
+def _deduplicate_tool_results(events: list[NormalizedEvent]) -> None:
+    canonical: dict[tuple[str, str], NormalizedEvent] = {}
+    detailed_types = {
+        "exec_command_end",
+        "patch_apply_end",
+        "mcp_tool_call_end",
+        "web_search_end",
+    }
+    for event in events:
+        if event.event_type != "tool_result":
+            continue
+        call_id = event.payload.get("call_id")
+        output = payload_tool_output(event.payload)
+        if not call_id or output in (None, "", [], {}):
+            continue
+        try:
+            output_key = json.dumps(
+                output,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            output_key = repr(output)
+        key = str(call_id), output_key
+        previous = canonical.get(key)
+        if previous is None:
+            canonical[key] = event
+            continue
+        previous_detailed = previous.payload.get("type") in detailed_types
+        event_detailed = event.payload.get("type") in detailed_types
+        if event_detailed and not previous_detailed:
+            _mark_duplicate_result(previous, event)
+            canonical[key] = event
+        else:
+            _mark_duplicate_result(event, previous)
+
+
+def _mark_duplicate_result(
+    duplicate: NormalizedEvent,
+    canonical: NormalizedEvent,
+) -> None:
+    duplicate.actor = "system"
+    duplicate.event_type = "metadata"
+    duplicate.summary = "duplicate tool result"
+    duplicate.payload = normalized_payload(
+        {
+            "metadata_kind": "duplicate_tool_result",
+            "duplicate_of": canonical.event_id,
+            "call_id": duplicate.payload.get("call_id"),
+            "source_payload_in_raw": True,
+        },
+        timestamp_inferred=duplicate.payload.get("timestamp_inferred") is True,
+    )
 
 
 def _read_session_meta(path: Path) -> dict[str, Any] | None:

@@ -16,6 +16,7 @@ from retro.renormalize import (
 )
 from retro.schema import NormalizedEvent, RawRef
 from retro.storage import Layout
+from retro.utils import event_tool_input, event_tool_output
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -57,12 +58,19 @@ def test_codex_v2_maps_known_records_and_pairs_results(tmp_path: Path):
         event for event in events if event.payload.get("call_id") == "call-command"
         and event.event_type == "tool_result"
     ]
-    assert len(command_results) == 2
+    assert len(command_results) == 1
     assert all(event.parent_event_id == command_call.event_id for event in command_results)
     detailed = next(event for event in command_results if "exit_code" in event.payload)
     assert detailed.payload["exit_code"] == 1
     assert detailed.payload["success"] is False
     assert detailed.payload["is_error"] is True
+    duplicate = next(
+        event
+        for event in events
+        if event.payload.get("metadata_kind") == "duplicate_tool_result"
+    )
+    assert duplicate.payload["duplicate_of"] == detailed.event_id
+    assert "output" not in duplicate.payload
 
     inferred = [
         event
@@ -96,6 +104,15 @@ def test_claude_v2_maps_metadata_injection_and_tool_results(tmp_path: Path):
     assert top_types["cost-state"] == "usage"
     assert top_types["queue-operation"] == "lifecycle"
     assert top_types["frame-link"] == "metadata"
+    assert sum(
+        event.payload.get("type") == "file-history-snapshot"
+        for event in events
+    ) == 1
+    assert sum(
+        isinstance(event.payload.get("message"), dict)
+        and "usage" in event.payload["message"]
+        for event in events
+    ) == 1
 
     injected = next(event for event in events if event.event_id == "meta-user")
     assert injected.actor == "system"
@@ -122,6 +139,8 @@ def test_claude_v2_maps_metadata_injection_and_tool_results(tmp_path: Path):
     assert failed.payload["success"] is False
     assert failed.payload["is_error"] is True
     assert failed.payload["tool_use_result"]["stderr"] == "failed"
+    assert "content" not in failed.payload
+    assert "input" not in calls["tool-bash"].payload
 
     assert all(event.timestamp is not None for event in events)
     inferred = [
@@ -153,6 +172,7 @@ def test_copilot_v2_maps_noise_usage_attribution_and_pairing(tmp_path: Path):
     assert by_raw_id["turn-start"].event_type == "lifecycle"
     assert by_raw_id["hook-start"].event_type == "lifecycle"
     assert by_raw_id["usage"].event_type == "usage"
+    assert sum(event.event_type == "usage" for event in events) == 1
     assert by_raw_id["model"].event_type == "metadata"
     assert by_raw_id["compact-start"].event_type == "compaction"
     assert by_raw_id["skill"].event_type == "attachment"
@@ -177,6 +197,12 @@ def test_copilot_v2_maps_noise_usage_attribution_and_pairing(tmp_path: Path):
     assert shell_result.parent_event_id == shell_call.event_id
     assert shell_result.payload["exit_code"] == 1
     assert shell_result.payload["success"] is False
+    assert "output" not in shell_result.payload
+    assert "input" not in shell_call.payload
+    assert "source_chunks" not in shell_call.payload
+    assert event_tool_output(shell_call) is None
+    assert event_tool_input(shell_call) == {"command": "false"}
+    assert event_tool_output(shell_result) is None
 
     external_call = next(
         event for event in events if event.payload.get("call_id") == "call-external"
@@ -187,6 +213,8 @@ def test_copilot_v2_maps_noise_usage_attribution_and_pairing(tmp_path: Path):
         and event.actor == "tool"
     )
     assert external_result.parent_event_id == external_call.event_id
+    assert "output" not in external_result.payload
+    assert event_tool_output(external_result) == {"ok": True}
 
     assert all(event.timestamp is not None for event in events)
     inferred = [event for event in events if event.raw_ref.line > 1]

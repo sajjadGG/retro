@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .schema import NormalizedEvent, read_events
-from .utils import atomic_write_text
+from .utils import atomic_write_text, event_text, event_tool_input, event_tool_output
 
 _COMMAND_OUT_LIMIT = 4000  # per-event content truncation in rendered md
 _TEXT_LIMIT = 8000
@@ -266,41 +266,19 @@ def _render_result_inline(ev: NormalizedEvent) -> list[str]:
 
 
 def _extract_text(ev: NormalizedEvent) -> str:
-    p = ev.payload or {}
-    for k in ("text", "thinking", "message"):
-        v = p.get(k)
-        if isinstance(v, str):
-            return v
-    raw = p.get("raw_content")
-    if raw is not None:
-        return json.dumps(raw, ensure_ascii=False)
-    return ev.summary
+    return event_text(ev)
 
 
 def _extract_tool_result_text(ev: NormalizedEvent) -> str:
-    p = ev.payload or {}
-    for key in ("output", "result", "tool_use_result"):
-        out = p.get(key)
-        if isinstance(out, str):
-            return out
-        if isinstance(out, (dict, list)):
-            return json.dumps(out, ensure_ascii=False, indent=2)
-    stdout = p.get("stdout")
-    stderr = p.get("stderr")
-    if isinstance(stdout, str) or isinstance(stderr, str):
-        chunks = [
-            value
-            for value in (stdout, stderr)
-            if isinstance(value, str) and value
-        ]
-        return "\n".join(chunks)
-    content = p.get("content")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
+    output = event_tool_output(ev)
+    if isinstance(output, str):
+        return output
+    if isinstance(output, dict):
+        return json.dumps(output, ensure_ascii=False, indent=2)
+    if isinstance(output, list):
         # Anthropic-style tool_result content blocks: [{type: "text", text: ...}, ...]
         content_chunks: list[str] = []
-        for c in content:
+        for c in output:
             if isinstance(c, dict):
                 t = c.get("text")
                 if isinstance(t, str):
@@ -319,9 +297,7 @@ def _tool_call_body(ev: NormalizedEvent) -> str:
     name = p.get("name") or p.get("tool_name")
     if name:
         parts.append(f"- **name:** `{name}`")
-    inp = p.get("input")
-    if inp is None:
-        inp = p.get("arguments")
+    inp = event_tool_input(ev)
     if inp is not None:
         parts.append("- **input:**")
         parts.append("```json")

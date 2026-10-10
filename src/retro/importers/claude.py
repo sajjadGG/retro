@@ -46,7 +46,7 @@ _TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "NotebookEdit": "file_edit",
     "Bash": "command",
 }
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 
 @dataclass
@@ -634,7 +634,6 @@ class ClaudeImporter:
                     None,
                     0,
                     timestamp_inferred=timestamp_inferred,
-                    text=content,
                 ),
                 **common,
             )
@@ -651,11 +650,16 @@ class ClaudeImporter:
                     None,
                     0,
                     timestamp_inferred=timestamp_inferred,
-                    raw_content=content,
                 ),
                 **common,
             )
             return
+        result_indices = [
+            index
+            for index, item in enumerate(content)
+            if isinstance(item, dict) and item.get("type") == "tool_result"
+        ]
+        structured_result_index = result_indices[-1] if result_indices else None
         for idx, part in enumerate(content):
             part_id = uuid if idx == 0 else f"{uuid}#{idx}"
             ptype = part.get("type") if isinstance(part, dict) else None
@@ -672,7 +676,6 @@ class ClaudeImporter:
                         part,
                         idx,
                         timestamp_inferred=timestamp_inferred,
-                        text=text,
                     ),
                     **common,
                 )
@@ -700,8 +703,12 @@ class ClaudeImporter:
                         tool_name=tool_name,
                         tool_use_id=call_id,
                         call_id=call_id,
-                        content=part.get("content"),
-                        tool_use_result=tool_use_result,
+                        **(
+                            {"tool_use_result": tool_use_result}
+                            if idx == structured_result_index
+                            and tool_use_result is not None
+                            else {}
+                        ),
                         **normalized_result_fields(part, tool_use_result),
                     ),
                     **result_common,
@@ -783,7 +790,6 @@ class ClaudeImporter:
                         part,
                         idx,
                         timestamp_inferred=timestamp_inferred,
-                        text=text,
                     ),
                     **common,
                 )
@@ -800,7 +806,6 @@ class ClaudeImporter:
                         part,
                         idx,
                         timestamp_inferred=timestamp_inferred,
-                        thinking=text,
                     ),
                     **common,
                 )
@@ -827,7 +832,6 @@ class ClaudeImporter:
                         tool_id=tool_id,
                         call_id=tool_id,
                         name=tool_name,
-                        input=tool_input,
                     ),
                     **common,
                 )
@@ -857,14 +861,20 @@ def _claude_content_payload(
     timestamp_inferred: bool,
     **fields: Any,
 ) -> dict[str, Any]:
-    payload = {
-        key: value
-        for key, value in raw.items()
-        if key not in {"message", "toolUseResult"}
-    }
+    payload = (
+        {
+            key: value
+            for key, value in raw.items()
+            if key not in {"message", "toolUseResult"}
+        }
+        if index == 0
+        else {}
+    )
     if part is not None:
         payload["part"] = part
-    if index == 0:
+    if index == 0 and part is None:
+        payload["message"] = message
+    elif index == 0:
         message_metadata = {
             key: value
             for key, value in message.items()
@@ -872,11 +882,6 @@ def _claude_content_payload(
         }
         if message_metadata:
             payload["message"] = message_metadata
-        usage = message.get("usage")
-        if isinstance(usage, dict):
-            payload["usage"] = usage
-        if "toolUseResult" in raw and "tool_use_result" not in fields:
-            payload["tool_use_result"] = raw["toolUseResult"]
     return normalized_payload(
         payload,
         timestamp_inferred=timestamp_inferred,

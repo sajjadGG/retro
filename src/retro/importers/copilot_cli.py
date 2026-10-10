@@ -29,7 +29,7 @@ from .vscode_copilot import (
 
 COPILOT_HOME_ENV = "COPILOT_HOME"
 COPILOT_SESSION_STATE_DIRS_ENV = "COPILOT_SESSION_STATE_DIRS"
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 _SESSION_METADATA_FILES = (
     "workspace.yaml",
@@ -379,10 +379,13 @@ class CopilotCliImporter:
             reasoning = data.get("reasoningText")
             thinking = reasoning if isinstance(reasoning, str) else ""
             turn_id = str(data.get("turnId") or "")
-            source_payload_available = True
+            residual_payload_available = True
 
-            def assistant_payload(**fields: Any) -> dict[str, Any]:
-                nonlocal source_payload_available
+            def assistant_payload(
+                source_fields: dict[str, Any],
+                **fields: Any,
+            ) -> dict[str, Any]:
+                nonlocal residual_payload_available
                 metadata = {
                     key: data[key]
                     for key in (
@@ -399,10 +402,25 @@ class CopilotCliImporter:
                     )
                     if key in data
                 }
-                if source_payload_available:
-                    source_payload_available = False
-                    return {**data, **fields}
-                return {**metadata, **fields}
+                if residual_payload_available:
+                    residual_payload_available = False
+                    metadata.update(
+                        {
+                            key: value
+                            for key, value in data.items()
+                            if key
+                            not in {
+                                "content",
+                                "reasoningText",
+                                "reasoningOpaque",
+                                "reasoningBlocks",
+                                "encryptedContent",
+                                "toolRequests",
+                                "source_chunks",
+                            }
+                        }
+                    )
+                return {**metadata, **source_fields, **fields}
 
             canonical_event_id: str | None = None
             if thinking:
@@ -413,7 +431,18 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type="reasoning",
                     summary=truncate_summary(thinking),
-                    payload=assistant_payload(thinking=thinking),
+                    payload=assistant_payload(
+                        {
+                            key: data[key]
+                            for key in (
+                                "reasoningText",
+                                "reasoningOpaque",
+                                "reasoningBlocks",
+                                "encryptedContent",
+                            )
+                            if key in data
+                        }
+                    ),
                     parent_event_id=parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -425,7 +454,7 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type="message",
                     summary=truncate_summary(text),
-                    payload=assistant_payload(text=text),
+                    payload=assistant_payload({"content": text}),
                     parent_event_id=parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -453,13 +482,12 @@ class CopilotCliImporter:
                     event_type=call_type,
                     summary=_tool_summary(name, arguments),
                     payload=assistant_payload(
+                        {"request": request},
                         name=name,
                         tool_name=name,
                         tool_id=call_id or None,
                         call_id=call_id or None,
-                        input=arguments,
                         requested_only=True,
-                        request=request,
                     ),
                     parent_event_id=canonical_event_id or parent,
                     raw_event_ids=raw_event_ids,
@@ -483,6 +511,15 @@ class CopilotCliImporter:
                     event_type="attachment",
                     summary="encrypted assistant message",
                     payload=assistant_payload(
+                        {
+                            key: data[key]
+                            for key in (
+                                "encryptedContent",
+                                "reasoningOpaque",
+                                "reasoningBlocks",
+                            )
+                            if key in data
+                        },
                         encrypted_content_bytes=len(str(encrypted)),
                     ),
                     parent_event_id=parent,
@@ -530,10 +567,6 @@ class CopilotCliImporter:
                     requests.append(request)
             first_data["toolRequests"] = requests
             first_data["persisted_chunk_count"] = len(ordered)
-            first_data["source_chunks"] = [
-                _event_data(raw)
-                for _, raw in ordered
-            ]
             first_data.pop("chunkIndex", None)
             first_data.pop("chunkCount", None)
             merged = dict(first_raw)
@@ -591,7 +624,7 @@ class CopilotCliImporter:
                     actor=message_actor,
                     event_type=message_type,
                     summary=truncate_summary(text or "empty user message"),
-                    payload={"text": text, **data, **normalized_fields},
+                    payload={**data, **normalized_fields},
                     parent_event_id=session_start_event_id,
                 )
             elif event_type == "assistant.message":
@@ -622,6 +655,13 @@ class CopilotCliImporter:
                 parent = logical_parent(data)
                 existing_call = tool_events.get(call_id)
                 if existing_call is not None:
+                    execution_data = dict(data)
+                    request = existing_call.payload.get("request")
+                    if (
+                        isinstance(request, dict)
+                        and request.get("arguments") == execution_data.get("arguments")
+                    ):
+                        execution_data.pop("arguments", None)
                     existing_call.actor = (
                         "subagent" if data.get("parentToolCallId") else "assistant"
                     )
@@ -629,12 +669,11 @@ class CopilotCliImporter:
                     existing_call.summary = _tool_summary(name, arguments)
                     existing_call.payload.update(
                         {
-                            **data,
+                            **execution_data,
                             "name": name,
                             "tool_name": name,
                             "tool_id": call_id,
                             "call_id": call_id,
-                            "input": arguments,
                             "requested_only": False,
                             "execution_raw_ref": {
                                 "path": artifact_ref(events_path, self.layout.root),
@@ -657,7 +696,6 @@ class CopilotCliImporter:
                             "tool_name": name,
                             "tool_id": call_id,
                             "call_id": call_id,
-                            "input": arguments,
                             "requested_only": False,
                         },
                         parent_event_id=parent,
@@ -682,7 +720,6 @@ class CopilotCliImporter:
                         "tool_name": name,
                         "tool_id": call_id,
                         "call_id": call_id,
-                        "output": data.get("result"),
                         **normalized_result_fields(data),
                     },
                     parent_event_id=start_id,
@@ -701,7 +738,6 @@ class CopilotCliImporter:
                         "name": name,
                         "tool_name": name,
                         "call_id": data.get("toolCallId") or request_id,
-                        "input": data.get("arguments"),
                     },
                     parent_event_id=current_user_event_id,
                 )
@@ -725,7 +761,6 @@ class CopilotCliImporter:
                         "name": name,
                         "tool_name": name,
                         "call_id": call_id,
-                        "output": data.get("result"),
                         **normalized_result_fields(data),
                     },
                     parent_event_id=external_tool_event_ids.get(request_id),
@@ -784,7 +819,7 @@ class CopilotCliImporter:
                     actor="system",
                     event_type="message",
                     summary=truncate_summary(text),
-                    payload={"text": text, **data},
+                    payload=data,
                     parent_event_id=current_user_event_id or session_start_event_id,
                 )
             elif event_type == "system.notification":

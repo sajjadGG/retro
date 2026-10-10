@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import resolve_archive_root, resolve_dashboard_dir
+from .utils import payload_tool_input, payload_tool_output
 
 # Defaults come from the per-user config; build() rebinds explicit overrides.
 ARTIFACT_ROOT = resolve_archive_root()
@@ -395,8 +396,10 @@ def analyze_session(
             paths = []
             if "file_path" in payload:
                 paths.append(payload["file_path"])
-            elif "input" in payload and isinstance(payload["input"], dict) and "file_path" in payload["input"]:
-                paths.append(payload["input"]["file_path"])
+            else:
+                tool_input = payload_tool_input(payload)
+                if isinstance(tool_input, dict) and "file_path" in tool_input:
+                    paths.append(tool_input["file_path"])
 
             for p in paths:
                 if isinstance(p, str) and p.startswith("/"):
@@ -1480,7 +1483,7 @@ def is_failed_event(event: dict[str, Any]) -> bool:
     status = payload.get("status")
     if isinstance(status, str) and status.lower() in {"failed", "error"}:
         return True
-    output = payload.get("output")
+    output = payload_tool_output(payload)
     if isinstance(output, str) and '"exit_code":' in output:
         match = re.search(r'"exit_code"\s*:\s*(\d+)', output)
         if match and int(match.group(1)) != 0:

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...schema import NormalizedEvent
+from ...utils import event_tool_input, event_tool_output
 from ..base import (
     MemoryCandidate,
     MiningContext,
@@ -199,7 +200,7 @@ def _result_is_error(ev: NormalizedEvent) -> bool:
     status = payload.get("status")
     if isinstance(status, str) and status.lower() in {"failed", "error"}:
         return True
-    output = payload.get("output")
+    output = event_tool_output(ev)
     if isinstance(output, str):
         m = re.search(r'"exit_code"\s*:\s*(\d+)', output)
         if m and int(m.group(1)) != 0:
@@ -288,8 +289,7 @@ def _infer_scope(turn: _Turn, origin: str | None, title_was_hint: bool):
     # task-scoped.
     repo_local = 0
     for ev in turn.tool_calls:
-        payload = ev.payload or {}
-        inp = payload.get("input") or payload.get("arguments") or {}
+        inp = event_tool_input(ev) or {}
         if isinstance(inp, str):
             text = inp
         elif isinstance(inp, dict):
@@ -318,9 +318,7 @@ def _abstract_steps(tool_calls: Sequence[NormalizedEvent], *, limit: int = 10) -
 def _describe_call(ev: NormalizedEvent) -> str:
     payload = ev.payload or {}
     name = payload.get("name") or payload.get("tool_name") or ev.event_type
-    inp = payload.get("input")
-    if inp is None:
-        inp = payload.get("arguments")
+    inp = event_tool_input(ev)
     detail = _summarize_input(inp)
     label = {
         "command": "run shell",
@@ -402,7 +400,7 @@ def _describe_verification(turn: _Turn) -> str:
     for ev in reversed(tail):
         if ev.event_type != "command":
             continue
-        text = _summarize_input((ev.payload or {}).get("input") or (ev.payload or {}).get("arguments"))
+        text = _summarize_input(event_tool_input(ev))
         if any(p.search(text) for p in _VERIFICATION_PATTERNS):
             return f"verified by running `{text[:80]}`"
     # File-edit-only flows: imply manual review.
@@ -413,7 +411,7 @@ def _describe_verification(turn: _Turn) -> str:
 
 def _last_edited_path(ev: NormalizedEvent) -> str | None:
     payload = ev.payload or {}
-    inp = payload.get("input") or {}
+    inp = event_tool_input(ev) or {}
     for k in ("file_path", "path", "file"):
         v = inp.get(k) if isinstance(inp, dict) else None
         if isinstance(v, str):

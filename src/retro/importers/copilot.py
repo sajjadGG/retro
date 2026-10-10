@@ -13,7 +13,7 @@ from .vscode_copilot import CopilotSession as VscodeCopilotSession
 from .vscode_copilot import VscodeCopilotImporter
 
 CopilotSession = Union[VscodeCopilotSession, CopilotCliSession]
-NORMALIZER_VERSION = 2
+NORMALIZER_VERSION = 3
 
 
 class CopilotImporter:

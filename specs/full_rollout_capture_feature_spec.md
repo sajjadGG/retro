@@ -300,11 +300,19 @@ ordinary completion is `tool_result`. Both sides carry `payload.call_id`, and a
 completion's `parent_event_id` points to its normalized call. Subagent
 lifecycle uses `subagent_start` and `subagent_end`.
 
-Host payload keys are retained and normalized aliases are added rather than
-replacing source fields. When a raw record lacks a timestamp, the nearest
-preceding timestamp is copied and `payload.timestamp_inferred` is `true`. A
-record before the first timestamp remains untimestamped. No following
-timestamp is backfilled.
+Host payload values are retained verbatim, but each large value is serialized
+only once. Multi-part messages distribute their source parts across normalized
+events instead of copying the complete source record into every part. Normalized
+aliases are limited to small linkage/status fields such as `call_id`,
+`success`, and `exit_code`; text, input, and output stay under their original
+host keys. `retro.utils.event_text`, `event_tool_input`, and
+`event_tool_output` provide shape-independent access. Duplicate host
+representations use a small metadata pointer to the canonical normalized event;
+the complete duplicate remains available through `raw_ref`.
+
+When a raw record lacks a timestamp, the nearest preceding timestamp is copied
+and `payload.timestamp_inferred` is `true`. A record before the first timestamp
+remains untimestamped. No following timestamp is backfilled.
 
 ### Codex mapping
 
@@ -317,7 +325,7 @@ timestamp is backfilled.
 | `inter_agent_communication_metadata` | `metadata` | Actor is `subagent`. |
 | `event_msg.user_message` | `message` | Actor is `user`, or `subagent` in a child session. |
 | `event_msg.agent_message` | `message` | Actor is `assistant` or `subagent`. Duplicate host representations become filtered `metadata`. |
-| `event_msg.agent_reasoning` | `reasoning` | Text is also exposed as `payload.thinking`. |
+| `event_msg.agent_reasoning` | `reasoning` | Source `text` is retained without a second text alias. |
 | `event_msg.task_started`, `task_complete` | `lifecycle` | `lifecycle=task_started|task_complete`. |
 | `event_msg.token_count` | `usage` | Original `info` and `rate_limits` shapes are unchanged. |
 | `event_msg.patch_apply_end`, `exec_command_end`, `mcp_tool_call_end`, `web_search_end` | `tool_result` | Normalizes call ID, output, success/error, and exit code when present. |
@@ -326,7 +334,7 @@ timestamp is backfilled.
 | `event_msg.context_compacted` | `compaction` | `lifecycle=compaction_complete`. |
 | `event_msg.sub_agent_activity` | `subagent_start`, `subagent_end`, or `lifecycle` | `started`/terminal kinds use the existing subagent types; other activity uses `lifecycle`. |
 | `event_msg.turn_aborted`, `thread_rolled_back` | `lifecycle` | Interruption/rollback reason remains in the payload. |
-| `response_item.message` | `message`, `attachment`, or `metadata` | Developer content is injected `attachment`; user/assistant content is `message`; duplicate host copies are `metadata`. |
+| `response_item.message` | `message`, `attachment`, or `metadata` | Developer content is injected `attachment`; user/assistant content is `message`; duplicate host copies are compact metadata pointers. |
 | `response_item.reasoning` | `reasoning` | Keeps plaintext summary/content and encrypted envelope. |
 | `response_item.function_call`, `custom_tool_call` | specialized call or `tool_call` | `exec_command`/`shell` → `command`; `apply_patch` → `file_edit`; read tools → `file_read`. |
 | `response_item.function_call_output`, `custom_tool_call_output` | `tool_result` | Linked to the call by `call_id` and `parent_event_id`. |

@@ -19,6 +19,7 @@ from collections import Counter
 from collections.abc import Sequence
 
 from ...schema import NormalizedEvent
+from ...utils import event_tool_input
 from ..base import (
     MemoryCandidate,
     MiningContext,
@@ -296,7 +297,7 @@ def _infer_procedure_scope(
     local = 0
     for ev in edits:
         payload = ev.payload or {}
-        inp = payload.get("input") or {}
+        inp = event_tool_input(ev) or {}
         if isinstance(inp, dict):
             for key in ("file_path", "path", "file"):
                 v = inp.get(key)

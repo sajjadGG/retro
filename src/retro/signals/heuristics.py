@@ -5,7 +5,7 @@ import re
 from datetime import datetime
 
 from ..schema import NormalizedEvent
-from ..utils import event_file_paths
+from ..utils import event_file_paths, payload_tool_output
 from .base import SessionContext, event_text, iter_messages, reading, register
 
 # ---- activity ---------------------------------------------------------------
@@ -478,7 +478,7 @@ def _is_failed(ev: NormalizedEvent) -> bool:
     status = payload.get("status")
     if isinstance(status, str) and status.lower() in {"failed", "error"}:
         return True
-    output = payload.get("output")
+    output = payload_tool_output(payload)
     if isinstance(output, str):
         m = re.search(r'"exit_code"\s*:\s*(\d+)', output)
         if m and int(m.group(1)) != 0:

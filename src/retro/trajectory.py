@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .schema import NormalizedEvent
-from .utils import event_text, truncate_summary
+from .utils import event_text, event_tool_input, event_tool_output, truncate_summary
 
 ActionCategory = Literal[
     "explore",
@@ -168,7 +168,7 @@ def action_fingerprint(ev: NormalizedEvent, text: str | None = None) -> str:
         value = payload.get(key)
         if isinstance(value, str) and value:
             parts.append(f"{key}={value}")
-    inp = payload.get("input")
+    inp = event_tool_input(ev)
     if isinstance(inp, dict):
         for key in ("file_path", "path", "filepath", "cmd", "command"):
             value = inp.get(key)
@@ -253,7 +253,7 @@ def _event_haystack(ev: NormalizedEvent, text: str | None = None) -> str:
             str(payload.get("name") or ""),
             str(payload.get("tool_name") or ""),
             _command_text(ev),
-            str(payload.get("input") or ""),
+            str(event_tool_input(ev) or ""),
         ]
     ).lower()
 
@@ -270,13 +270,13 @@ def _command_text(ev: NormalizedEvent) -> str:
         value = payload.get(key)
         if isinstance(value, str) and value:
             return value
-    inp = payload.get("input")
+    inp = event_tool_input(ev)
     if isinstance(inp, dict):
         for key in ("cmd", "command"):
             value = inp.get(key)
             if isinstance(value, str) and value:
                 return value
-    output = payload.get("output")
+    output = event_tool_output(ev)
     if isinstance(output, str):
         match = re.search(r"(?:cmd|command)=([^,\n)]+)", output)
         if match:
