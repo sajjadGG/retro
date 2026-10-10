@@ -40,20 +40,12 @@ def test_noop_sync_does_not_rebuild_dashboard(monkeypatch, tmp_path: Path):
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-
-    def write_signals(layout, readings):
-        path = layout.root / "signals" / "readings.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-        return {"readings": path}
 
     def reindex(layout):
         path = layout.memory_index_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"index")
 
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", write_signals)
     monkeypatch.setattr("retro.sync.reindex_memory", reindex)
     rebuilt = []
     monkeypatch.setattr(
@@ -120,8 +112,6 @@ def test_sync_report_is_structured(monkeypatch, tmp_path: Path):
     layout.ensure()
     dashboard = tmp_path / "dashboard"
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
 
@@ -195,8 +185,6 @@ def test_sync_imports_registered_extension_source(monkeypatch, tmp_path: Path):
         "retro.sync.create_source",
         lambda host, layout: SourceHandle(record, layout),
     )
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
     layout = Layout(tmp_path / "archive")
@@ -222,8 +210,6 @@ def test_low_space_only_blocks_scheduled_sync(monkeypatch, tmp_path: Path):
         "retro.sync.shutil.disk_usage",
         lambda path: _ntuple_diskusage(10 * 1024**3, 9 * 1024**3, 1024**3),
     )
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
 
@@ -253,7 +239,7 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     (layout.root / "signals").mkdir()
-    (layout.root / "signals" / "readings.jsonl").write_text("", encoding="utf-8")
+    (layout.root / "signals" / "sessions.jsonl").write_text("", encoding="utf-8")
     state = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
     state.parent.mkdir(parents=True)
     state.write_text(
@@ -266,8 +252,6 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
         encoding="utf-8",
     )
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "")
     rebuilt = []
@@ -293,7 +277,7 @@ def test_scheduled_sync_defers_derived_work_until_interval(
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     (layout.root / "signals").mkdir()
-    (layout.root / "signals" / "readings.jsonl").write_text("", encoding="utf-8")
+    (layout.root / "signals" / "sessions.jsonl").write_text("", encoding="utf-8")
     layout.memory_index_path().parent.mkdir(parents=True, exist_ok=True)
     layout.memory_index_path().write_bytes(b"index")
     state = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"

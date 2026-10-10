@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import shutil
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,13 +21,7 @@ from .memory_store import reindex as reindex_memory
 from .renderer import render_file
 from .schema import Host, validate_host_id, validate_session_id
 from .sdk import SessionDescriptor
-from .signals import REGISTRY as SIGNAL_REGISTRY
-from .signals import (
-    read_signal_readings,
-    replace_session_readings,
-    run_signals,
-    write_signal_artifacts,
-)
+from .signals import definitions_version, update_signals
 from .storage import Layout
 from .utils import atomic_write_text
 
@@ -176,7 +169,7 @@ def run_sync(
             )
             full_signal_rebuild = (
                 force_derived
-                or not (layout.root / "signals" / "readings.jsonl").exists()
+                or not (layout.root / "signals" / "sessions.jsonl").exists()
                 or signal_schema_changed
             )
             should_rebuild_derived = (
@@ -205,31 +198,11 @@ def run_sync(
                         layout.rendered_path(host, session_id),
                     )
                     report.rendered.append(f"{host}/{session_id}")
-            if should_rebuild_derived and full_signal_rebuild:
-                readings = run_signals(layout)
-                write_signal_artifacts(layout, readings)
-                report.signals_recomputed = True
-            elif should_rebuild_derived and pending_typed:
-                existing = read_signal_readings(layout)
-                replacements = []
-                by_host: dict[Host, list[str]] = defaultdict(list)
-                for host, session_id in pending_typed:
-                    by_host[host].append(session_id)
-                for host, session_ids in by_host.items():
-                    replacements.extend(
-                        run_signals(
-                            layout,
-                            host=host,
-                            session_ids=session_ids,
-                        )
-                    )
-                merged = replace_session_readings(
-                    existing,
-                    replacements,
-                    pending_typed,
+            if should_rebuild_derived:
+                signal_update = update_signals(layout, force=full_signal_rebuild)
+                report.signals_recomputed = bool(
+                    full_signal_rebuild or signal_update.recomputed or signal_update.removed_keys
                 )
-                write_signal_artifacts(layout, merged)
-                report.signals_recomputed = True
 
             if should_rebuild_derived and (
                 force_derived
@@ -365,20 +338,7 @@ def _is_prefix(prefix: Path, candidate: Path) -> bool:
 
 
 def _signal_signature() -> str:
-    payload = [
-        {
-            "name": signal.name,
-            "group": signal.group,
-            "kind": signal.kind,
-            "method": signal.method,
-            "unit": signal.unit,
-            "description": signal.description,
-        }
-        for signal in SIGNAL_REGISTRY.values()
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return definitions_version()
 
 
 def _derived_due(

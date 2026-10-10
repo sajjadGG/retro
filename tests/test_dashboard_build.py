@@ -10,7 +10,7 @@ from retro.dashboard_build import PricingMap, build
 from retro.dashboard_experiments import build as build_experiments
 from retro.dashboard_publish import build_and_publish_dashboard
 from retro.schema import NormalizedEvent, RawRef, write_events
-from retro.signals import run_signals, write_signal_artifacts
+from retro.signals import update_signals
 from retro.storage import Layout
 
 
@@ -136,15 +136,11 @@ def test_build_includes_extension_host_in_dynamic_summary(tmp_path: Path):
     assert "populateHostFilters" in html
     assert "hostColor(host)" in html
 
-    write_signal_artifacts(layout, run_signals(layout))
+    update_signals(layout)
     experiments_path = build_experiments(
         artifact_root=layout.root,
         out_dir=out_dir,
     )
-    experiments = json.loads(
-        (out_dir / "data" / "trajectory_experiments.json").read_text(encoding="utf-8")
-    )
-    assert experiments["sessions"][0]["host"] == "opencode"
     assert "populateHosts" in experiments_path.read_text(encoding="utf-8")
 
 

@@ -83,7 +83,12 @@ from .renderer import render_file
 from .schema import BUILTIN_HOSTS, Host, read_events
 from .sdk import SessionDescriptor
 from .signals import REGISTRY as SIGNAL_REGISTRY
-from .signals import run_signals, write_signal_artifacts
+from .signals import (
+    definitions_version,
+    load_signal_store,
+    summarize,
+    update_signals,
+)
 from .storage import Layout, default_layout
 
 app = typer.Typer(
@@ -561,12 +566,17 @@ def _do_import(
         console.print(f"  rendered:   {dest}  ({n:,} bytes)")
 
     try:
-        from .analyzer import check_operator_diagnostics
+        from .signals import build_profile, session_tips
 
-        events = list(read_events(result.normalized_path))
-        tips = check_operator_diagnostics(events)
-        for tip in tips:
-            console.print(f"[yellow]{tip}[/yellow]")
+        profile = build_profile(
+            key=f"{result.host}/{result.session_id}",
+            host=result.host,
+            session_id=result.session_id,
+            events=list(read_events(result.normalized_path)),
+            raw_dir=result.raw_dir,
+        )
+        for tip in session_tips(profile):
+            console.print(f"[yellow]retro tip:[/yellow] {tip}")
     except Exception as exc:
         console.print(
             f"[yellow]operator diagnostics unavailable: "
@@ -1885,21 +1895,44 @@ def doctor_cmd() -> None:
 
 @signal_app.command("list")
 def signal_list(
-    group: Optional[str] = typer.Option(None, help="Filter by group: activity|outcome|cost|risk"),
+    category: Optional[str] = typer.Option(
+        None,
+        "--category",
+        help="Filter by category: usage|activity|outcome|friction|efficiency|collaboration|risk|quality|work",
+    ),
+    describe: bool = typer.Option(
+        False, "--describe", help="Include the full definition of each signal"
+    ),
 ):
-    """List registered signals grouped by intent."""
-    table = Table(title=f"Signals ({len(SIGNAL_REGISTRY)} registered)")
-    table.add_column("name")
-    table.add_column("group")
-    table.add_column("kind")
-    table.add_column("method")
-    table.add_column("unit")
-    table.add_column("description")
-    for name in sorted(SIGNAL_REGISTRY):
-        s = SIGNAL_REGISTRY[name]
-        if group and s.group != group:
+    """List registered signals with their metadata."""
+    table = Table(
+        title=f"Signals ({len(SIGNAL_REGISTRY)} registered, set {definitions_version()})"
+    )
+    table.add_column("id", no_wrap=True, style="cyan")
+    table.add_column("category", no_wrap=True)
+    table.add_column("kind", no_wrap=True)
+    table.add_column("unit", no_wrap=True)
+    table.add_column("polarity", no_wrap=True)
+    table.add_column("method", no_wrap=True)
+    table.add_column("v", justify="right", no_wrap=True)
+    if describe:
+        table.add_column("description", overflow="fold", ratio=2)
+    for signal_id in sorted(SIGNAL_REGISTRY):
+        definition = SIGNAL_REGISTRY[signal_id]
+        if category and definition.category != category:
             continue
-        table.add_row(s.name, s.group, s.kind, s.method, s.unit or "", s.description)
+        row = [
+            definition.id,
+            definition.category,
+            definition.kind,
+            definition.unit or "",
+            definition.polarity,
+            definition.method,
+            str(definition.version),
+        ]
+        if describe:
+            row.append(definition.description)
+        table.add_row(*row)
     console.print(table)
 
 
@@ -1907,30 +1940,44 @@ def signal_list(
 def signal_run(
     host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
     session_id: Optional[str] = typer.Option(
-        None, "--session-id", help="Restrict to one session id (repeatable via comma)"
+        None, "--session-id", help="Restrict to session ids (comma separated)"
     ),
-    signal: Optional[str] = typer.Option(
-        None, "--signal", help="Restrict to one signal name (repeatable via comma)"
+    force: bool = typer.Option(False, "--force", help="Recompute every session"),
+    include_scratch: bool = typer.Option(
+        False,
+        "--include-scratch",
+        help="Also evaluate sessions whose working directory is a temp directory",
     ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
-    """Compute signals over imported sessions and write readings + aggregates."""
+    """Update signals/sessions.jsonl for every catalogued session."""
     lay = _layout(root)
     host_full = _expand_host(host) if host else None
-    sids = [s.strip() for s in session_id.split(",")] if session_id else None
-    sigs = [s.strip() for s in signal.split(",")] if signal else None
-    try:
-        readings = run_signals(lay, host=host_full, session_ids=sids, signal_names=sigs)
-    except KeyError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1) from None
-    if not readings:
-        console.print("[yellow]No readings produced (no matching sessions or signals).[/yellow]")
-        raise typer.Exit(0)
-    paths = write_signal_artifacts(lay, readings)
-    console.print(f"[green]wrote {len(readings)} readings[/green]")
-    for label, p in paths.items():
-        console.print(f"  {label:<10} {p}")
+    sids = [s.strip() for s in session_id.split(",") if s.strip()] if session_id else None
+    source = None
+    if include_scratch:
+        from .signals import NormalizedSource
+
+        source = NormalizedSource(
+            layout=lay, host=host_full, session_ids=sids, skip_temp=False
+        )
+    update = update_signals(
+        lay,
+        source,
+        force=force,
+        host=host_full,
+        session_ids=sids,
+        prune=not (host_full or sids),
+    )
+    console.print(
+        f"[green]signals up to date[/green] set={update.version} sessions={update.total:,} "
+        f"added={len(update.added_keys):,} changed={len(update.changed_keys):,} "
+        f"removed={len(update.removed_keys):,} reused={update.reused:,} "
+        f"in {update.duration_s:.1f}s"
+    )
+    signals_root = lay.root / "signals"
+    console.print(f"  definitions {signals_root / 'definitions.json'}")
+    console.print(f"  sessions    {signals_root / 'sessions.jsonl'}")
 
 
 @signal_app.command("show")
@@ -1939,51 +1986,82 @@ def signal_show(
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
-    """Show all signal readings stored for one session."""
+    """Show every stored signal value for one session."""
     lay = _layout(root)
     host_full = _expand_host(host)
-    readings_path = lay.root / "signals" / "readings.jsonl"
-    if not readings_path.exists():
-        console.print(f"[red]No readings found at {readings_path}. Run `retro signal run` first.[/red]")
+    key = f"{host_full}/{session_id}"
+    store = load_signal_store(lay)
+    record = store.record(key)
+    if record is None:
+        console.print(
+            f"[yellow]No stored signals for {key}. Run `retro signal run` first.[/yellow]"
+        )
         raise typer.Exit(1)
-    import json as _json
+    definitions = {item["id"]: item for item in store.definitions}
+    evidence = store.evidence(key)
+    confidence = store.confidence(key)
 
-    table = Table(title=f"Signals for {host_full}/{session_id}")
-    table.add_column("signal")
-    table.add_column("group")
-    table.add_column("kind")
+    table = Table(title=f"Signals for {key}")
+    table.add_column("id")
+    table.add_column("category")
     table.add_column("value")
     table.add_column("unit")
-    table.add_column("notes")
-    found = 0
-    with readings_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            r = _json.loads(line)
-            if r["host"] != host_full or r["session_id"] != session_id:
-                continue
-            found += 1
-            note_bits = []
-            if r.get("confidence") not in (None, 1.0):
-                note_bits.append(f"conf={r['confidence']}")
-            meta = r.get("metadata") or {}
-            if "reason" in meta:
-                note_bits.append(f"reason={meta['reason']}")
-            if "error" in meta:
-                note_bits.append(f"err={meta['error'][:40]}")
-            table.add_row(
-                r["signal"],
-                r["group"],
-                r["kind"],
-                str(r["value"]),
-                r.get("unit") or "",
-                ", ".join(note_bits),
-            )
-    if found == 0:
-        console.print(f"[yellow]No readings for {host_full}/{session_id}[/yellow]")
+    table.add_column("conf", justify="right")
+    table.add_column("evidence")
+    for signal_id, value in sorted(record.get("values", {}).items()):
+        definition = definitions.get(signal_id, {})
+        refs = evidence.get(signal_id) or []
+        table.add_row(
+            signal_id,
+            str(definition.get("category") or ""),
+            str(value),
+            str(definition.get("unit") or ""),
+            f"{confidence.get(signal_id, 1.0):.2f}",
+            ", ".join(refs[:2]),
+        )
+    console.print(table)
+
+
+@signal_app.command("summary")
+def signal_summary(
+    signal: Optional[str] = typer.Option(
+        None, "--signal", help="Restrict to signal ids (comma separated)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the raw summary as JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+):
+    """Aggregate stored signal values across every evaluated session."""
+    lay = _layout(root)
+    store = load_signal_store(lay)
+    if not len(store):
+        console.print("[yellow]No signal store yet. Run `retro signal run` first.[/yellow]")
         raise typer.Exit(1)
+    wanted = {s.strip() for s in signal.split(",") if s.strip()} if signal else None
+    summary = summarize(store.all_values(), store.definitions)
+    blocks = summary["signals"]
+    if wanted:
+        blocks = {k: v for k, v in blocks.items() if k in wanted}
+    if as_json:
+        import json as _json
+
+        console.print_json(_json.dumps({"sessions": summary["sessions"], "signals": blocks}))
+        return
+    table = Table(title=f"Signal summary ({summary['sessions']:,} sessions)")
+    table.add_column("id")
+    table.add_column("category")
+    table.add_column("n", justify="right")
+    table.add_column("summary")
+    for signal_id, block in sorted(blocks.items()):
+        if "true_rate" in block:
+            text = f"true {block['true']}/{block['n']} ({block['true_rate']:.0%})"
+        elif "counts" in block:
+            text = ", ".join(f"{k}={v}" for k, v in list(block["counts"].items())[:4])
+        else:
+            text = (
+                f"median {block['median']:g}  p90 {block['p90']:g}  "
+                f"mean {block['mean']:g}  sum {block['sum']:g}"
+            )
+        table.add_row(signal_id, str(block.get("category") or ""), f"{block['n']:,}", text)
     console.print(table)
 
 
@@ -2055,12 +2133,13 @@ def dashboard_view(
 @app.command("analyze")
 def analyze(
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
 ) -> None:
     """Analyze command and tool call patterns across imported sessions."""
-    from .analyzer import analyze_sessions, generate_report, render_console_report
+    from .signals import analyze_sessions, generate_report, render_console_report
 
     lay = _layout(root)
-    stats = analyze_sessions(lay)
+    stats = analyze_sessions(lay, host=_expand_host(host) if host else None)
     render_console_report(stats)
 
     report_path = lay.root / "analysis_report.md"

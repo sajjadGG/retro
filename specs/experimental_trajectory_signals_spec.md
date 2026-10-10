@@ -1,3 +1,5 @@
+> **Superseded.** The trajectory signals described here were implemented, measured against the real archive, and retired in signals v2. See `specs/rollout_signals_spec.md` § "What was dropped, and why" for what was kept (validation-before-termination, repeated-action-without-progress) and what was dropped (the thought/action/result iteration model, the eight-way action taxonomy, n-gram mining, the five semantic adjacency relations). This file is retained as design history only.
+
 # Experimental Trajectory Signals Spec
 
 ## Purpose
