@@ -12,6 +12,7 @@ from retro.extensions import SourceHandle
 from retro.importers.copilot_cli import CopilotCliSession
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.sdk import ImportResult, SessionDescriptor, SourceRegistry
+from retro.signals import SignalUpdate
 from retro.storage import Layout
 from retro.sync import _preserve_rewritten_raw, run_sync
 
@@ -263,7 +264,7 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
 
     report = run_sync(layout, dashboard_dir=dashboard)
 
-    assert report.signals_recomputed is True
+    assert report.stages["signals"]["status"] == "success"
     assert report.dashboard_rebuilt is True
     assert rebuilt == [dashboard.resolve()]
 
@@ -332,15 +333,9 @@ def test_dashboard_failure_retries_without_recomputing_signals(
     _patch_empty_sources(monkeypatch)
     signal_runs = []
 
-    def run_signal_stage(layout, **kwargs):
-        signal_runs.append(kwargs)
-        return []
-
-    def write_signals(layout, readings):
-        path = layout.root / "signals" / "readings.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-        return {"readings": path}
+    def refresh_signals(layout, catalog, *, force=False):
+        signal_runs.append(force)
+        return SignalUpdate(version="test", added_keys=["codex/x"] if force else [])
 
     def reindex(layout):
         path = layout.memory_index_path()
@@ -356,8 +351,7 @@ def test_dashboard_failure_retries_without_recomputing_signals(
         output.mkdir(parents=True, exist_ok=True)
         (output / "index.html").write_text("ok", encoding="utf-8")
 
-    monkeypatch.setattr("retro.sync.run_signals", run_signal_stage)
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", write_signals)
+    monkeypatch.setattr("retro.sync.refresh_signals", refresh_signals)
     monkeypatch.setattr("retro.sync.reindex_memory", reindex)
     monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
 
@@ -368,9 +362,11 @@ def test_dashboard_failure_retries_without_recomputing_signals(
     assert first.stages["signals"]["status"] == "success"
     assert first.stages["dashboard"]["status"] == "failed"
     assert second.status == "success"
-    assert second.stages["signals"]["status"] == "skipped"
+    assert second.stages["signals"]["status"] == "success"
     assert second.stages["dashboard"]["status"] == "success"
-    assert len(signal_runs) == 1
+    assert signal_runs == [True, False]
+    assert first.signals_recomputed is True
+    assert second.signals_recomputed is False
     assert len(dashboard_attempts) == 2
     state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
     assert state["schema_version"] == 2
