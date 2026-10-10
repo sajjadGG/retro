@@ -168,7 +168,20 @@ def test_sync_imports_registered_extension_source(monkeypatch, tmp_path: Path):
                             path=f"raw/{self.host}/{identifier}/session.jsonl",
                             line=1,
                         ),
-                    )
+                    ),
+                    NormalizedEvent(
+                        event_id="message-2",
+                        session_id=identifier,
+                        host=self.host,
+                        sequence=2,
+                        actor="assistant",
+                        event_type="message",
+                        summary="hi",
+                        raw_ref=RawRef(
+                            path=f"raw/{self.host}/{identifier}/session.jsonl",
+                            line=1,
+                        ),
+                    ),
                 ],
             )
             return ImportResult(
