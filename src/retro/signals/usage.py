@@ -114,6 +114,10 @@ def _from_normalized(events: Sequence[NormalizedEvent]) -> UsageStats:
     current_model: str | None = None
     previous_cumulative: Mapping[str, int] | None = None
     final_cumulative: Mapping[str, int] | None = None
+    # v3 keeps the host-native record on every part of a multi-part message, so
+    # one Anthropic response's `message.usage` is repeated across its text and
+    # tool_use events. Counting each copy doubles the session's tokens.
+    seen: set[tuple[Any, Any]] = set()
 
     for event in events:
         payload = event.payload or {}
@@ -133,6 +137,13 @@ def _from_normalized(events: Sequence[NormalizedEvent]) -> UsageStats:
         parsed = _usage_from_payload(payload)
         if parsed is not None:
             model_name, usage, extras = parsed
+            if model_name == "<synthetic>":
+                continue
+            fingerprint = _usage_fingerprint(payload)
+            if fingerprint is not None:
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
             stats.add(model_name or current_model, usage)
             _apply_extras(stats, extras)
 
@@ -218,6 +229,18 @@ def _usage_from_payload(
         if isinstance(inner, dict) and inner:
             return _string(message.get("model")), _anthropic_bucket(inner), payload
     return None
+
+
+def _usage_fingerprint(payload: Mapping[str, Any]) -> tuple[Any, Any] | None:
+    """Identify the provider response a usage block belongs to, if it says so."""
+    message = payload.get("message")
+    message_id = message.get("id") if isinstance(message, dict) else None
+    if message_id is None:
+        message_id = payload.get("messageId") or payload.get("apiCallId")
+    if message_id is None:
+        return None
+    request_id = payload.get("requestId") or payload.get("request_id")
+    return (message_id, request_id)
 
 
 def _apply_extras(stats: UsageStats, payload: Mapping[str, Any]) -> None:

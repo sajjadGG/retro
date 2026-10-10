@@ -11,18 +11,19 @@ importers and schema versions.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from ..schema import NormalizedEvent
 from ..storage import Layout
-from ..utils import event_file_paths, event_text
+from ..utils import event_file_paths, event_text, event_tool_input, payload_tool_output
 from . import commands as cmd
 from . import patterns as pat
 from .meta import is_temp_cwd, meta_cwd, read_raw_meta
@@ -280,6 +281,7 @@ class _ScanState:
         self.index = 0
         self.awaiting_reply = False
         self.last_agent_ts: datetime | None = None
+        self.result_failed_by_call: dict[str, bool] = {}
 
     # -- per event ----------------------------------------------------------
 
@@ -401,17 +403,17 @@ class _ScanState:
             self.saw_edit = True
             if self.first_edit_ts is None and timestamp is not None:
                 self.first_edit_ts = timestamp
-            paths = event_file_paths(event)
+            paths = _file_paths(event)
             p.files_edited |= paths
             for path in paths:
                 p.edits_per_file[path] += 1
-            lines = _edited_lines(payload)
+            lines = _edited_lines(payload, event_tool_input(event))
             if lines:
                 p.edited_lines += lines
                 p.edits_with_diff += 1
         elif event.event_type == "file_read":
             p.file_reads += 1
-            p.files_read |= event_file_paths(event)
+            p.files_read |= _file_paths(event)
 
         text = cmd.command_text(event)
         if not text:
@@ -434,6 +436,10 @@ class _ScanState:
 
     def _handle_result(self, event: NormalizedEvent, payload: Mapping[str, Any]) -> None:
         p = self.p
+        call_id = _call_id(payload)
+        if call_id and call_id in self.result_failed_by_call:
+            self._handle_result_continuation(event, payload, call_id)
+            return
         p.tool_results += 1
         matched = self._match_call(event, payload)
         if matched is None:
@@ -443,13 +449,10 @@ class _ScanState:
             call_meta = None
         text = _result_text(payload, event.summary)
         failed = _result_failed(event, payload, text)
+        if call_id:
+            self.result_failed_by_call[call_id] = failed
         if failed:
-            p.tool_errors += 1
-            self.streak += 1
-            p.error_streak_max = max(p.error_streak_max, self.streak)
-            p.trailing_failures += 1
-            if len(p.error_events) < 50:
-                p.error_events.append(event.event_id)
+            self._record_failure(event)
         else:
             self.streak = 0
             p.trailing_failures = 0
@@ -473,6 +476,32 @@ class _ScanState:
             )
         if cmd.is_git_commit(command):
             p.commit_events.append((event.event_id, not failed and not cmd.commit_was_noop(text)))
+
+    def _handle_result_continuation(
+        self, event: NormalizedEvent, payload: Mapping[str, Any], call_id: str
+    ) -> None:
+        """A later record of a call already scored (begin/end, output deltas).
+
+        v3 emits every host record of one tool invocation, so one `apply_patch`
+        can produce a begin and an end event. They describe a single operation:
+        count it once, but let a late failure overturn an early success.
+        """
+        if self.result_failed_by_call.get(call_id):
+            return
+        text = _result_text(payload, event.summary)
+        if not _result_failed(event, payload, text):
+            return
+        self.result_failed_by_call[call_id] = True
+        self._record_failure(event)
+
+    def _record_failure(self, event: NormalizedEvent) -> None:
+        p = self.p
+        p.tool_errors += 1
+        self.streak += 1
+        p.error_streak_max = max(p.error_streak_max, self.streak)
+        p.trailing_failures += 1
+        if len(p.error_events) < 50:
+            p.error_events.append(event.event_id)
 
     def _handle_permission(self, event: NormalizedEvent, payload: Mapping[str, Any]) -> None:
         p = self.p
@@ -590,8 +619,32 @@ def _is_result(event: NormalizedEvent, payload: Mapping[str, Any]) -> bool:
     if event.actor == "tool" and event.event_type in ACTION_TYPES:
         return True
     if event.actor in ("tool", "subagent"):
-        return any(key in payload for key in RESULT_KEYS)
+        if any(key in payload for key in RESULT_KEYS):
+            return True
+        part = payload.get("part")
+        return isinstance(part, dict) and any(key in part for key in RESULT_KEYS)
     return False
+
+
+def _file_paths(event: NormalizedEvent) -> set[str]:
+    """Paths named by a file event, including a JSON-encoded tool input.
+
+    Codex serializes its tool arguments as a JSON string, so `event_file_paths`
+    sees text where it expects a mapping and finds nothing for reads.
+    """
+    paths = event_file_paths(event)
+    if paths:
+        return paths
+    raw = event_tool_input(event)
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return paths
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return paths
+    if not isinstance(parsed, dict):
+        return paths
+    return event_file_paths(replace(event, payload=parsed))
 
 
 def _call_id(payload: Mapping[str, Any]) -> str:
@@ -640,12 +693,28 @@ def _is_user_abort(payload: Mapping[str, Any]) -> bool:
 def _result_text(payload: Mapping[str, Any], summary: str) -> str:
     parts: list[str] = []
     budget = RESULT_TEXT_LIMIT
-    for key in ("output", "result", "content", "stdout", "stderr", "error"):
-        value = payload.get(key)
+    candidates: list[Any] = [payload_tool_output(dict(payload))]
+    candidates.extend(
+        payload.get(key) for key in ("output", "result", "content", "stdout", "stderr", "error")
+    )
+    part = payload.get("part")
+    if isinstance(part, dict):
+        candidates.extend(part.get(key) for key in ("content", "output", "error"))
+    seen_text: set[str] = set()
+    for value in candidates:
+        if value is None:
+            continue
         if isinstance(value, str):
-            parts.append(value[:budget])
+            chunk = value[:budget]
+            if chunk and chunk not in seen_text:
+                seen_text.add(chunk)
+                parts.append(chunk)
+                budget -= len(chunk)
         elif isinstance(value, (dict, list)):
             for chunk in pat.iter_payload_strings(value, budget=budget):
+                if chunk in seen_text:
+                    continue
+                seen_text.add(chunk)
                 parts.append(chunk)
                 budget -= len(chunk)
                 if budget <= 0:
@@ -658,16 +727,22 @@ def _result_text(payload: Mapping[str, Any], summary: str) -> str:
 
 
 def _result_failed(event: NormalizedEvent, payload: Mapping[str, Any], text: str) -> bool:
-    if payload.get("is_error") is True or payload.get("success") is False:
-        return True
+    containers: list[Mapping[str, Any]] = [payload]
+    part = payload.get("part")
+    if isinstance(part, dict):
+        containers.append(part)
+    for container in containers:
+        if container.get("is_error") is True or container.get("success") is False:
+            return True
     status = payload.get("status")
     if isinstance(status, str) and status.lower() in {"failed", "error", "timeout", "cancelled", "canceled"}:
         return True
-    error = payload.get("error")
-    if isinstance(error, str) and error.strip():
-        return True
-    if isinstance(error, dict) and error:
-        return True
+    for container in containers:
+        error = container.get("error")
+        if isinstance(error, str) and error.strip():
+            return True
+        if isinstance(error, dict) and error:
+            return True
     exit_code = _nested_exit_code(payload)
     if exit_code is not None:
         return exit_code != 0
@@ -699,8 +774,20 @@ def _nested_exit_code(value: Any, depth: int = 0) -> int | None:
     return None
 
 
-def _edited_lines(payload: Mapping[str, Any]) -> int:
-    for key in ("patch", "diff", "arguments", "input", "content", "new_string", "newString"):
+def _edited_lines(payload: Mapping[str, Any], tool_input: Any = None) -> int:
+    if isinstance(tool_input, str) and tool_input:
+        count = _count_diff_lines(tool_input)
+        if count:
+            return count
+    if isinstance(tool_input, dict):
+        count = _edited_lines_from(tool_input)
+        if count:
+            return count
+    return _edited_lines_from(payload)
+
+
+def _edited_lines_from(payload: Mapping[str, Any]) -> int:
+    for key in ("patch", "diff", "arguments", "input", "content", "new_string", "newString", "newText"):
         value = payload.get(key)
         if isinstance(value, str) and value:
             count = _count_diff_lines(value)
