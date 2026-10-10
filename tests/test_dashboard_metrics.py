@@ -5,6 +5,7 @@ import pytest
 
 from retro.dashboard.metrics import (
     Filters,
+    cost_basis,
     cost_usd,
     error_rate,
     filter_rows,
@@ -73,9 +74,11 @@ def test_kpis_sum_costs_and_mixes(inputs):  # noqa: F811
     model = inputs.model
     stats = kpis(filter_rows(model.rows, Filters(), model.dictionaries), model.dictionaries)
     assert stats.sessions == 6
-    assert stats.cost_usd == pytest.approx(7.26)
-    assert stats.sessions_with_cost == 5
-    assert stats.tokens == 1_218_000
+    assert stats.cost_usd == pytest.approx(7.14)
+    assert stats.sessions_with_cost == 4
+    assert stats.unpriced == 2
+    assert stats.to_dict()["cost_per_priced_session"] == pytest.approx(7.14 / 4)
+    assert stats.tokens == 1_203_000
     assert stats.outcomes["success"] == 2
     assert stats.outcomes["unknown"] == 2
     assert stats.work["build"] == 2
@@ -108,6 +111,19 @@ def test_trend_compares_periods(inputs):  # noqa: F811
     deltas = trend(now, before)
     assert deltas["sessions"] == pytest.approx(1.0)
     assert deltas["cost_usd"] == pytest.approx((1.63 - 4.87) / 4.87, rel=1e-3)
+
+
+def test_missing_cost_is_never_zero(inputs):  # noqa: F811
+    model = inputs.model
+    unpriced = model.row("codex/019d0006-0000-7000-8000-000000000006")
+    assert cost_usd(unpriced) is None
+    assert cost_basis(unpriced, model.cost_basis) == "none"
+    unscored = model.row("codex/019d0008-0000-7000-8000-000000000008")
+    assert cost_usd(unscored) is None
+    assert cost_basis(unscored, model.cost_basis) == "unscored"
+    priced = model.row(KEY_MAIN)
+    assert cost_usd(priced) == pytest.approx(1.42)
+    assert cost_basis(priced, model.cost_basis) == "exact"
 
 
 def test_row_accessors(inputs):  # noqa: F811

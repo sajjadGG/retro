@@ -61,15 +61,20 @@ def test_manifest_describes_the_fact_table(built):
 def test_every_declared_shard_exists_and_parses(built):
     out, _ = built
     manifest = manifest_of(out)
-    total = 0
-    for shard in manifest["shards"]["sessions"]:
-        name, payload = read_shard(out / shard["file"])
-        assert name == "sessions:" + str(shard["shard"])
-        assert len(payload["rows"]) == shard["rows"]
-        total += len(payload["rows"])
-        for row in payload["rows"]:
-            assert len(row) == len(COLUMNS)
-    assert total == manifest["counts"]["sessions"]
+    counts = {}
+    for channel in ("sessions", "excluded"):
+        total = 0
+        for shard in manifest["shards"][channel]:
+            name, payload = read_shard(out / shard["file"])
+            assert name == channel + ":" + str(shard["shard"])
+            assert len(payload["rows"]) == shard["rows"]
+            assert payload["offset"] == shard["offset"]
+            total += len(payload["rows"])
+            for row in payload["rows"]:
+                assert len(row) == len(COLUMNS)
+        counts[channel] = total
+    assert counts["sessions"] == manifest["counts"]["included"]
+    assert counts["excluded"] == manifest["counts"]["excluded"]
 
     for shard in manifest["shards"]["signals"]:
         name, payload = read_shard(out / shard["file"])
@@ -81,6 +86,10 @@ def test_every_declared_shard_exists_and_parses(built):
         name, payload = read_shard(path)
         assert name.startswith("detail:")
         assert payload["sessions"]
+    for path in (out / "data" / "detail-x").glob("*.js"):
+        name, payload = read_shard(path)
+        assert name.startswith("detailx:")
+        assert all(session["minimal"] for session in payload["sessions"].values())
 
 
 def test_detail_shards_hold_full_session_records(built):
@@ -113,11 +122,12 @@ def test_payload_escapes_script_terminators(tmp_path: Path):
 def test_build_is_incremental_between_runs(archive: Layout, tmp_path: Path):  # noqa: F811
     cache = tmp_path / "cache"
     first = build(archive, tmp_path / "one", cache_dir=cache)
-    assert first.detail_written == first.detail_shards
+    all_shards = first.detail_shards + first.excluded_detail_shards
+    assert first.detail_written == all_shards
     assert first.detail_cached == 0
 
     second = build(archive, tmp_path / "two", cache_dir=cache)
-    assert second.detail_cached == second.detail_shards
+    assert second.detail_cached == all_shards
     assert second.detail_written == 0
 
     path = archive.root / "catalog" / "sessions.jsonl"
@@ -127,7 +137,7 @@ def test_build_is_incremental_between_runs(archive: Layout, tmp_path: Path):  # 
 
     third = build(archive, tmp_path / "three", cache_dir=cache)
     assert third.detail_written == 1
-    assert third.detail_cached == third.detail_shards - 1
+    assert third.detail_cached == all_shards - 1
 
 
 def test_full_mode_rebuilds_every_detail_shard(archive: Layout, tmp_path: Path):  # noqa: F811
@@ -135,19 +145,22 @@ def test_full_mode_rebuilds_every_detail_shard(archive: Layout, tmp_path: Path):
     build(archive, tmp_path / "one", cache_dir=cache)
     report = build(archive, tmp_path / "two", mode="full", cache_dir=cache)
     assert report.detail_cached == 0
-    assert report.detail_written == report.detail_shards
+    assert report.detail_written == report.detail_shards + report.excluded_detail_shards
 
 
 def test_cache_drops_buckets_that_no_longer_exist(archive: Layout, tmp_path: Path):  # noqa: F811
     cache = tmp_path / "cache"
     build(archive, tmp_path / "one", cache_dir=cache)
-    index = json.loads((cache / "index.json").read_text(encoding="utf-8"))
-    assert index["buckets"]
+    for name, prefix in (("detail", "d"), ("detail-x", "x")):
+        index = json.loads((cache / name / "index.json").read_text(encoding="utf-8"))
+        assert index["buckets"]
+        assert list((cache / name).glob(f"{prefix}-*.js"))
     (archive.root / "catalog" / "sessions.jsonl").write_text("", encoding="utf-8")
     build(archive, tmp_path / "two", cache_dir=cache)
-    index = json.loads((cache / "index.json").read_text(encoding="utf-8"))
-    assert index["buckets"] == {}
-    assert not list(cache.glob("d-*.js"))
+    for name, prefix in (("detail", "d"), ("detail-x", "x")):
+        index = json.loads((cache / name / "index.json").read_text(encoding="utf-8"))
+        assert index["buckets"] == {}
+        assert not list((cache / name).glob(f"{prefix}-*.js"))
 
 
 def test_build_warns_when_inputs_are_missing(empty_archive: Layout, tmp_path: Path):  # noqa: F811
@@ -157,6 +170,45 @@ def test_build_warns_when_inputs_are_missing(empty_archive: Layout, tmp_path: Pa
     assert any("signal store missing" in warning for warning in report.warnings)
     manifest = manifest_of(tmp_path / "dashboard")
     assert manifest["counts"]["sessions"] == 0
+
+
+def test_first_load_excludes_the_excluded_payload(built):
+    out, report = built
+    manifest = manifest_of(out)
+    boot = [out / "index.html", out / "data" / "manifest.js"]
+    boot += [out / shard["file"] for shard in manifest["shards"]["sessions"]]
+    boot += [path for path in (out / "assets").iterdir()]
+    boot_bytes = sum(path.stat().st_size for path in boot)
+    lazy_bytes = sum(
+        (out / shard["file"]).stat().st_size for shard in manifest["shards"]["excluded"]
+    ) + (out / manifest["shards"]["dict_tail"]["file"]).stat().st_size
+    assert boot_bytes > 0
+    assert lazy_bytes > 0
+    assert report.excluded_shards >= 1
+    assert manifest["shards"]["detail_excluded"]["buckets"] >= 1
+
+
+def test_manifest_dictionary_holds_only_the_included_prefix(built):
+    out, _ = built
+    manifest = manifest_of(out)
+    split = manifest["dict_split"]
+    assert len(manifest["dict"]["projects"]) == split["projects"]
+    _, tail = read_shard(out / manifest["shards"]["dict_tail"]["file"])
+    assert tail["projects"]["offset"] == split["projects"]
+    assert tail["projects"]["items"]
+    ids = [entry["id"] for entry in manifest["dict"]["projects"]]
+    assert "path:/tmp/eval" not in ids
+    assert any(entry["id"] == "path:/tmp/eval" for entry in tail["projects"]["items"])
+
+
+def test_manifest_publishes_cost_basis_and_sync_health(built):
+    out, _ = built
+    manifest = manifest_of(out)
+    assert manifest["cost_basis"][0] == "exact"
+    assert manifest["quality"]["cost"]["unpriced"] == 2
+    latest = manifest["sync"]["latest"]
+    assert latest["health"] == "failed"
+    assert latest["unchanged"] == 0
 
 
 def test_stale_signals_surface_as_a_warning(built):

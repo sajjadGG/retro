@@ -187,6 +187,25 @@
         "chat",
         "other"
       ]
+    },
+    {
+      "id": "quality.cost_basis",
+      "title": "Cost basis",
+      "category": "quality",
+      "kind": "category",
+      "unit": null,
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "How the cost estimate was derived.",
+      "categories": [
+        "exact",
+        "family",
+        "mixed",
+        "embedded",
+        "unpriced",
+        "none"
+      ]
     }
   ]
 }

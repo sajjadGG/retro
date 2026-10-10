@@ -53,8 +53,10 @@ class BuildReport:
     with_signals: int = 0
     signal_definitions: int = 0
     session_shards: int = 0
+    excluded_shards: int = 0
     signal_shards: int = 0
     detail_shards: int = 0
+    excluded_detail_shards: int = 0
     detail_cached: int = 0
     detail_written: int = 0
     bytes_total: int = 0
@@ -73,8 +75,10 @@ class BuildReport:
             "with_signals": self.with_signals,
             "signal_definitions": self.signal_definitions,
             "session_shards": self.session_shards,
+            "excluded_shards": self.excluded_shards,
             "signal_shards": self.signal_shards,
             "detail_shards": self.detail_shards,
+            "excluded_detail_shards": self.excluded_detail_shards,
             "detail_cached": self.detail_cached,
             "detail_written": self.detail_written,
             "bytes_total": self.bytes_total,
@@ -125,18 +129,27 @@ def build(
         "columns": list(COLUMNS),
         "flags": dict(FLAGS),
         "shard_rows": SESSION_SHARD_ROWS,
-        "dict": model.dictionaries.to_dict(),
+        "dict": _included_dictionaries(model),
+        "dict_split": dict(model.dictionary_split),
+        "cost_basis": model.cost_basis,
         "counts": {
             "sessions": len(model.rows),
             "included": model.quality["included"],
             "excluded": model.quality["excluded"],
             "with_signals": model.quality["with_signals"],
             "detail_buckets": model.bucket_count,
+            "excluded_detail_buckets": model.excluded_bucket_count,
         },
         "shards": {
             "sessions": writer.session_shards,
+            "excluded": writer.excluded_shards,
             "signals": writer.signal_shards,
-            "detail": {"pattern": "data/detail/d-%04d.js", "buckets": model.bucket_count},
+            "dict_tail": writer.dictionary_tail,
+            "detail": {"pattern": "data/detail/d-{}.js", "buckets": model.bucket_count},
+            "detail_excluded": {
+                "pattern": "data/detail-x/x-{}.js",
+                "buckets": model.excluded_bucket_count,
+            },
         },
         "signals": {
             "version": signals.version,
@@ -165,8 +178,10 @@ def build(
         with_signals=model.quality["with_signals"],
         signal_definitions=len(model.definitions),
         session_shards=shard_report.session_shards,
+        excluded_shards=shard_report.excluded_shards,
         signal_shards=shard_report.signal_shards,
         detail_shards=shard_report.detail_shards,
+        excluded_detail_shards=shard_report.excluded_detail_shards,
         detail_cached=shard_report.detail_cached,
         detail_written=shard_report.detail_written,
         warnings=warnings,
@@ -186,6 +201,16 @@ def load_inputs(layout: Layout) -> DashboardInputs:
     sync = read_sync_runs(layout)
     model = build_model(layout, catalog, signals, sync)
     return DashboardInputs(layout=layout, catalog=catalog, signals=signals, sync=sync, model=model)
+
+
+def _included_dictionaries(model) -> dict[str, Any]:
+    """Only the dictionary prefix referenced by included rows; the tail is a shard."""
+    dictionaries = model.dictionaries.to_dict()
+    for name, split in model.dictionary_split.items():
+        values = dictionaries.get(name)
+        if isinstance(values, list) and split < len(values):
+            dictionaries[name] = values[:split]
+    return dictionaries
 
 
 def copy_assets(output_dir: Path) -> None:

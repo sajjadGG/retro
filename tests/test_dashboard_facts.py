@@ -1,10 +1,19 @@
 """Fact-table construction, signal matrix encoding and quality aggregates."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from retro.dashboard.build import load_inputs
-from retro.dashboard.facts import COLUMN_INDEX, COLUMNS, FLAGS, _bucket_count, detail_payload
+from retro.dashboard.facts import (
+    COLUMN_INDEX,
+    COLUMNS,
+    FLAGS,
+    _bucket_count,
+    detail_payload,
+    excluded_detail_payload,
+)
 from retro.storage import Layout
 from tests.dashboard_helpers import archive, empty_archive, inputs  # noqa: F401
 
@@ -18,11 +27,67 @@ def column(row, name):
     return row[COLUMN_INDEX[name]]
 
 
-def test_rows_are_sorted_newest_first(inputs):  # noqa: F811
-    started = [column(row, "started") for row in inputs.model.rows if column(row, "started")]
-    assert started == sorted(started, reverse=True)
-    assert len(inputs.model.rows) == 8
-    assert column(inputs.model.rows[-1], "started") is None
+def has_flag(row, name):
+    return bool(row[COLUMN_INDEX["flags"]] & FLAGS[name])
+
+
+def test_rows_are_included_first_then_newest_first(inputs):  # noqa: F811
+    model = inputs.model
+    assert len(model.rows) == 8
+    assert model.included_count == 6
+    assert all(not has_flag(row, "excluded") for row in model.included_rows)
+    assert all(has_flag(row, "excluded") for row in model.excluded_rows)
+    for block in (model.included_rows, model.excluded_rows):
+        started = [column(row, "started") for row in block if column(row, "started")]
+        assert started == sorted(started, reverse=True)
+    assert column(model.rows[-1], "started") is None
+
+
+def test_dictionary_split_covers_included_rows(inputs):  # noqa: F811
+    model = inputs.model
+    for name, accessor in (
+        ("projects", "project"),
+        ("agents", "agent"),
+        ("clients", "client"),
+    ):
+        split = model.dictionary_split[name]
+        for row in model.included_rows:
+            assert column(row, accessor) < split
+    tag_split = model.dictionary_split["tags"]
+    for row in model.included_rows:
+        assert all(index < tag_split for index in column(row, "tags"))
+    excluded_only = [
+        index
+        for row in model.excluded_rows
+        for index in [column(row, "project")]
+        if index >= model.dictionary_split["projects"]
+    ]
+    assert excluded_only, "the fixture has an excluded-only project"
+
+
+def test_excluded_rows_drop_the_prompt_excerpt(inputs):  # noqa: F811
+    for row in inputs.model.excluded_rows:
+        assert column(row, "prompt") == ""
+    assert any(column(row, "prompt") for row in inputs.model.included_rows)
+
+
+def test_cost_basis_column(inputs):  # noqa: F811
+    model = inputs.model
+    assert model.cost_basis[:3] == ["exact", "family", "mixed"]
+    main = model.row(KEY_MAIN)
+    assert model.cost_basis[column(main, "basis")] == "exact"
+    unscored = model.row("codex/019d0008-0000-7000-8000-000000000008")
+    assert column(unscored, "basis") == -1
+
+
+def test_quality_reports_cost_coverage(inputs):  # noqa: F811
+    cost = inputs.model.quality["cost"]
+    assert cost["priced"] == 4
+    assert cost["unpriced"] == 2
+    basis = {entry["basis"]: entry for entry in cost["basis"]}
+    assert basis["none"]["count"] == 1
+    assert basis["unscored"]["count"] == 1
+    assert basis["none"]["examples"] == ["codex/019d0006-0000-7000-8000-000000000006"]
 
 
 def test_row_columns_merge_catalog_and_signals(inputs):  # noqa: F811
@@ -105,8 +170,8 @@ def test_signal_matrix_encodes_by_kind(inputs):  # noqa: F811
 def test_signal_summaries_cover_every_kind(inputs):  # noqa: F811
     summaries = inputs.model.summaries
     cost = summaries["usage.cost_usd"]
-    assert cost["n"] == 5
-    assert cost["sum"] == pytest.approx(7.26)
+    assert cost["n"] == 4
+    assert cost["sum"] == pytest.approx(7.14)
     assert cost["max"] == pytest.approx(4.87)
     assert summaries["outcome.committed"]["true_rate"] == pytest.approx(0.5)
     assert summaries["outcome.status"]["counts"]["success"] == 2
@@ -161,12 +226,23 @@ def test_detail_payload_of_unscored_session_has_no_signals(inputs):  # noqa: F81
     assert payload["excluded"] is True
 
 
+def test_excluded_detail_payload_only_adds_what_rows_lack(inputs):  # noqa: F811
+    payload = excluded_detail_payload(inputs.model, KEY_EVAL)
+    assert payload["minimal"] is True
+    assert payload["counts"]["events"] == 6
+    assert payload["tag_sources"]["ignore"] == ["rule:builtin.temp-dir"]
+    assert payload["cwd"] == "/private/var/folders/kw/T/tmpuxz1xexv"
+    for duplicated in ("title", "agent", "client", "project", "paths", "models", "tags", "prompt"):
+        assert duplicated not in payload
+
+
 def test_bucket_count_grows_in_powers_of_two():
     assert _bucket_count(0) == 1
     assert _bucket_count(64) == 1
     assert _bucket_count(65) == 2
     assert _bucket_count(2000) == 32
     assert _bucket_count(35000) == 1024
+    assert _bucket_count(31169, target=320) == 128
 
 
 def test_buckets_are_stable_when_sessions_are_added(inputs, archive: Layout):  # noqa: F811
@@ -186,3 +262,94 @@ def test_empty_archive_builds_an_empty_model(empty_archive: Layout):  # noqa: F8
     assert model.rows == []
     assert model.quality["sessions"] == 0
     assert model.sync["latest"] is None
+
+
+def test_sync_summary_counts_lists_or_integers(archive: Layout):  # noqa: F811
+    path = archive.root / "sync" / "runs" / "20261010T030000.json"
+    path.write_text(
+        json.dumps(
+            {
+                "started_at": "2026-10-10T03:00:00+00:00",
+                "completed_at": None,
+                "status": "running",
+                "unchanged": 31169,
+                "imported": ["codex/a", "codex/b"],
+                "rendered": 4,
+                "failures": [],
+                "stages": {
+                    "capture": {"status": "success", "duration_seconds": 44.1, "changed_keys": 111},
+                    "catalog": {"status": "success", "total": 31901, "excluded": 31169},
+                    "dashboard": {"status": "running"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    model = load_inputs(archive).model
+    latest = model.sync["latest"]
+    assert latest["status"] == "running"
+    assert latest["unchanged"] == 31169
+    assert latest["imported"] == 2
+    assert latest["rendered"] == 4
+    assert latest["health"] == "ok"
+    assert latest["built_during_sync"] is True
+    assert latest["stages_unfinished"] == ["dashboard"]
+    assert latest["stages_ok"] == ["capture", "catalog"]
+    assert latest["observed_at"] == "2026-10-10T03:00:00+00:00"
+    assert latest["stages"]["catalog"]["excluded"] == 31169
+
+
+def test_sync_summary_reports_failed_stages(archive: Layout):  # noqa: F811
+    path = archive.root / "sync" / "runs" / "20261010T040000.json"
+    path.write_text(
+        json.dumps(
+            {
+                "started_at": "2026-10-10T04:00:00+00:00",
+                "status": "running",
+                "unchanged": 0,
+                "failures": [],
+                "stages": {
+                    "capture": {"status": "success"},
+                    "signals": {"status": "failed", "error": "boom"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    latest = load_inputs(archive).model.sync["latest"]
+    assert latest["health"] == "failed"
+    assert latest["built_during_sync"] is True
+    assert latest["stages_failed"] == ["signals"]
+    assert latest["stages"]["signals"]["error"] == "boom"
+
+
+def test_sync_state_file_supplies_stages(archive: Layout):  # noqa: F811
+    state = archive.root / "state" / "sync.json"
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "updated_at": "2026-10-11T00:10:00+00:00",
+                "last_run": {
+                    "started_at": "2026-10-11T00:00:00+00:00",
+                    "completed_at": "2026-10-11T00:09:00+00:00",
+                    "status": "success",
+                },
+                "stages": {
+                    "capture": {"status": "success", "duration_seconds": 12.0},
+                    "dashboard": {"status": "success"},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sync = load_inputs(archive).model.sync
+    assert sync["state_path"].endswith("state/sync.json")
+    latest = sync["latest"]
+    assert latest["health"] == "ok"
+    assert latest["built_during_sync"] is False
+    assert latest["started_at"] == "2026-10-11T00:00:00+00:00"
+    assert sorted(latest["stages"]) == ["capture", "dashboard"]
+    # the newest run report is still the one on disk for history
+    assert len(sync["history"]) == 2

@@ -2332,8 +2332,9 @@ def dashboard_build(
         f"scored={report.with_signals:,} signals={report.signal_definitions}"
     )
     console.print(
-        f"  shards: sessions={report.session_shards} signals={report.signal_shards} "
-        f"detail={report.detail_shards} (reused {report.detail_cached})"
+        f"  shards: included={report.session_shards} excluded={report.excluded_shards} "
+        f"signals={report.signal_shards} detail={report.detail_shards}"
+        f"+{report.excluded_detail_shards} (reused {report.detail_cached})"
     )
     console.print(
         f"  size={report.bytes_total / 1_048_576:.1f} MiB "

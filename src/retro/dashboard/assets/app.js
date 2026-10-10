@@ -29,21 +29,82 @@
 
   function renderBanner() {
     var messages = (C.manifest.warnings || []).slice();
-    var sync = (C.manifest.sync || {}).latest;
-    if (sync && sync.status && sync.status !== "ok") {
-      messages.push("last sync " + sync.status + " at " + (sync.started_at || "?") +
-        (sync.failure_count ? " with " + sync.failure_count + " failures" : "") + " — see Data quality");
-    }
     var quality = C.manifest.quality || {};
+    var sync = (C.manifest.sync || {}).latest;
+    var tone = "warn";
+    var note = null;
+
+    if (sync) {
+      // The dashboard stage runs inside the sync, so the report it was built
+      // from is usually still open. Report the run in the past tense and only
+      // raise a banner for stages that actually failed.
+      if (sync.health === "failed" || sync.health === "degraded") {
+        messages.push(
+          "last sync " + sync.health +
+          (sync.observed_at ? " at " + sync.observed_at : "") +
+          ((sync.stages_failed || []).length ? " — failed stages: " + sync.stages_failed.join(", ") : "") +
+          (sync.failure_count ? " — " + sync.failure_count + " session failures" : "") +
+          " — see Data quality"
+        );
+      } else {
+        note = stageNote(sync);
+      }
+      if (sync.warning) { messages.push(sync.warning); }
+    }
     if (quality.unknown_rate > 0.25) {
       messages.push("unknown events are " + C.fmt.pct(quality.unknown_rate, 1) +
         " of all captured events — normalization coverage is incomplete");
     }
-    if (!messages.length) { bannerNode.hidden = true; C.clear(bannerNode); return; }
+
     C.clear(bannerNode);
-    bannerNode.hidden = false;
-    bannerNode.appendChild(el("strong", {text: "capture health"}));
-    bannerNode.appendChild(el("ul", null, messages.map(function (message) { return el("li", {text: message}); })));
+    if (messages.length) {
+      bannerNode.hidden = false;
+      bannerNode.className = "banner " + tone;
+      bannerNode.appendChild(el("strong", {text: "capture health"}));
+      bannerNode.appendChild(el("ul", null, messages.map(function (message) { return el("li", {text: message}); })));
+      if (note) { bannerNode.appendChild(el("div", {class: "muted", text: note})); }
+      return;
+    }
+    if (note) {
+      bannerNode.hidden = false;
+      bannerNode.className = "banner ok";
+      bannerNode.appendChild(el("span", {text: note}));
+      bannerNode.appendChild(el("a", {href: "#/quality", text: "details"}));
+      return;
+    }
+    bannerNode.hidden = true;
+  }
+
+  function stageNote(sync) {
+    // This generation was built during that run and stays published until the
+    // next rebuild, so the banner always reports a past sync, never a live one.
+    var when = sync.observed_at || sync.completed_at || sync.started_at;
+    var epoch = epochOf(when);
+    var label = epoch ? C.fmt.dateTime(epoch) + " (" + C.fmt.ago(epoch) + ")" : "unknown time";
+    var stages = sync.stages || {};
+    var order = ["capture", "catalog", "render", "signals", "memory", "dashboard"];
+    var names = Object.keys(stages).sort(function (a, b) {
+      var ai = order.indexOf(a), bi = order.indexOf(b);
+      return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi);
+    });
+    var unfinished = sync.stages_unfinished || [];
+    var parts = names.filter(function (name) {
+      return unfinished.indexOf(name) === -1;
+    }).map(function (name) {
+      var status = String(stages[name].status);
+      var mark = (status === "success" || status === "ok") ? "✓" : (status === "skipped" ? "–" : "✗");
+      return name + " " + mark;
+    });
+    var note = "last sync " + label;
+    if (parts.length) { note += ": " + parts.join("  "); }
+    if (sync.built_during_sync) { note += " · this dashboard was built during that sync"; }
+    return note;
+  }
+
+  function epochOf(value) {
+    if (!value) { return null; }
+    var parsed = Date.parse(value);
+    return isNaN(parsed) ? null : parsed / 1000;
   }
 
   function renderLoadState() {
@@ -158,6 +219,7 @@
 
     C.onChange(function () {
       renderLoadState();
+      if (C.store.excludedReady) { renderBanner(); }
       if (context && context.onStoreChange) { context.onStoreChange(); }
       else if (context && (context.route === "overview" || context.route === "projects" ||
         context.route === "project" || context.route === "signal")) {

@@ -78,6 +78,7 @@
   /* ---------------- overview ---------------------------------------------- */
 
   views.overview = function (container, ctx) {
+    if (includeExcluded(ctx)) { C.loadExcluded(); }
     var rows = C.filterRows(filterOptions(ctx, {rollupSubagents: false}));
     var stats = C.aggregate(rows);
     var span = C.rangeDays(rangeKey(ctx));
@@ -106,8 +107,8 @@
     container.appendChild(el("div", {class: "grid cards", style: "margin-top:14px"}, [
       C.kpi("sessions", fmt.int(stats.sessions), delta(stats.sessions, before.sessions)),
       C.kpi("active time", fmt.duration(stats.activeS), delta(stats.activeS, before.activeS)),
-      C.kpi("est. cost", fmt.money(stats.cost), delta(stats.cost, before.cost),
-        stats.withCost < stats.sessions ? fmt.int(stats.withCost) + " of " + fmt.int(stats.sessions) + " priced" : null),
+      C.kpi("est. cost", C.costTotal(stats), delta(stats.cost, before.cost),
+        stats.unpriced ? fmt.int(stats.unpriced) + " sessions unpriced" : "all sessions priced"),
       C.kpi("tokens", fmt.compact(stats.tokens), delta(stats.tokens, before.tokens)),
       C.kpi("user turns", fmt.int(stats.turns), delta(stats.turns, before.turns)),
       C.kpi("tool calls", fmt.int(stats.tools), delta(stats.tools, before.tools)),
@@ -115,6 +116,16 @@
       C.kpi("success rate", fmt.pct(stats.successRate), null,
         stats.successRate === null ? "no outcome signal" : fmt.int(stats.outcomes.success || 0) + " successful")
     ]));
+    if (stats.unpriced) {
+      container.appendChild(el("p", {class: "muted", style: "margin:8px 0 0"}, [
+        C.costTotal(stats) + " covers " + fmt.int(stats.withCost) + " of " + fmt.int(stats.sessions) +
+        " sessions; " + fmt.int(stats.unpriced) + " have no cost estimate (",
+        unpricedReasons(stats.basis),
+        stats.withCost
+          ? "). Averages use priced sessions only — mean " + fmt.money(stats.costPerSession) + " per priced session."
+          : ")."
+      ]));
+    }
 
     var days = span || 90;
     var series = C.dailySeries(rows, Math.min(days, 180));
@@ -144,10 +155,24 @@
 
     container.appendChild(el("section", {class: "panel", style: "margin-top:14px"}, [
       el("h2", {text: "recent sessions"}),
-      recentTable(rows.slice(0, 12)),
+      recentTable(topRecent(rows, 12)),
       el("p", null, [el("a", {href: C.buildHash("sessions", "", params(ctx)), text: "open sessions explorer →"})])
     ]));
   };
+
+  function unpricedReasons(basis) {
+    var parts = [];
+    for (var name in basis) {
+      if (Object.prototype.hasOwnProperty.call(basis, name)) {
+        parts.push(el("span", {
+          class: "tag",
+          text: name + " " + fmt.int(basis[name]),
+          title: C.COST_BASIS_REASON[name] || name
+        }));
+      }
+    }
+    return el("span", null, parts);
+  }
 
   function agentTable(rows, ctx, dimension) {
     var groups = C.groupBy(rows, dimension === "agent" ? C.agentName : C.clientName);
@@ -165,7 +190,7 @@
           }),
           {num: true, text: fmt.int(entry.stats.sessions)},
           {num: true, text: fmt.duration(entry.stats.activeS)},
-          {num: true, text: fmt.money(entry.stats.cost)},
+          {num: true, text: C.costTotal(entry.stats), title: C.costTotalTitle(entry.stats)},
           {num: true, text: fmt.pct(entry.stats.successRate)}
         ];
       })
@@ -182,6 +207,8 @@
       for (var id in groups) {
         if (!Object.prototype.hasOwnProperty.call(groups, id) || seen[id]) { continue; }
         seen[id] = true;
+        var size = (current[id] ? current[id].length : 0) + (previous[id] ? previous[id].length : 0);
+        if (size < MIN_SAMPLE) { continue; }
         var now = C.aggregate(current[id] || []);
         var before = C.aggregate(previous[id] || []);
         if (now.sessions + before.sessions < MIN_SAMPLE) { continue; }
@@ -230,19 +257,28 @@
   }
 
   function recentTable(rows) {
+    var ordered = rows.slice().sort(function (a, b) {
+      return (b[C.COL.started] || 0) - (a[C.COL.started] || 0);
+    });
     return C.tableOf(
       ["when", "agent", "project", "title", {label: "cost", num: true}, "outcome"],
-      rows.map(function (row) {
+      ordered.map(function (row) {
         return [
           fmt.ago(row[C.COL.started]),
           C.agentName(row),
-          C.projectMeta(row).name,
+          {text: C.projectMeta(row).name, title: C.projectMeta(row).id},
           sessionLink(row),
-          {num: true, text: fmt.money(C.cost(row))},
+          {num: true, node: C.costCell(row)},
           {node: C.pill(C.outcomeName(row))}
         ];
       })
     );
+  }
+
+  function topRecent(rows, count) {
+    return rows.slice().sort(function (a, b) {
+      return (b[C.COL.started] || 0) - (a[C.COL.started] || 0);
+    }).slice(0, count);
   }
 
   function merge(base, changes) {
@@ -255,6 +291,7 @@
   /* ---------------- projects ----------------------------------------------- */
 
   views.projects = function (container, ctx) {
+    if (includeExcluded(ctx)) { C.loadExcluded(); }
     var rows = C.filterRows(filterOptions(ctx, {rollupSubagents: false}));
     var groups = C.groupBy(rows, function (row) { return C.projectMeta(row).id; });
     var entries = Object.keys(groups).map(function (id) {
@@ -301,7 +338,7 @@
             el("a", {href: C.buildHash("project", entry.id, params(ctx)), text: entry.meta.name}),
             {num: true, text: fmt.int(entry.stats.sessions)},
             {num: true, text: fmt.duration(entry.stats.activeS)},
-            {num: true, text: fmt.money(entry.stats.cost)},
+            {num: true, text: C.costTotal(entry.stats), title: C.costTotalTitle(entry.stats)},
             {num: true, text: fmt.pct(entry.stats.successRate)},
             {num: true, text: fmt.pct(entry.stats.errorRate, 1)},
             fmt.ago(entry.stats.last),
@@ -319,6 +356,7 @@
   };
 
   views.project = function (container, ctx) {
+    if (includeExcluded(ctx)) { C.loadExcluded(); }
     var projectId = ctx.id;
     var rows = C.filterRows(filterOptions(ctx, {projects: [projectId], rollupSubagents: false}));
     var stats = C.aggregate(rows);
@@ -334,7 +372,8 @@
     container.appendChild(el("div", {class: "grid cards", style: "margin-top:14px"}, [
       C.kpi("sessions", fmt.int(stats.sessions)),
       C.kpi("active time", fmt.duration(stats.activeS)),
-      C.kpi("est. cost", fmt.money(stats.cost)),
+      C.kpi("est. cost", C.costTotal(stats), null,
+        stats.unpriced ? fmt.int(stats.unpriced) + " unpriced" : null),
       C.kpi("tool calls", fmt.int(stats.tools)),
       C.kpi("file edits", fmt.int(stats.edits)),
       C.kpi("success rate", fmt.pct(stats.successRate)),
@@ -356,7 +395,7 @@
 
     container.appendChild(el("section", {class: "panel", style: "margin-top:14px"}, [
       el("h2", {text: "sessions"}),
-      recentTable(rows.slice(0, 25)),
+      recentTable(topRecent(rows, 25)),
       el("p", null, [el("a", {
         href: C.buildHash("sessions", "", merge(params(ctx), {project: projectId})),
         text: "open all " + fmt.int(rows.length) + " in the sessions explorer →"
@@ -375,7 +414,7 @@
           key,
           {num: true, text: fmt.int(stats.sessions)},
           {num: true, text: fmt.duration(stats.activeS)},
-          {num: true, text: fmt.money(stats.cost)},
+          {num: true, text: C.costTotal(stats), title: C.costTotalTitle(stats)},
           {num: true, text: fmt.pct(stats.successRate)}
         ];
       })
@@ -384,57 +423,90 @@
 
   /* ---------------- sessions explorer -------------------------------------- */
 
+  var SESSION_COLUMNS = [
+    {label: "when", field: "started", cls: "c-when"},
+    {label: "agent", field: "agent", cls: "c-agent"},
+    {label: "project", field: "project", cls: "c-project"},
+    {label: "title", field: "title", cls: "c-title"},
+    {label: "dur", field: "duration", cls: "c-duration c-num"},
+    {label: "cost", field: "cost", cls: "c-cost c-num"},
+    {label: "outcome", field: "outcome", cls: "c-outcome"},
+    {label: "turns", field: "turns", cls: "c-turns c-num"}
+  ];
+
   views.sessions = function (container, ctx) {
     container.appendChild(el("h1", {text: "Sessions"}));
     var countNode = el("p", {class: "sub", text: "…"});
-    container.appendChild(filterBar(ctx));
+    var filterHost = el("div");
+    container.appendChild(filterHost);
     container.appendChild(countNode);
 
+    var shell = el("div", {class: "sessionlist"});
+    var head = el("div", {class: "listhead", role: "row"}, SESSION_COLUMNS.map(function (column) {
+      return sortHeader(ctx, column);
+    }));
     var viewport = el("div", {class: "viewport", tabindex: "0", role: "list", "aria-label": "sessions"});
-    var head = el("div", {class: "listhead"}, [
-      sortHeader(ctx, "when", "started"), sortHeader(ctx, "agent", "agent"), sortHeader(ctx, "project", "project"),
-      sortHeader(ctx, "title", "title"), sortHeader(ctx, "dur", "duration"), sortHeader(ctx, "cost", "cost"),
-      sortHeader(ctx, "outcome", "outcome"), sortHeader(ctx, "turns", "turns")
-    ]);
-    container.appendChild(el("section", {class: "panel", style: "padding:0 0 4px"}, [head]));
-    container.appendChild(viewport);
+    shell.appendChild(head);
+    shell.appendChild(viewport);
+    container.appendChild(shell);
 
     var selected = -1;
     var rows = [];
     var list = null;
 
     function renderRow(row, index) {
+      var title = row[C.COL.title] || row[C.COL.key];
+      var project = C.projectMeta(row);
       var node = el("div", {
         class: "listrow" + (C.flag(row, "excluded") ? " excluded" : ""),
         role: "listitem", tabindex: "-1",
         onclick: function () { C.go("session", row[C.COL.key], {}); }
       }, [
-        el("span", {class: "sub nowrap", text: fmt.dateTime(row[C.COL.started])}),
-        el("span", {class: "nowrap", text: C.agentName(row)}),
-        el("span", {class: "sub nowrap", text: C.projectMeta(row).name}),
-        el("span", {class: "title"}, [
+        el("span", {class: "c-when sub", text: fmt.dateTime(row[C.COL.started])}),
+        el("span", {class: "c-agent", text: C.agentName(row), title: C.agentName(row) + " · " + C.clientName(row)}),
+        el("span", {class: "c-project sub", text: project.name, title: project.id}),
+        el("span", {class: "c-title", title: title}, [
           C.flag(row, "subagent") ? el("span", {class: "muted", text: "↳ "}) : null,
-          row[C.COL.title] || row[C.COL.key],
-          C.store.childCount[row[C.COL.key]] ? el("span", {class: "tag", text: "+" + C.store.childCount[row[C.COL.key]] + " sub"}) : null
+          title,
+          C.store.childCount[row[C.COL.key]]
+            ? el("span", {class: "tag", text: "+" + C.store.childCount[row[C.COL.key]] + " sub"})
+            : null
         ]),
-        el("span", {class: "right nowrap", text: fmt.duration(row[C.COL.duration])}),
-        el("span", {class: "right nowrap", text: fmt.money(C.cost(row))}),
-        C.pill(C.outcomeName(row)),
-        el("span", {class: "right nowrap", text: fmt.int(row[C.COL.turns])})
+        el("span", {class: "c-duration c-num", text: fmt.duration(row[C.COL.duration])}),
+        el("span", {class: "c-cost c-num"}, [C.costCell(row)]),
+        el("span", {class: "c-outcome"}, [C.pill(C.outcomeName(row))]),
+        el("span", {class: "c-turns c-num", text: fmt.int(row[C.COL.turns])})
       ]);
       if (index === selected) { node.setAttribute("aria-selected", "true"); }
       return node;
     }
 
     function refresh() {
+      C.clear(filterHost);
+      filterHost.appendChild(filterBar(ctx, scopeRows(ctx)));
       rows = C.filterRows(filterOptions(ctx, {rollupSubagents: rollup(ctx)}));
       sortRows(rows, params(ctx).sort || "started", params(ctx).dir !== "asc");
+      var loading = includeExcluded(ctx) && !C.store.excludedReady;
       countNode.textContent = fmt.int(rows.length) + " sessions" +
-        (C.store.ready ? "" : " (loading " + fmt.int(C.store.rows.length) + " of " + fmt.int(C.store.total) + "…)") +
-        (includeExcluded(ctx) ? " · excluded included" : " · excluded hidden") +
+        (!C.store.ready || loading
+          ? " (indexing " + fmt.int(C.store.rows.length) + " of " +
+            fmt.int(includeExcluded(ctx) ? C.store.total : C.store.included) + "…)"
+          : "") +
+        (includeExcluded(ctx) ? " · excluded included" : " · " + fmt.int(C.store.excludedTotal) + " excluded hidden") +
         (rollup(ctx) ? " · subagents rolled up" : "");
       if (list) { list.refresh(rows, true); } else { list = C.virtualList(viewport, rows, renderRow); }
+      syncScrollbarGutter();
     }
+
+    function syncScrollbarGutter() {
+      var gutter = Math.max(0, viewport.offsetWidth - viewport.clientWidth);
+      shell.style.setProperty("--sbw", gutter + "px");
+    }
+
+    global.addEventListener("resize", function () {
+      syncScrollbarGutter();
+      if (list) { list.render(); }
+    });
 
     viewport.addEventListener("keydown", function (event) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
@@ -447,21 +519,28 @@
       }
     });
 
+    if (includeExcluded(ctx)) { C.loadExcluded(); }
     refresh();
     ctx.onStoreChange = refresh;
   };
 
-  function sortHeader(ctx, label, field) {
-    var active = (params(ctx).sort || "started") === field;
+  function sortHeader(ctx, column) {
+    var active = (params(ctx).sort || "started") === column.field;
+    function apply() {
+      navigate(ctx, {
+        sort: column.field,
+        dir: active && params(ctx).dir !== "asc" ? "asc" : "desc"
+      });
+    }
     return el("span", {
-      text: label + (active ? (params(ctx).dir === "asc" ? " ▲" : " ▼") : ""),
-      role: "button", tabindex: "0",
-      onclick: function () { navigate(ctx, {sort: field, dir: active && params(ctx).dir !== "asc" ? "asc" : "desc"}); },
+      class: column.cls,
+      text: column.label + (active ? (params(ctx).dir === "asc" ? " ▲" : " ▼") : ""),
+      role: "columnheader",
+      "aria-sort": active ? (params(ctx).dir === "asc" ? "ascending" : "descending") : "none",
+      tabindex: "0",
+      onclick: apply,
       onkeydown: function (event) {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          navigate(ctx, {sort: field, dir: active && params(ctx).dir !== "asc" ? "asc" : "desc"});
-        }
+        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); apply(); }
       }
     });
   }
@@ -482,40 +561,105 @@
     });
   }
 
-  function filterBar(ctx) {
+  var FACET_OPTION_CAP = 40;
+
+  function scopeRows(ctx) {
+    return C.filterRows({includeExcluded: includeExcluded(ctx), since: C.rangeStart(rangeKey(ctx))});
+  }
+
+  function filterBar(ctx, scope) {
     var current = params(ctx);
-    function select(label, key, options, formatter) {
+    function pair(key, value) { var out = {}; out[key] = value; return out; }
+
+    // Facets list only values present in the current scope, most common first,
+    // so a 30k-option project dropdown can never happen.
+    function facetSelect(label, key, accessor, labeller) {
+      var entries = C.facetCounts(scope, accessor);
+      var options = [el("option", {value: "", text: "all " + label + " (" + fmt.int(entries.length) + ")"})];
+      var shown = entries.slice(0, FACET_OPTION_CAP);
+      var selectedPresent = !current[key];
+      shown.forEach(function (entry) {
+        if (entry.value === current[key]) { selectedPresent = true; }
+        options.push(el("option", {
+          value: entry.value,
+          text: (labeller ? labeller(entry.value) : entry.value) + " (" + fmt.int(entry.count) + ")",
+          selected: entry.value === current[key] ? "selected" : null
+        }));
+      });
+      if (!selectedPresent) {
+        options.push(el("option", {
+          value: current[key],
+          text: (labeller ? labeller(current[key]) : current[key]) + " (0 here)",
+          selected: "selected"
+        }));
+      }
+      if (entries.length > shown.length) {
+        options.push(el("option", {value: "", disabled: "disabled", text: "… " + fmt.int(entries.length - shown.length) + " more — use search"}));
+      }
       var node = el("select", {
         "aria-label": label,
         onchange: function (event) { navigate(ctx, pair(key, event.target.value)); }
-      }, [el("option", {value: "", text: "all " + label})].concat(options.map(function (option) {
-        var value = typeof option === "string" ? option : option.id;
-        var text = formatter ? formatter(option) : value;
-        return el("option", {value: value, text: text, selected: current[key] === value ? "selected" : null});
-      })));
+      }, options);
       return el("label", null, [label, node]);
     }
-    function pair(key, value) { var out = {}; out[key] = value; return out; }
+
+    // Projects and models can be unbounded: type-ahead over a capped datalist.
+    function facetTypeAhead(label, key, accessor, resolve) {
+      var entries = C.facetCounts(scope, accessor);
+      var listId = "facet-" + key;
+      var datalist = el("datalist", {id: listId});
+      function fill(query) {
+        C.clear(datalist);
+        var needle = (query || "").toLowerCase();
+        var shown = 0;
+        for (var i = 0; i < entries.length && shown < 200; i++) {
+          var entry = entries[i];
+          var text = resolve ? resolve(entry.value) : entry.value;
+          if (needle && (text + " " + entry.value).toLowerCase().indexOf(needle) === -1) { continue; }
+          datalist.appendChild(el("option", {value: entry.value, label: text + " (" + entry.count + ")"}));
+          shown += 1;
+        }
+      }
+      fill("");
+      var input = el("input", {
+        type: "search", class: "facet", list: listId, value: current[key] || "",
+        placeholder: "any " + label + " (" + fmt.int(entries.length) + ")",
+        "aria-label": label
+      });
+      var timer = null;
+      input.addEventListener("input", function () {
+        fill(input.value);
+        if (timer) { clearTimeout(timer); }
+        var value = input.value;
+        var known = false;
+        for (var i = 0; i < entries.length; i++) { if (entries[i].value === value) { known = true; break; } }
+        if (!value || known) {
+          timer = setTimeout(function () { navigate(ctx, pair(key, value)); }, 160);
+        }
+      });
+      input.addEventListener("change", function () { navigate(ctx, pair(key, input.value)); });
+      return el("label", null, [label, input, datalist]);
+    }
 
     var search = el("input", {
       type: "search", id: "session-search", placeholder: "search title and first prompt…",
       value: current.q || "", "aria-label": "search sessions"
     });
-    var timer = null;
+    var searchTimer = null;
     search.addEventListener("input", function () {
-      if (timer) { clearTimeout(timer); }
-      timer = setTimeout(function () { navigate(ctx, {q: search.value}); }, 220);
+      if (searchTimer) { clearTimeout(searchTimer); }
+      searchTimer = setTimeout(function () { navigate(ctx, {q: search.value}); }, 220);
     });
 
     return el("div", {class: "filters"}, [
       el("label", null, ["search", search]),
-      select("agent", "agent", C.DICT.agents),
-      select("client", "client", C.DICT.clients),
-      select("project", "project", C.DICT.projects, function (project) { return project.name; }),
-      select("tag", "tag", C.DICT.tags),
-      select("outcome", "outcome", C.DICT.outcomes),
-      select("work", "work", C.DICT.work),
-      select("model", "model", C.DICT.models),
+      facetSelect("agent", "agent", C.agentName),
+      facetSelect("client", "client", C.clientName),
+      facetTypeAhead("project", "project", function (row) { return C.projectMeta(row).id; }, projectLabel),
+      facetSelect("tag", "tag", function (row) { return C.tagNames(row); }),
+      facetSelect("outcome", "outcome", C.outcomeName),
+      facetSelect("work", "work", C.workName),
+      facetTypeAhead("model", "model", function (row) { return C.modelNames(row); }),
       el("label", null, ["mode", el("select", {
         "aria-label": "interaction mode",
         onchange: function (event) { navigate(ctx, {mode: event.target.value}); }
@@ -546,6 +690,14 @@
     ]);
   }
 
+  function projectLabel(id) {
+    var projects = C.DICT.projects;
+    for (var i = 0; i < projects.length; i++) {
+      if (projects[i] && projects[i].id === id) { return projects[i].name; }
+    }
+    return id;
+  }
+
   /* ---------------- session detail ------------------------------------------ */
 
   views.session = function (container, ctx) {
@@ -556,9 +708,10 @@
 
     function attempt() {
       var row = C.store.byKey[key];
-      if (!row && !C.store.ready) {
-        host.textContent = "loading the session index… " + fmt.int(C.store.rows.length) + " of " + fmt.int(C.store.total);
+      if (!row && (!C.store.ready || !C.store.excludedReady)) {
+        host.textContent = "loading the session index… " + fmt.int(C.store.rows.length) + " sessions so far";
         ctx.onStoreChange = attempt;
+        if (C.store.ready) { C.loadExcluded(); }
         return;
       }
       ctx.onStoreChange = null;
@@ -587,6 +740,11 @@
       " · " + detail.agent + " / " + detail.client,
       detail.excluded ? el("span", {class: "tag", text: "excluded"}) : null
     ]));
+    if (detail.minimal) {
+      host.appendChild(el("p", {class: "muted"},
+        "This session is excluded, so only its catalog record is published. " +
+        "Signals and token usage are not computed for excluded sessions."));
+    }
 
     var git = detail.git || {};
     host.appendChild(el("div", {class: "grid two"}, [
@@ -596,10 +754,10 @@
         el("dt", {text: "ended"}), el("dd", {text: detail.ended_at || "–"}),
         el("dt", {text: "duration"}), el("dd", {text: fmt.duration(detail.duration_s)}),
         el("dt", {text: "active"}), el("dd", {text: fmt.duration(detail.active_s)}),
-        el("dt", {text: "cost"}), el("dd", {text: row ? fmt.money(C.cost(row)) : "–"}),
-        el("dt", {text: "models"}), el("dd", {text: (detail.models || []).join(", ") || "–"}),
-        el("dt", {text: "branch"}), el("dd", {text: git.branch || "–"}),
-        el("dt", {text: "remote"}), el("dd", {class: "mono", text: git.remote || "–"}),
+        el("dt", {text: "cost"}), el("dd", null, [row ? C.costCell(row) : "—"]),
+        el("dt", {text: "models"}), el("dd", {text: (detail.models || []).join(", ") || "—"}),
+        el("dt", {text: "branch"}), el("dd", {text: git.branch || "—"}),
+        el("dt", {text: "remote"}), el("dd", {class: "mono", text: git.remote || "—"}),
         el("dt", {text: "cwd"}), el("dd", {class: "mono", text: detail.cwd || "–"}),
         el("dt", {text: "interactive"}), el("dd", {text: detail.interactive === null ? "unknown" : (detail.interactive ? "yes" : "no")})
       ])]),
@@ -918,6 +1076,7 @@
   views.quality = function (container, ctx) {
     var quality = C.manifest.quality || {};
     var sync = C.manifest.sync || {};
+    var cost = quality.cost || {};
     container.appendChild(el("h1", {text: "Data quality and capture"}));
     container.appendChild(el("p", {class: "sub", text: "what the archive contains, what was filtered out, and whether capture is healthy"}));
 
@@ -926,10 +1085,10 @@
       C.kpi("included", fmt.int(quality.included)),
       C.kpi("excluded", fmt.int(quality.excluded), null, fmt.pct(quality.sessions ? quality.excluded / quality.sessions : 0) + " of archive"),
       C.kpi("scored", fmt.int(quality.with_signals), null, "sessions with signals"),
+      C.kpi("priced", fmt.int(cost.priced), null, fmt.int(cost.unpriced) + " without a cost estimate"),
       C.kpi("unknown events", fmt.pct(quality.unknown_rate, 2), null, fmt.compact(quality.unknown_events) + " of " + fmt.compact(quality.events)),
       C.kpi("interactive", fmt.int(quality.interactive), null, fmt.int(quality.automated) + " automated"),
-      C.kpi("stale signals", fmt.int(quality.stale_signals), null, "fingerprint drift"),
-      C.kpi("missing signals", fmt.int(quality.missing_signals), null, "included but unscored")
+      C.kpi("stale signals", fmt.int(quality.stale_signals), null, fmt.int(quality.missing_signals) + " included but unscored")
     ]));
 
     container.appendChild(el("div", {class: "grid two", style: "margin-top:14px"}, [
@@ -937,23 +1096,27 @@
         (quality.excluded_by_tag || []).length ? C.tableOf(
           ["tag", {label: "sessions", num: true}, "sources", "examples"],
           (quality.excluded_by_tag || []).map(function (entry) {
-            var sources = Object.keys(entry.sources || {}).map(function (source) {
+            var sources = el("span", {class: "chips"}, Object.keys(entry.sources || {}).map(function (source) {
               return el("span", {class: "tag", text: source + " " + entry.sources[source]});
-            });
+            }));
+            var examples = el("span", null, (entry.examples || []).slice(0, 3).map(function (key) {
+              return el("div", null, [el("a", {
+                class: "mono", href: C.buildHash("session", key, {}), text: shortKey(key), title: key
+              })]);
+            }));
             return [
               {node: el("span", {class: "tag", text: entry.tag})},
               {num: true, text: fmt.int(entry.count)},
-              {node: el("span", null, sources)},
-              {node: el("span", null, (entry.examples || []).slice(0, 3).map(function (key) {
-                return el("div", null, [el("a", {class: "mono", href: C.buildHash("session", key, {}), text: key})]);
-              }))}
+              {node: sources},
+              {node: examples, cls: "keys"}
             ];
           })
         ) : el("p", {class: "muted", text: "nothing is excluded"})
       ]),
       C.panel("capture by host", [
         C.tableOf(
-          ["host", {label: "sessions", num: true}, {label: "events", num: true}, {label: "unknown", num: true}, {label: "no transcript", num: true}],
+          ["host", {label: "sessions", num: true}, {label: "events", num: true},
+            {label: "unknown", num: true}, {label: "no transcript", num: true}],
           (quality.hosts || []).map(function (entry) {
             return [
               entry.host,
@@ -968,6 +1131,23 @@
     ]));
 
     container.appendChild(el("div", {class: "grid two", style: "margin-top:14px"}, [
+      C.panel("cost coverage", [
+        (cost.basis || []).length ? C.tableOf(
+          ["basis", {label: "sessions", num: true}, "meaning", "examples"],
+          (cost.basis || []).map(function (entry) {
+            return [
+              {node: el("span", {class: "tag", text: entry.basis})},
+              {num: true, text: fmt.int(entry.count)},
+              C.COST_BASIS_REASON[entry.basis] || "unknown basis",
+              {cls: "keys", node: el("span", null, (entry.examples || []).slice(0, 2).map(function (key) {
+                return el("div", null, [el("a", {class: "mono", href: C.buildHash("session", key, {}), text: shortKey(key), title: key})]);
+              }))}
+            ];
+          })
+        ) : el("p", {class: "muted", text: "every included session has a cost estimate"}),
+        el("p", {class: "muted", text:
+          "Sessions without an estimate show “—”, never $0.00, and are excluded from cost averages."})
+      ]),
       C.panel("tags", [
         C.tableOf(["tag", {label: "sessions", num: true}], (quality.tags || []).slice(0, 20).map(function (entry) {
           return [
@@ -975,19 +1155,6 @@
             {num: true, text: fmt.int(entry.count)}
           ];
         }))
-      ]),
-      C.panel("inputs", [
-        el("dl", {class: "kv"}, [
-          el("dt", {text: "catalog"}), el("dd", {class: "mono", text: (quality.catalog || {}).path || "–"}),
-          el("dt", {text: "catalog state"}), el("dd", {text: (quality.catalog || {}).missing ? "missing" : "ok" +
-            ((quality.catalog || {}).malformed ? " · " + quality.catalog.malformed + " malformed lines" : "")}),
-          el("dt", {text: "signal store"}), el("dd", {class: "mono", text: (quality.signals || {}).sessions_path || "–"}),
-          el("dt", {text: "signal version"}), el("dd", {class: "mono", text: (quality.signals || {}).version || "–"}),
-          el("dt", {text: "markers"}), el("dd", {text: Object.keys(quality.markers || {}).map(function (directive) {
-            return directive + " " + quality.markers[directive];
-          }).join(", ") || "none"}),
-          el("dt", {text: "built"}), el("dd", {text: C.manifest.generated_at || "–"})
-        ])
       ])
     ]));
 
@@ -996,19 +1163,26 @@
       el("h2", {text: "latest sync"}),
       latest ? el("div", null, [
         el("p", null, [
-          el("span", {class: "pill " + (latest.status === "ok" ? "success" : "failed"), text: latest.status || "unknown"}),
-          " started " + (latest.started_at || "–") + " · finished " + (latest.completed_at || "–")
+          el("span", {class: "pill " + healthPill(latest.health), text: syncHeadline(latest)}),
+          latest.started_at ? " started " + latest.started_at : "",
+          latest.completed_at ? " · finished " + latest.completed_at : ""
         ]),
-        el("dl", {class: "kv"}, [
-          el("dt", {text: "imported"}), el("dd", {text: fmt.int(latest.imported)}),
-          el("dt", {text: "rendered"}), el("dd", {text: fmt.int(latest.rendered)}),
-          el("dt", {text: "pending"}), el("dd", {text: fmt.int(latest.pending)}),
-          el("dt", {text: "failures"}), el("dd", {text: fmt.int(latest.failure_count)}),
-          el("dt", {text: "free disk"}), el("dd", {text: latest.free_bytes ? (latest.free_bytes / (1024 * 1024 * 1024)).toFixed(1) + " GiB" : "–"}),
-          el("dt", {text: "warning"}), el("dd", {text: latest.warning || "none"})
+        latest.built_during_sync ? el("p", {class: "muted", text:
+          "This dashboard was built by the dashboard stage of that run, so the report was still open when it " +
+          "was read. Stages that had not finished at that point are listed as pending; the generation stays " +
+          "published until the next rebuild."}) : null,
+        stageTable(latest.stages, latest.stages_unfinished || []),
+        C.tableOf(["metric", {label: "value", num: true}], [
+          ["imported", {num: true, text: fmt.int(latest.imported)}],
+          ["unchanged", {num: true, text: fmt.int(latest.unchanged)}],
+          ["rendered", {num: true, text: fmt.int(latest.rendered)}],
+          ["pending", {num: true, text: fmt.int(latest.pending)}],
+          ["failures", {num: true, text: fmt.int(latest.failure_count)}],
+          ["free disk", {num: true, text: latest.free_bytes ? (latest.free_bytes / (1024 * 1024 * 1024)).toFixed(1) + " GiB" : "—"}],
+          ["warning", latest.warning || "none"]
         ]),
         (latest.failures || []).length ? C.tableOf(["session", "error"], latest.failures.map(function (failure) {
-          return [{node: el("span", {class: "mono", text: failure.session})}, failure.error];
+          return [{node: el("span", {class: "mono", text: shortKey(failure.session), title: failure.session})}, failure.error];
         })) : null
       ]) : el("p", {class: "muted", text: "no sync reports in the archive"}),
       (sync.history || []).length > 1 ? el("div", null, [
@@ -1019,8 +1193,79 @@
           }))
       ]) : null
     ]));
+
+    container.appendChild(el("section", {class: "panel", style: "margin-top:14px"}, [
+      el("h2", {text: "inputs"}),
+      el("dl", {class: "kv"}, [
+        el("dt", {text: "catalog"}), el("dd", {class: "mono", text: (quality.catalog || {}).path || "—"}),
+        el("dt", {text: "catalog state"}), el("dd", {text: (quality.catalog || {}).missing ? "missing" : "ok" +
+          ((quality.catalog || {}).malformed ? " · " + quality.catalog.malformed + " malformed lines" : "")}),
+        el("dt", {text: "signal store"}), el("dd", {class: "mono", text: (quality.signals || {}).sessions_path || "—"}),
+        el("dt", {text: "signal version"}), el("dd", {class: "mono", text: (quality.signals || {}).version || "—"}),
+        el("dt", {text: "sync state"}), el("dd", {class: "mono", text: sync.state_path || "—"}),
+        el("dt", {text: "markers"}), el("dd", {text: Object.keys(quality.markers || {}).map(function (directive) {
+          return directive + " " + quality.markers[directive];
+        }).join(", ") || "none"}),
+        el("dt", {text: "built"}), el("dd", {text: C.manifest.generated_at || "—"})
+      ])
+    ]));
     var _ = ctx;
   };
+
+  function shortKey(key) {
+    var text = String(key || "");
+    var slash = text.indexOf("/");
+    if (slash === -1) { return text.length > 20 ? text.slice(0, 10) + "…" + text.slice(-6) : text; }
+    var host = text.slice(0, slash);
+    var id = text.slice(slash + 1);
+    return host + "/" + (id.length > 14 ? id.slice(0, 8) + "…" + id.slice(-4) : id);
+  }
+
+  function healthPill(health) {
+    if (health === "ok") { return "success"; }
+    if (health === "degraded") { return "partial"; }
+    return "failed";
+  }
+
+  function syncHeadline(latest) {
+    if (latest.health === "ok") { return "sync ok"; }
+    if (latest.health === "degraded") { return "sync degraded"; }
+    return "sync failed";
+  }
+
+  function stageTable(stages, unfinished) {
+    var names = Object.keys(stages || {});
+    if (!names.length) { return el("p", {class: "muted", text: "this run did not record per-stage status"}); }
+    return C.tableOf(
+      ["stage", "status", {label: "duration", num: true}, "finished", "detail"],
+      names.map(function (name) {
+        var stage = stages[name];
+        var detail = [];
+        ["changed_keys", "total", "excluded", "rendered", "recomputed", "reused", "removed_keys"].forEach(function (key) {
+          if (stage[key] !== undefined && stage[key] !== null) { detail.push(key + " " + fmt.int(stage[key])); }
+        });
+        if (stage.error) { detail.push(String(stage.error)); }
+        var pending = (unfinished || []).indexOf(name) !== -1;
+        return [
+          name,
+          {node: el("span", {
+            class: "pill " + stageStyle(stage.status),
+            text: pending ? "pending at build" : stage.status
+          })},
+          {num: true, text: stage.duration_seconds ? fmt.duration(stage.duration_seconds) : "—"},
+          stage.completed_at || "—",
+          detail.join(" · ") || "—"
+        ];
+      })
+    );
+  }
+
+  function stageStyle(status) {
+    if (status === "success" || status === "ok") { return "success"; }
+    if (status === "running" || status === "in_progress" || status === "skipped") { return "unknown"; }
+    if (status === "failed" || status === "error") { return "failed"; }
+    return "unknown";
+  }
 
   global.RETRO.views = views;
 })(window);

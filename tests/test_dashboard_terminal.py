@@ -77,3 +77,18 @@ def test_detail_accepts_a_session_key(inputs):  # noqa: F811
     assert "rendered/codex" in text.replace("\n", "")
     show_detail(console, inputs, state, "missing-session")
     assert "no such session" in buffer.getvalue()
+
+
+def test_unpriced_groups_show_a_dash_not_zero(archive: Layout):  # noqa: F811
+    output = render(archive, interactive=True, input_text="r all\np\nq\n")
+    assert "unpriced (shown as —)" in output
+    # the Cortex project in the fixture has one priced and one unscored session
+    projects = output[output.index("projects ("):]
+    assert "$0.00" not in projects
+
+
+def test_cost_column_is_dashed_for_sessions_without_an_estimate(archive: Layout):  # noqa: F811
+    output = render(archive, interactive=True, input_text="r all\ns\nq\n")
+    sessions = output[output.index("sessions ("):]
+    assert "—" in sessions
+    assert "$0.00" not in sessions

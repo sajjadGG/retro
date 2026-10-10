@@ -41,7 +41,7 @@ def build_and_publish(
             layout,
             staging,
             mode=resolved_mode,
-            cache_dir=output_dir / CACHE_DIRNAME / "detail",
+            cache_dir=output_dir / CACHE_DIRNAME,
         )
         if report is not None:
             report.append(build_report)
@@ -52,6 +52,14 @@ def build_and_publish(
 
 
 def publish_generation(staging: Path, output_dir: Path, *, keep: int = KEEP_GENERATIONS) -> Path:
+    """Swap one pointer.
+
+    ``index.html``, ``assets`` and ``data`` are permanent symlinks that resolve
+    through ``current``, so publishing is a single atomic rename of ``current``
+    once the new generation is fully materialised. A reader can therefore never
+    observe a mix of two generations, and a failure before the swap leaves the
+    previous generation serving untouched.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     builds_dir = output_dir / BUILDS_DIRNAME
     builds_dir.mkdir(parents=True, exist_ok=True)
@@ -59,11 +67,23 @@ def publish_generation(staging: Path, output_dir: Path, *, keep: int = KEEP_GENE
     generation = builds_dir / name
     os.replace(staging, generation)
 
+    ensure_entry_points(output_dir)
     _swap_symlink(output_dir / CURRENT_LINK, Path(BUILDS_DIRNAME) / name)
-    for link in PUBLISHED_LINKS:
-        _swap_symlink(output_dir / link, Path(CURRENT_LINK) / link)
     _trim_generations(builds_dir, generation, keep=keep)
     return output_dir / "index.html"
+
+
+def ensure_entry_points(output_dir: Path) -> list[str]:
+    """Create the stable entry-point symlinks when missing or pointing elsewhere."""
+    repaired: list[str] = []
+    for link in PUBLISHED_LINKS:
+        path = output_dir / link
+        target = Path(CURRENT_LINK) / link
+        if path.is_symlink() and os.readlink(path) == str(target):
+            continue
+        _swap_symlink(path, target)
+        repaired.append(link)
+    return repaired
 
 
 def build_dashboard(
@@ -79,7 +99,7 @@ def build_dashboard(
             layout,
             Path(output_dir),
             mode=mode,
-            cache_dir=Path(output_dir) / CACHE_DIRNAME / "detail",
+            cache_dir=Path(output_dir) / CACHE_DIRNAME,
         )
     reports: list[BuildReport] = []
     index_path = build_and_publish(layout, Path(output_dir), mode=mode, report=reports)
