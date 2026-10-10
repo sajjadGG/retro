@@ -47,17 +47,17 @@ def test_methods():
 def test_signal_list():
     result = runner.invoke(app, ["signal", "list"])
     assert result.exit_code == 0
-    assert "command_count" in result.output or "command_co" in result.output
+    assert "outcome.status" in result.output
     assert "activity" in result.output
     assert "risk" in result.output
     assert "Signals" in result.output
 
 
-def test_signal_list_filter_by_group():
-    result = runner.invoke(app, ["signal", "list", "--group", "risk"])
+def test_signal_list_filter_by_category():
+    result = runner.invoke(app, ["signal", "list", "--category", "risk"])
     assert result.exit_code == 0
     assert "secret_exposure" in result.output
-    assert "command_count" not in result.output
+    assert "activity.user_turns" not in result.output
 
 
 def test_import_claude_no_args():
@@ -196,7 +196,7 @@ def test_dashboard_build_writes_a_published_generation(tmp_path):
 def test_analyze_command(tmp_path):
     result = runner.invoke(app, ["analyze", "--root", str(tmp_path / "rollout-memory")])
     assert result.exit_code == 0
-    assert "Retro Command & Tool Call Analysis" in result.output
+    assert "Command & tool behavior" in result.output
     assert "Wrote analysis report to:" in result.output
 
 

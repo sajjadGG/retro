@@ -276,9 +276,8 @@ rollout-memory/
   mined/<method>/<host>/<session-id>.prompt.md  # paste-ready prompt block
 
   signals/
-    readings.jsonl                            # one row per (session, signal)
-    aggregates.json                           # rolled-up stats per signal
-    summary.md                                # human view
+    definitions.json                          # the registered signal set + its digest
+    sessions.jsonl                            # one compact line per evaluated session
 
   memories/
     items.jsonl                               # canonical appended memory records
@@ -467,59 +466,90 @@ traffic. See [`specs/rollout_catalog_spec.md`](specs/rollout_catalog_spec.md).
 
 ## Signals
 
-Signals are evaluators that observe a captured rollout and emit a comparable reading (numeric / boolean / categorical). They answer: *"how did this rollout go, by some objective measure?"*
+Signals are evaluators that observe a captured rollout and emit a comparable
+value (number / boolean / category). They answer *"how did this rollout go, by
+some objective measure?"*, and they are derived backwards from the decisions the
+archive exists to support: which agent/model/client to use for which work, where
+time and money go, where agents struggle, which steering habits to change,
+whether a session succeeded, what was risky, and whether the data is trustworthy.
 
-Signals are grouped by intent, not implementation:
+Each session is scanned **once** into a `SessionProfile` of facts; every signal is
+then a pure read over that profile. Signals are organized by category:
 
-| Group      | Question answered                       | Examples |
-| ---------- | --------------------------------------- | -------- |
-| `activity` | What did the agent do?                  | `command_count`, `unique_files_edited`, `web_search_count` |
-| `outcome`  | Did the work land?                      | `git_commits_made_during`, `failed_command_ratio`, `user_satisfaction_lexical` |
-| `cost`     | What did it cost (effort/tokens/time)?  | `session_duration_seconds`, `user_correction_count`, `time_to_first_edit_seconds` |
-| `risk`     | How trustworthy was the capture/work?   | `unknown_event_count`, `capture_gap_signal`, `secret_exposure_signal` |
+| Category | Question answered | Examples |
+| --- | --- | --- |
+| `usage` | What did it consume? | `usage.cost_usd`, `usage.tokens_total`, `usage.active_s`, `usage.credits` |
+| `activity` | What did the agent do? | `activity.user_turns`, `activity.tool_calls`, `activity.file_edits` |
+| `outcome` | Did the work land? | `outcome.status`, `outcome.validated`, `outcome.committed` |
+| `friction` | Where did it get stuck? | `friction.tool_error_rate`, `friction.user_corrections`, `friction.longest_error_streak` |
+| `efficiency` | What did it cost per unit of work? | `efficiency.cost_per_edit`, `efficiency.cache_read_share` |
+| `collaboration` | How did the human steer? | `collaboration.first_prompt_chars`, `collaboration.reply_latency_s` |
+| `risk` | What could hurt? | `risk.secret_exposure`, `risk.destructive_commands` |
+| `quality` | Can the numbers be trusted? | `quality.capture_score`, `quality.cost_basis`, `quality.usage_source` |
+| `work` | What kind of work was it? | `work.kind`, `work.primary_language`, `work.validation_commands` |
 
-Methods: `heuristic` (pure event walk), `regex` (text patterns), `external` (touches the world — e.g. `git log`). `llm_judge` is reserved for later.
+Every signal carries id, title, category, kind, unit, polarity, method, version,
+description and applicability, plus per-session evidence (`event_id`s) and
+confidence. Methods: `exact` (direct reading), `heuristic` (rules over facts),
+`regex` (text patterns), `llm` (reserved, unused).
+
+See `specs/rollout_signals_spec.md` for every algorithm, threshold, known bias
+and the hand-label validation numbers.
 
 ### Commands
 
 ```bash
 # Inventory of registered signals
 retro signal list
-retro signal list --group outcome
+retro signal list --category outcome --describe
 
-# Compute signals for every imported session
+# Update signals/sessions.jsonl (incremental: only changed sessions are recomputed)
 retro signal run
+retro signal run --force
 
-# Restrict scope
+# Restrict scope (keeps the rest of the store intact)
 retro signal run --host claude
 retro signal run --host codex --session-id <id>
-retro signal run --signal git_commits_made_during,failed_command_ratio
 
-# Inspect readings for one session
+# Inspect one session, or aggregate across all of them
 retro signal show claude <session-id>
-retro signal show codex  <thread-id>
+retro signal summary
+retro signal summary --signal outcome.status,usage.cost_usd --json
 ```
 
 ### Output
 
-- `rollout-memory/signals/readings.jsonl` — one row per `(session, signal)` reading.
-- `rollout-memory/signals/aggregates.json` — per-signal cross-session aggregates (mean / median / p90 / sum / histogram).
-- `rollout-memory/signals/summary.md` — human view.
+- `rollout-memory/signals/definitions.json` — the registered signal set and a
+  digest of it (`{"schema": 2, "version": "…", "signals": [...]}`).
+- `rollout-memory/signals/sessions.jsonl` — one line per evaluated session:
+  `{"key", "fingerprint", "version", "values", "evidence", "confidence"}`.
 
-Each reading carries `evidence_refs` (event_ids), `confidence`, and a `method` tag so it can be traced back to the rollout. External signals (e.g. `git_commits_made_during`) emit a `null` reading with a `reason` field when their context is missing (cwd gone, not a git repo) rather than silently skipping.
+A session is recomputed only when its catalog fingerprint changes or the signal
+set changes; a signal that does not apply is omitted rather than stored as a
+zero. On the reference archive the store is ~2 MB for 1,651 sessions and a
+no-change update takes well under a second.
 
 ### Adding a new signal
 
 ```python
-from retro.signals.base import SessionContext, reading, register
+from retro.signals import SessionProfile, SignalValue, register
 
-@register("my_signal", group="outcome", kind="boolean",
-          method="heuristic", description="…")
-def _my_signal(ctx: SessionContext):
-    return reading(ctx, _my_signal, value=True, evidence=[some_event])
+@register(
+    "friction.my_signal",
+    title="My signal",
+    category="friction",
+    kind="count",
+    unit="count",
+    polarity="lower_better",
+    description="What it measures and how.",
+)
+def _my_signal(profile: SessionProfile):
+    return SignalValue(len(profile.error_events), tuple(profile.error_events[:5]))
 ```
 
-`retro signal list`/`run`/`show` and the dashboard pick it up automatically.
+Register it in `src/retro/signals/definitions.py`; `retro signal list`/`run`/
+`show` and the dashboard pick it up automatically. Bump a signal's `version`
+whenever its algorithm changes — that invalidates the stored values.
 
 ---
 
@@ -1027,10 +1057,8 @@ src/retro/
   storage.py             # artifact layout
   cli.py                 # Typer CLI (`retro`)
   renderer.py            # Markdown view
-  analyzer.py            # command/tool pattern analysis + operator diagnostics
   memory_store.py        # SQLite memory index (FTS5, wiki-links, weave)
   llm.py                 # headless `codex exec` helper
-  trajectory.py          # trajectory extraction for experimental signals
   dashboard/
     inputs.py            # readers for catalog/, signals/, sync/runs/
     facts.py             # fact table, signal matrix, quality aggregates
@@ -1047,8 +1075,12 @@ src/retro/
     claude.py            # Claude Code transcript reader (multi-root + env override)
     codex.py             # Codex SQLite + JSONL reader (multi-root)
   signals/
-    base.py, runner.py, heuristics.py, external.py
-    trajectory.py        # experimental trajectory signals
+    profile.py           # one scan per session -> SessionProfile of facts
+    usage.py, pricing.py # per-host token accounting + model rates
+    commands.py, patterns.py, classify.py   # command/text understanding, outcome + work kind
+    registry.py, definitions.py             # signal metadata + the catalogue
+    store.py, sources.py, summary.py        # incremental store, inputs, aggregation
+    analyze.py           # cross-session command/tool report (`retro analyze`)
   mining/
     base.py              # MemoryCandidate, MiningResult, registries
     render.py            # prompt-block markdown rendering + write helpers

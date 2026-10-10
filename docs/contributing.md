@@ -32,7 +32,7 @@ by `retro.config`, not a checkout-local `rollout-memory/`.
 
 ## Add A Signal
 
-1. Add a function in `src/retro/signals/heuristics.py` or `external.py`.
+1. Add a function in `src/retro/signals/definitions.py` that reads a `SessionProfile`.
 2. Decorate it with `@register(...)`.
 3. Add tests in `tests/test_signals.py`.
 

@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import time
-from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +17,8 @@ from .archive_health import (
     describe_archive_error,
     is_external_volume_permission_error,
 )
+from .catalog import Catalog, CatalogUpdate, load_catalog
+from .catalog import update_catalog as refresh_catalog
 from .config import load_config, resolve_dashboard_dir, user_state_dir
 from .extensions import (
     cleanup_stale_import_staging,
@@ -33,13 +34,8 @@ from .memory_store import reindex as reindex_memory
 from .renderer import render_file
 from .schema import Host, validate_host_id, validate_session_id
 from .sdk import SessionDescriptor
-from .signals import REGISTRY as SIGNAL_REGISTRY
-from .signals import (
-    read_signal_readings,
-    replace_session_readings,
-    run_signals,
-    write_signal_artifacts,
-)
+from .signals import SignalUpdate, definitions_version
+from .signals import update_signals as refresh_signals
 from .storage import Layout
 from .utils import atomic_write_text
 
@@ -48,18 +44,6 @@ MIN_SYNC_FREE_BYTES = 2 * 1024**3
 SYNC_STATE_SCHEMA = 2
 STAGE_NAMES = ("capture", "catalog", "render", "signals", "memory", "dashboard")
 DERIVED_STAGE_NAMES = STAGE_NAMES[1:]
-
-
-@dataclass(frozen=True)
-class CatalogUpdate:
-    changed_keys: set[str]
-
-
-@dataclass(frozen=True)
-class CatalogWork:
-    changed_keys: set[str]
-    force: bool = False
-    catalog: Any = None
 
 
 @dataclass
@@ -174,18 +158,14 @@ def _run_sync_locked(
     pending = _pending(state)
     signal_signature = _signal_signature()
     memory_signature = _memory_source_signature(layout)
-    all_keys = _all_normalized_keys(layout)
 
     if force_derived:
-        pending["catalog"]["keys"] = sorted(
-            set(pending["catalog"]["keys"]) | all_keys
-        )
+        pending["catalog"]["all"] = True
         pending["render"]["all"] = True
         pending["signals"]["all"] = True
         pending["memory"]["needed"] = True
         pending["dashboard"]["needed"] = True
     if state.get("signal_signature") != signal_signature:
-        pending["signals"]["all"] = True
         pending["dashboard"]["needed"] = True
     if state.get("memory_signature") != memory_signature:
         pending["memory"]["needed"] = True
@@ -335,23 +315,27 @@ def capture_sessions(layout: Layout, report: SyncReport) -> set[str]:
     return changed
 
 
-def update_catalog(
-    layout: Layout,
-    *,
-    keys: set[str],
-    force: bool = False,
-) -> CatalogUpdate:
-    del layout, force
-    return CatalogUpdate(changed_keys=set(keys))
+def update_catalog(layout: Layout, *, force: bool = False) -> CatalogUpdate:
+    return refresh_catalog(layout, force=force)
 
 
 def update_rendered(
     layout: Layout,
     *,
     keys: set[str],
+    catalog: Catalog | None,
     force: bool = False,
 ) -> set[str]:
     targets = _all_normalized_keys(layout) if force else set(keys)
+    if catalog is not None:
+        included = {record.key for record in catalog.included()}
+        missing = {
+            key
+            for key in included
+            if (parsed := _parse_key(key)) is not None
+            and not layout.rendered_path(*parsed).exists()
+        }
+        targets = (targets | missing) & included
     rendered: set[str] = set()
     for key in sorted(targets):
         parsed = _parse_key(key)
@@ -366,35 +350,13 @@ def update_rendered(
     return rendered
 
 
-def update_signals(layout: Layout, catalog: CatalogWork) -> None:
-    readings_path = layout.root / "signals" / "readings.jsonl"
-    full = catalog.force or not readings_path.exists()
-    if full:
-        readings = run_signals(layout)
-        write_signal_artifacts(layout, readings)
-        return
-    pending = {
-        parsed
-        for key in catalog.changed_keys
-        if (parsed := _parse_key(key)) is not None
-    }
-    if not pending:
-        return
-    existing = read_signal_readings(layout)
-    replacements = []
-    by_host: dict[Host, list[str]] = defaultdict(list)
-    for host, session_id in pending:
-        by_host[host].append(session_id)
-    for host, session_ids in by_host.items():
-        replacements.extend(
-            run_signals(
-                layout,
-                host=host,
-                session_ids=session_ids,
-            )
-        )
-    merged = replace_session_readings(existing, replacements, pending)
-    write_signal_artifacts(layout, merged)
+def update_signals(
+    layout: Layout,
+    catalog: Catalog,
+    *,
+    force: bool = False,
+) -> SignalUpdate:
+    return refresh_signals(layout, catalog, force=force)
 
 
 def update_memory(layout: Layout) -> None:
@@ -415,41 +377,64 @@ def _run_derived_stages(
     memory_signature: str,
 ) -> None:
     pending = _pending(state)
-    catalog_result: Any = None
+    catalog: Catalog | None = None
 
-    catalog_keys = set(pending["catalog"]["keys"])
-    if catalog_keys:
-        def catalog_operation() -> tuple[Any, dict[str, Any], str]:
-            result = update_catalog(layout, keys=catalog_keys)
-            changed_keys = _catalog_changed_keys(result, catalog_keys)
-            pending["catalog"]["keys"] = []
-            _add_pending_keys(pending["render"], changed_keys)
-            _add_pending_keys(pending["signals"], changed_keys)
-            if changed_keys:
-                pending["dashboard"]["needed"] = True
-            return result, {"changed_keys": len(changed_keys)}, "success"
-
-        _catalog_ok, catalog_result = _call_stage(
-            "catalog",
-            layout=layout,
-            state=state,
-            report=report,
-            operation=catalog_operation,
+    def catalog_operation() -> tuple[Catalog, dict[str, Any], str]:
+        captured = set(pending["catalog"]["keys"])
+        result = update_catalog(layout, force=bool(pending["catalog"]["all"]))
+        changed = _catalog_changed_keys(result, captured)
+        _add_pending_keys(pending["render"], captured | changed)
+        pending["catalog"] = {"keys": [], "all": False, "needed": False}
+        if changed or result.removed_keys:
+            pending["dashboard"]["needed"] = True
+        loaded = load_catalog(layout)
+        return (
+            loaded,
+            {
+                "changed_keys": len(changed),
+                "removed_keys": len(result.removed_keys),
+                "total": result.total,
+                "excluded": result.excluded_total,
+            },
+            "success",
         )
-    else:
-        _skip_stage("catalog", layout=layout, state=state, report=report)
 
-    render_keys = set(pending["render"]["keys"])
-    render_all = bool(pending["render"]["all"])
-    if render_keys or render_all:
+    catalog_ok, catalog_result = _call_stage(
+        "catalog",
+        layout=layout,
+        state=state,
+        report=report,
+        operation=catalog_operation,
+    )
+    if catalog_ok:
+        catalog = catalog_result
+    else:
+        pending["catalog"]["needed"] = True
+
+    if catalog is None:
+        for name in ("render", "signals"):
+            _skip_stage(
+                name,
+                layout=layout,
+                state=state,
+                report=report,
+                status="blocked",
+                reason="catalog stage failed",
+            )
+    else:
+        render_keys = set(pending["render"]["keys"])
+        render_all = bool(pending["render"]["all"])
+
         def render_operation() -> tuple[set[str], dict[str, Any], str]:
             rendered = update_rendered(
                 layout,
                 keys=render_keys,
+                catalog=catalog,
                 force=render_all,
             )
-            pending["render"] = {"keys": [], "all": False}
-            pending["dashboard"]["needed"] = True
+            pending["render"] = {"keys": [], "all": False, "needed": False}
+            if rendered:
+                pending["dashboard"]["needed"] = True
             return rendered, {"rendered": len(rendered), "full": render_all}, "success"
 
         render_ok, rendered = _call_stage(
@@ -461,31 +446,28 @@ def _run_derived_stages(
         )
         if render_ok:
             report.rendered.extend(sorted(rendered))
-    else:
-        _skip_stage("render", layout=layout, state=state, report=report)
 
-    signal_keys = set(pending["signals"]["keys"])
-    signal_all = bool(pending["signals"]["all"])
-    if signal_keys or signal_all:
-        def signals_operation() -> tuple[None, dict[str, Any], str]:
-            update_signals(
-                layout,
-                CatalogWork(
-                    changed_keys=signal_keys,
-                    force=signal_all,
-                    catalog=catalog_result,
-                ),
-            )
-            pending["signals"] = {"keys": [], "all": False}
+        signals_force = bool(pending["signals"]["all"])
+
+        def signals_operation() -> tuple[SignalUpdate, dict[str, Any], str]:
+            result = update_signals(layout, catalog, force=signals_force)
+            pending["signals"] = {"keys": [], "all": False, "needed": False}
             state["signal_signature"] = signal_signature
-            pending["dashboard"]["needed"] = True
+            if result.recomputed or result.removed_keys:
+                pending["dashboard"]["needed"] = True
             return (
-                None,
-                {"changed_keys": len(signal_keys), "full": signal_all},
+                result,
+                {
+                    "recomputed": result.recomputed,
+                    "removed": len(result.removed_keys),
+                    "reused": result.reused,
+                    "total": result.total,
+                    "full": signals_force,
+                },
                 "success",
             )
 
-        signals_ok, _ = _call_stage(
+        signals_ok, signal_result = _call_stage(
             "signals",
             layout=layout,
             state=state,
@@ -493,9 +475,11 @@ def _run_derived_stages(
             operation=signals_operation,
         )
         if signals_ok:
-            report.signals_recomputed = True
-    else:
-        _skip_stage("signals", layout=layout, state=state, report=report)
+            report.signals_recomputed = bool(
+                signal_result.recomputed or signal_result.removed_keys
+            )
+        else:
+            pending["signals"]["needed"] = True
 
     if pending["memory"]["needed"]:
         def memory_operation() -> tuple[None, dict[str, Any], str]:
@@ -713,8 +697,9 @@ def _pending(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
             if isinstance(keys, list)
             else set()
         )
-    pending["render"]["all"] = bool(pending["render"].get("all"))
-    pending["signals"]["all"] = bool(pending["signals"].get("all"))
+    for name in ("catalog", "render", "signals"):
+        pending[name]["all"] = bool(pending[name].get("all"))
+        pending[name]["needed"] = bool(pending[name].get("needed"))
     pending.setdefault("memory", {})["needed"] = bool(
         pending.get("memory", {}).get("needed")
     )
@@ -752,7 +737,7 @@ def _stage_has_pending(
     name: str,
 ) -> bool:
     if name in {"catalog", "render", "signals"}:
-        return bool(pending[name].get("keys")) or bool(pending[name].get("all"))
+        return any(bool(pending[name].get(field)) for field in ("keys", "all", "needed"))
     return bool(pending[name].get("needed"))
 
 
@@ -888,20 +873,7 @@ def _is_prefix(prefix: Path, candidate: Path) -> bool:
 
 
 def _signal_signature() -> str:
-    payload = [
-        {
-            "name": signal.name,
-            "group": signal.group,
-            "kind": signal.kind,
-            "method": signal.method,
-            "unit": signal.unit,
-            "description": signal.description,
-        }
-        for signal in SIGNAL_REGISTRY.values()
-    ]
-    return hashlib.sha256(
-        json.dumps(payload, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return definitions_version()
 
 
 def _derived_due(

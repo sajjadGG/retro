@@ -13,7 +13,7 @@ raw/ -> normalized/ -> catalog/ -> signals/ -> mined/ -> memories/ -> dashboard/
 | `raw/` | Immutable or revision-preserved source copies from registered hosts. |
 | `normalized/` | Common `NormalizedEvent` JSONL stream. |
 | `catalog/` | Session identity, client context, consolidated project, tags, and exclusion decisions. |
-| `signals/` | Evidence-linked readings and aggregates. |
+| `signals/` | Registered signal definitions plus one evidence-linked line per evaluated session. |
 | `mined/` | Prompt-time memory candidates per method. |
 | `memories/` | Canonical memory records, lifecycle events, and derived SQLite index. |
 | `rendered/` | Human-readable markdown transcripts. |
@@ -85,7 +85,7 @@ aggregation consume included records by default.
 | `src/retro/extensions.py` | Built-in adapters, diagnostics, staging, validation, and publication. |
 | `src/retro/importers/` | Host-specific importers. |
 | `src/retro/catalog/` | Metadata extraction, rules, markers, Git/project resolution, annotations, persistence, and CLI groups. |
-| `src/retro/signals/` | Signal registry and evaluators. |
+| `src/retro/signals/` | Session profile builder, signal registry, incremental store, token/cost accounting. |
 | `src/retro/mining/` | Mining method and filter registries. |
 | `src/retro/memory_store.py` | SQLite schema, reindex, retrieval, authored import, utility updates, weave. |
 | `src/retro/renderer.py` | Markdown transcript rendering. |
@@ -100,7 +100,7 @@ API version `1` and import public types from `retro.sdk`.
 
 Signals and mining methods self-register with decorators.
 
-Signals use `@register(...)` in `src/retro/signals/`.
+Signals use `@register(...)` in `src/retro/signals/definitions.py` and read a `SessionProfile`.
 
 Mining methods use `@register_method(...)` in `src/retro/mining/methods/` and must be imported in `src/retro/mining/methods/__init__.py`.
 

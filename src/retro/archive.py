@@ -12,11 +12,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .catalog import load_catalog, update_catalog
 from .config import user_data_dir
 from .locking import archive_lock
 from .memory_store import reindex as reindex_memory
 from .renderer import render_file
-from .signals import run_signals, write_signal_artifacts
+from .signals import signals_dir, update_signals
 from .storage import Layout
 from .utils import atomic_write_text, resolve_artifact_ref
 
@@ -387,8 +388,8 @@ def rebuild_derived_artifacts(
                 render_count += 1
 
         memory_report = reindex_memory(layout)
-        readings = run_signals(layout)
-        signal_paths = write_signal_artifacts(layout, readings)
+        update_catalog(layout, force=True)
+        signal_update = update_signals(layout, load_catalog(layout))
 
         from .dashboard import build_and_publish
 
@@ -403,8 +404,11 @@ def rebuild_derived_artifacts(
                 "evidence_refs": memory_report.evidence_refs,
                 "links": memory_report.links,
             },
-            "signal_readings": len(readings),
-            "signal_paths": {key: str(value) for key, value in signal_paths.items()},
+            "signal_sessions": signal_update.total,
+            "signal_paths": {
+                "definitions": str(signals_dir(layout) / "definitions.json"),
+                "sessions": str(signals_dir(layout) / "sessions.jsonl"),
+            },
             "dashboard": str(output_dir / index_path.name),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         }

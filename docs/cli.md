@@ -81,8 +81,9 @@ persist in `projects.aliases`; renames persist in `projects.names`.
 ## Signals
 
 ```bash
-retro signal list [--group activity|outcome|cost|risk]
-retro signal run [--host <host>] [--session-id <id>] [--signal <name,name>]
+retro signal list [--category usage|activity|outcome|friction|efficiency|collaboration|risk|quality|work] [--describe]
+retro signal run [--host <host>] [--session-id <id,id>] [--force] [--include-scratch]
+retro signal summary [--signal <id,id>] [--json]
 retro signal show claude <session-id>
 retro signal show codex <thread-id>
 ```
