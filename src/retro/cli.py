@@ -1978,7 +1978,7 @@ def doctor_cmd() -> None:
             "ok" if result.ok else f"ERROR: {result.message}",
         )
         if not result.ok:
-            warnings.append(
+            errors.append(
                 f"{result.record.name} provider failed: {result.message}"
             )
     status = schedule_status()
