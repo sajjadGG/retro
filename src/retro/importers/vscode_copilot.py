@@ -23,10 +23,8 @@ from ..utils import artifact_ref, truncate_summary
 from .base import (
     ImportResult,
     has_only_repo_state_capture,
-    normalized_payload,
-    normalized_result_fields,
-    resolve_timestamp,
 )
+from .normalization import normalized_payload, normalized_result_fields, resolve_timestamp
 
 VSCODE_COPILOT_USER_DIRS_ENV = "VSCODE_COPILOT_USER_DIRS"
 NORMALIZER_VERSION = 2

@@ -24,10 +24,8 @@ from ..utils import artifact_ref, iter_jsonl, truncate_summary
 from .base import (
     ImportResult,
     has_only_repo_state_capture,
-    normalized_payload,
-    normalized_result_fields,
-    resolve_timestamp,
 )
+from .normalization import normalized_payload, normalized_result_fields, resolve_timestamp
 
 CLAUDE_HOME = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_HOME / "projects"

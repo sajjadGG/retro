@@ -16,10 +16,8 @@ from .base import (
     ImportResult,
     has_only_repo_state_capture,
     is_ghostlab_copilot_session_id,
-    normalized_payload,
-    normalized_result_fields,
-    resolve_timestamp,
 )
+from .normalization import normalized_payload, normalized_result_fields, resolve_timestamp
 from .vscode_copilot import (
     _copy_stable,
     _export_session_store,
