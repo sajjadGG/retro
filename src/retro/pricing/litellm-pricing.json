@@ -2,7 +2,7 @@
   "_meta": {
     "source": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
     "schema": "LiteLLM model_prices_and_context_window subset",
-    "note": "USD per token. Refresh via: python dashboard/pricing/refresh.py",
+    "note": "USD per token. Refresh via: python dashboard/pricing/refresh.py. Entries with rate_basis=family-estimate have no upstream LiteLLM price and use the vendor's published tier for that model family; retro reports them as cost_basis=family.",
     "snapshot_taken": "2026-06-11",
     "snapshot_kind": "litellm-upstream",
     "models_updated": 15,
@@ -153,5 +153,69 @@
     "cache_read_input_token_cost": 0.000000025,
     "cache_creation_input_token_cost": 0.0000003,
     "litellm_provider": "anthropic"
+  },
+  "claude-opus-4-8": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic",
+    "rate_basis": "family-estimate"
+  },
+  "claude-opus-5": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic",
+    "rate_basis": "family-estimate"
+  },
+  "claude-opus-5-5": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.000025,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.00000625,
+    "litellm_provider": "anthropic",
+    "rate_basis": "family-estimate"
+  },
+  "claude-sonnet-5": {
+    "input_cost_per_token": 0.000003,
+    "output_cost_per_token": 0.000015,
+    "cache_read_input_token_cost": 0.0000003,
+    "cache_creation_input_token_cost": 0.00000375,
+    "litellm_provider": "anthropic",
+    "rate_basis": "family-estimate"
+  },
+  "gpt-5.6-sol": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.00003,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.000005,
+    "litellm_provider": "openai",
+    "rate_basis": "family-estimate"
+  },
+  "gpt-5.6-terra": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.00003,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.000005,
+    "litellm_provider": "openai",
+    "rate_basis": "family-estimate"
+  },
+  "gpt-5.6-luna": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.00003,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.000005,
+    "litellm_provider": "openai",
+    "rate_basis": "family-estimate"
+  },
+  "gpt-6-astra": {
+    "input_cost_per_token": 0.000005,
+    "output_cost_per_token": 0.00003,
+    "cache_read_input_token_cost": 0.0000005,
+    "cache_creation_input_token_cost": 0.000005,
+    "litellm_provider": "openai",
+    "rate_basis": "family-estimate"
   }
 }

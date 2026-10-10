@@ -1,0 +1,45 @@
+{"type":"session.start","id":"start","timestamp":"2026-10-01T00:00:00Z","data":{"sessionId":"copilot-v2","selectedModel":"gpt-6"}}
+{"type":"user.message","id":"user","data":{"content":"Build it","interactionId":"i1"}}
+{"type":"user.message","id":"skill-context","data":{"content":"<skill-context>...</skill-context>","source":"skill-review"}}
+{"type":"user.message","id":"agent-prompt","data":{"content":"Parent agent task","source":"agent-parent"}}
+{"type":"user.message","id":"system-steer","data":{"content":"","source":"system","delivery":"steering"}}
+{"type":"user.message","id":"auto","data":{"content":"Continue","isAutopilotContinuation":true}}
+{"type":"assistant.turn_start","id":"turn-start","data":{"turnId":"turn-1","interactionId":"i1"}}
+{"type":"assistant.message","id":"assistant","data":{"turnId":"turn-1","content":"Running","reasoningText":"Inspect first","toolRequests":[{"toolCallId":"call-shell","name":"bash","arguments":{"command":"false"}}]}}
+{"type":"tool.execution_start","id":"tool-start","data":{"toolCallId":"call-shell","toolName":"bash","arguments":{"command":"false"},"turnId":"turn-1"}}
+{"type":"permission.requested","id":"permission-start","data":{"requestId":"perm-1","permissionRequest":{"kind":"execute"}}}
+{"type":"permission.completed","id":"permission-end","data":{"requestId":"perm-1","toolCallId":"call-shell","result":"approved"}}
+{"type":"tool.execution_complete","id":"tool-end","data":{"toolCallId":"call-shell","success":false,"error":{"message":"failed"},"shellExecution":{"exitCode":1}}}
+{"type":"hook.start","id":"hook-start","data":{"hookInvocationId":"hook-1","hookType":"postToolUse","parentToolCallId":"call-shell"}}
+{"type":"hook.end","id":"hook-end","data":{"hookInvocationId":"hook-1","hookType":"postToolUse","success":true}}
+{"type":"external_tool.requested","id":"external-start","data":{"requestId":"external-1","toolCallId":"call-external","toolName":"browser","arguments":{"url":"https://example.test"}}}
+{"type":"external_tool.completed","id":"external-end","data":{"requestId":"external-1","result":{"ok":true}}}
+{"type":"assistant.message","id":"assistant-subagent","data":{"turnId":"turn-2","content":"","toolRequests":[{"toolCallId":"call-agent","name":"task","arguments":{"description":"Review"}}]}}
+{"type":"tool.execution_start","id":"agent-tool-start","data":{"toolCallId":"call-agent","toolName":"task","arguments":{"description":"Review"},"turnId":"turn-2"}}
+{"type":"subagent.started","id":"agent-start","agentId":"agent-1","data":{"toolCallId":"call-agent","agentName":"review","agentDisplayName":"Reviewer"}}
+{"type":"subagent.configured","id":"agent-configured","agentId":"agent-1","data":{"model":"gpt-6","reasoningEffort":"max","contextTier":"long_context","multiTurn":true}}
+{"type":"subagent.selected","id":"agent-selected","agentId":"agent-1","data":{"agentName":"review","agentDisplayName":"Reviewer","tools":["*"]}}
+{"type":"subagent.completed","id":"agent-end","agentId":"agent-1","data":{"toolCallId":"call-agent","agentName":"review","agentDisplayName":"Reviewer","durationMs":10}}
+{"type":"tool.execution_complete","id":"agent-tool-end","data":{"toolCallId":"call-agent","success":true,"result":{"summary":"Looks good"}}}
+{"type":"subagent.deselected","id":"agent-deselected","agentId":"agent-1","data":{}}
+{"type":"session.workspace_file_changed","id":"file-change","data":{"operation":"update","path":"a.py"}}
+{"type":"session.permissions_changed","id":"permissions","data":{"allowAllPermissions":true}}
+{"type":"session.mode_changed","id":"mode","data":{"previousMode":"interactive","newMode":"autopilot"}}
+{"type":"session.model_change","id":"model","data":{"previousModel":"gpt-5","newModel":"gpt-6"}}
+{"type":"session.auto_mode_resolved","id":"auto-mode","data":{"chosenModel":"gpt-6","routingMethod":"auto_v2"}}
+{"type":"session.mode_notice_delivered","id":"mode-notice","data":{"mode":"autopilot"}}
+{"type":"skill.invoked","id":"skill","data":{"name":"review","content":"skill body"}}
+{"type":"skill.invoked_ref","id":"skill-ref","data":{"name":"review","contentId":"sha256:1","contentLength":10}}
+{"type":"skill.context_delivered_ref","id":"skill-context-ref","data":{"source":"skill-review","prefix":"<skill>","suffix":"</skill>"}}
+{"type":"session.binary_asset","id":"asset","data":{"assetId":"asset-1","mimeType":"image/png","data":"AA=="}}
+{"type":"session.usage_checkpoint","id":"usage","data":{"totalNanoAiu":100,"totalPremiumRequests":1}}
+{"type":"session.task_complete","id":"task-complete","data":{"success":true,"summary":"Done"}}
+{"type":"session.compaction_start","id":"compact-start","data":{"currentTokens":100,"tokenLimit":200,"trigger":"threshold"}}
+{"type":"session.compaction_complete","id":"compact-end","data":{"success":true,"preCompactionTokens":100,"postCompactionTokens":50}}
+{"type":"system.message","id":"system-message","data":{"role":"system","content":"Validation complete"}}
+{"type":"system.notification","id":"notification","data":{"content":"Agent idle","kind":{"type":"agent_idle"}}}
+{"type":"assistant.turn_end","id":"turn-end","data":{"turnId":"turn-1"}}
+{"type":"session.resume","id":"resume","data":{"eventCount":40}}
+{"type":"abort","id":"abort","data":{"reason":"user_initiated"}}
+{"type":"session.shutdown","id":"shutdown","data":{"shutdownType":"normal"}}
+{"type":"future.copilot.event","id":"future","data":{"preserve":true}}

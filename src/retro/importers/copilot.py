@@ -1,10 +1,11 @@
 """Composite importer for all locally persisted VS Code Copilot sessions."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Union
 
-from ..schema import Host
+from ..schema import Host, NormalizedEvent
 from ..storage import Layout
 from .base import ImportResult
 from .copilot_cli import CopilotCliImporter, CopilotCliSession
@@ -12,6 +13,7 @@ from .vscode_copilot import CopilotSession as VscodeCopilotSession
 from .vscode_copilot import VscodeCopilotImporter
 
 CopilotSession = Union[VscodeCopilotSession, CopilotCliSession]
+NORMALIZER_VERSION = 3
 
 
 class CopilotImporter:
@@ -72,3 +74,22 @@ class CopilotImporter:
         raise FileNotFoundError(
             f"No local VS Code Copilot or Copilot Agent Host session found with id {identifier!r}"
         )
+
+    def normalize_raw_dir(
+        self,
+        raw_dir: Path,
+        session_id: str,
+    ) -> tuple[list[NormalizedEvent], int, list[str]]:
+        meta_path = raw_dir / "import_meta.json"
+        if meta_path.is_file():
+            try:
+                metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                metadata = {}
+            if metadata.get("source_kind") == "vscode-chat":
+                return self.vscode.normalize_raw_dir(raw_dir, session_id)
+            if metadata.get("source_kind") == "copilot-cli":
+                return self.agent_host.normalize_raw_dir(raw_dir, session_id)
+        if (raw_dir / "events.jsonl").is_file():
+            return self.agent_host.normalize_raw_dir(raw_dir, session_id)
+        return self.vscode.normalize_raw_dir(raw_dir, session_id)

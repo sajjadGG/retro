@@ -109,7 +109,7 @@ The API version is independent from the `retro-ai` package version. Providers
 should constrain the core release range they test, for example:
 
 ```toml
-dependencies = ["retro-ai>=0.4.0,<0.5"]
+dependencies = ["retro-ai>=0.4.0,<0.6"]
 ```
 
 Retro supports Python 3.9 and newer. Extension annotations should use

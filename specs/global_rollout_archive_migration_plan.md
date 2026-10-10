@@ -117,10 +117,9 @@ The physical data path remains compatible with the existing pipeline:
     experiments/
     migrations/
     sync/
-  state/
-    archive.lock
-    last-sync.json
-    source-fingerprints.json
+    state/
+      archive.lock
+      sync.json
 
 /Users/sajad/Dev/repos/Mem/
   rollout-memory -> ~/Library/Application Support/retro/rollout-memory
@@ -141,8 +140,9 @@ Retro's logs and scheduler definition are kept out of the archive:
   io.retro.sync.plist
 ```
 
-The archive can therefore be moved or backed up independently of scheduler
-state.
+The archive-coupled state and lock move with the archive. Scheduler logs remain
+on the internal disk so failures are visible even while an external archive
+volume is unmounted.
 
 ## Configuration and root resolution
 
@@ -366,7 +366,8 @@ It performs, under a per-user exclusive lock:
    utility events changed.
 6. Incrementally update cached dashboard session summaries.
 7. Atomically publish the dashboard.
-8. Write a structured run report and update `last-sync.json`.
+8. Write a structured run report and persist `<archive>/state/sync.json` after
+   every stage.
 
 ### Raw update semantics
 
@@ -431,6 +432,11 @@ On macOS, `schedule install` creates a user LaunchAgent:
 - no shell interpolation,
 - standard output/error redirected to `~/Library/Logs/retro/`,
 - job runs `retro sync --scheduled`.
+
+For archives under `/Volumes/<name>`, a missing mount makes scheduled sync skip
+without creating the mount path. `retro doctor` and `retro schedule status`
+also report macOS removable-volume privacy denial and the exact `Python.app`
+bundle that needs Full Disk Access.
 
 The installer validates that the executable and configured archive remain
 reachable after the current shell exits. Documentation should recommend

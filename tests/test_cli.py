@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from retro.cli import (
     taskset_run_cmd,
     taskset_select_cmd,
 )
-from retro.config import load_config
+from retro.config import RetroConfig, load_config, save_config
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.sdk import ImportResult, SessionDescriptor
 
@@ -46,17 +47,17 @@ def test_methods():
 def test_signal_list():
     result = runner.invoke(app, ["signal", "list"])
     assert result.exit_code == 0
-    assert "command_count" in result.output or "command_co" in result.output
+    assert "outcome.status" in result.output
     assert "activity" in result.output
     assert "risk" in result.output
     assert "Signals" in result.output
 
 
-def test_signal_list_filter_by_group():
-    result = runner.invoke(app, ["signal", "list", "--group", "risk"])
+def test_signal_list_filter_by_category():
+    result = runner.invoke(app, ["signal", "list", "--category", "risk"])
     assert result.exit_code == 0
     assert "secret_exposure" in result.output
-    assert "command_count" not in result.output
+    assert "activity.user_turns" not in result.output
 
 
 def test_import_claude_no_args():
@@ -72,6 +73,36 @@ def test_import_codex_no_args():
 def test_import_copilot_no_args():
     result = runner.invoke(app, ["import", "copilot"])
     assert result.exit_code != 0
+
+
+def test_import_renormalize_command(tmp_path: Path):
+    root = tmp_path / "rollout-memory"
+    raw_dir = root / "raw" / "codex" / "cli-renormalize"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "rollout.jsonl").write_text(
+        '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z",'
+        '"payload":{"id":"cli-renormalize","cwd":"/workspace"}}\n',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "import",
+            "renormalize",
+            "--root",
+            str(root),
+            "--host",
+            "codex",
+            "--session",
+            "cli-renormalize",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would rebuild 1/1" in result.output
+    assert not (root / "normalized" / "codex" / "cli-renormalize.events.jsonl").exists()
 
 
 def test_show_unknown_host():
@@ -167,17 +198,35 @@ def test_extension_import_command_routes_provider(monkeypatch, tmp_path: Path):
     assert (root / "normalized/opencode/session-1.events.jsonl").is_file()
 
 
-def test_dashboard_view_non_interactive():
-    result = runner.invoke(app, ["dashboard", "view"])
-    assert result.exit_code == 0
-    assert "Retro Rollout Dashboard" in result.output or "Retro Portfolio Dashboard" in result.output
-    assert "Imported Sessions Summary" in result.output
+def test_dashboard_view_non_interactive(tmp_path):
+    archive = Path(__file__).parent / "fixtures" / "dashboard-archive"
+    result = runner.invoke(app, ["dashboard", "view", "--root", str(archive), "--no-interactive"])
+    assert result.exit_code == 0, result.output
+    assert "retro dashboard" in result.output
+    assert "sessions shown" in result.output
+    assert "projects" in result.output
+
+
+def test_dashboard_build_writes_a_published_generation(tmp_path):
+    archive = Path(__file__).parent / "fixtures" / "dashboard-archive"
+    out = tmp_path / "dashboard"
+    result = runner.invoke(app, ["dashboard", "build", "--root", str(archive), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "dashboard ready" in result.output
+    assert (out / "index.html").exists()
+    assert (out / "data" / "manifest.js").exists()
+    assert (out / "current").is_symlink()
+
+    bad = runner.invoke(
+        app, ["dashboard", "build", "--mode", "nope", "--root", str(archive), "--out", str(out)]
+    )
+    assert bad.exit_code != 0
 
 
 def test_analyze_command(tmp_path):
     result = runner.invoke(app, ["analyze", "--root", str(tmp_path / "rollout-memory")])
     assert result.exit_code == 0
-    assert "Retro Command & Tool Call Analysis" in result.output
+    assert "Command & tool behavior" in result.output
     assert "Wrote analysis report to:" in result.output
 
 
@@ -387,6 +436,46 @@ def test_setup_without_schedule(tmp_path):
     assert dashboard.is_dir()
 
 
+def test_archive_repair_refs_dry_run_command(tmp_path):
+    root = tmp_path / "archive"
+
+    result = runner.invoke(
+        app,
+        ["archive", "repair-refs", "--root", str(root), "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert '"dry_run": true' in result.output
+    assert not root.exists()
+
+
+def test_scheduled_sync_cli_exits_zero_when_archive_volume_is_unmounted(
+    monkeypatch,
+):
+    volume = Path("/Volumes/retro-cli-unmounted")
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "--root",
+            str(volume / "archive"),
+            "--dashboard-dir",
+            str(volume / "dashboard"),
+            "--scheduled",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "sync skipped" in result.output
+    assert "Archive volume is not mounted" in result.output
+    assert not volume.exists()
+
+
 def test_doctor_fresh_install_and_dashboard_override(monkeypatch, tmp_path):
     override = Path("/tmp/retro-override-dashboard")
     monkeypatch.setenv("RETRO_DASHBOARD_DIR", str(override))
@@ -396,3 +485,72 @@ def test_doctor_fresh_install_and_dashboard_override(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert "Retro global archive" in result.output
     assert "override-dashboard" in result.output
+
+
+def test_doctor_reports_unmounted_archive_without_creating_mount_path(
+    monkeypatch,
+    tmp_path,
+):
+    volume = Path("/Volumes/retro-doctor-unmounted")
+    save_config(
+        RetroConfig(
+            archive_root=str(volume / "archive"),
+            dashboard_dir=str(tmp_path / "dashboard"),
+        )
+    )
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+    monkeypatch.setattr("retro.cli.doctor_sources", lambda: [])
+    monkeypatch.setattr(
+        "retro.schedule._run_launchctl",
+        lambda args, check=False: subprocess.CompletedProcess(
+            args, 1, "", "not loaded"
+        ),
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "Archive volume is not mounted" in result.output
+    assert "archive lock" in result.output
+    assert not volume.exists()
+
+
+def test_doctor_reports_stage_state_legacy_data_and_dashboard_staging(
+    monkeypatch,
+    tmp_path,
+):
+    archive = tmp_path / "archive"
+    dashboard = tmp_path / "dashboard"
+    save_config(
+        RetroConfig(
+            archive_root=str(archive),
+            dashboard_dir=str(dashboard),
+        )
+    )
+    state = archive / "state" / "sync.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps({"stages": {"dashboard": {"status": "failed"}}}),
+        encoding="utf-8",
+    )
+    legacy = Path(os.environ["RETRO_DATA_DIR"]) / "rollout-memory"
+    legacy.mkdir(parents=True)
+    (legacy / "legacy.txt").write_text("legacy", encoding="utf-8")
+    staging = dashboard.parent / ".retro-dashboard-stale"
+    staging.mkdir()
+    monkeypatch.setattr("retro.cli.doctor_sources", lambda: [])
+    monkeypatch.setattr(
+        "retro.schedule.schedule_status",
+        lambda: {"installed": False, "loaded": False},
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "last sync dashboard" in result.output
+    assert "failed" in result.output
+    assert "legacy archive data remains" in result.output
+    assert "dashboard staging" in result.output

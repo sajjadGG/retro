@@ -5,13 +5,28 @@ import os
 import plistlib
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
-from .config import config_path, user_log_dir
+from .archive_health import scheduled_archive_access
+from .config import user_log_dir
+from .storage import default_layout
+from .utils import atomic_write_bytes
 
 LAUNCHD_LABEL = "io.retro.sync"
+FORWARDED_ENVIRONMENT = (
+    "RETRO_DATA_DIR",
+    "RETRO_LOG_DIR",
+    "RETRO_CONFIG_PATH",
+    "RETRO_ROOT",
+    "RETRO_ARTIFACT_ROOT",
+    "RETRO_DASHBOARD_DIR",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+)
 
 
 def parse_interval(value: str) -> int:
@@ -68,6 +83,13 @@ def install_schedule(
 
     logs = user_log_dir()
     logs.mkdir(parents=True, exist_ok=True)
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    }
+    for name in FORWARDED_ENVIRONMENT:
+        value = os.environ.get(name)
+        if value:
+            environment[name] = value
     payload: dict[str, Any] = {
         "Label": LAUNCHD_LABEL,
         "ProgramArguments": [
@@ -82,13 +104,10 @@ def install_schedule(
         "ProcessType": "Background",
         "StandardOutPath": str(logs / "sync.log"),
         "StandardErrorPath": str(logs / "sync.error.log"),
-        "EnvironmentVariables": {
-            "RETRO_CONFIG_PATH": str(config_path()),
-            "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        },
+        "EnvironmentVariables": environment,
     }
     path = launch_agent_path()
-    _atomic_write_bytes(path, plistlib.dumps(payload, sort_keys=True))
+    atomic_write_bytes(path, plistlib.dumps(payload, sort_keys=True))
     if load:
         _bootout(ignore_failure=True)
         _run_launchctl(["bootstrap", launchd_domain(), str(path)])
@@ -104,6 +123,7 @@ def schedule_status() -> dict[str, Any]:
             "loaded": False,
             "path": str(path),
         }
+    access = scheduled_archive_access(default_layout().root)
     result = _run_launchctl(["print", launchd_service()], check=False)
     return {
         "supported": True,
@@ -112,6 +132,7 @@ def schedule_status() -> dict[str, Any]:
         "path": str(path),
         "service": launchd_service(),
         "detail": result.stdout.strip() if result.returncode == 0 else result.stderr.strip(),
+        "archive_access": access,
     }
 
 
@@ -157,21 +178,6 @@ def _run_launchctl(
             or f"launchctl {' '.join(arguments)} failed"
         )
     return result
-
-
-def _atomic_write_bytes(path: Path, content: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def _is_unstable_executable(path: Path) -> bool:

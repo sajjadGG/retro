@@ -3577,7 +3577,7 @@ def _active_build_sources(paths: TasksetPaths) -> list[_BuildSource]:
         source_path = paths.source_dir(source_id)
         if not isinstance(reported_path, str) or not reported_path:
             raise BuildConfigurationError(f"{where}.path must identify the source bundle")
-        if Path(reported_path).resolve() != source_path.resolve():
+        if _source_location(reported_path) != _source_location(source_path.as_posix()):
             raise BuildConfigurationError(
                 f"{where}.path={reported_path!r} does not identify the current source "
                 f"bundle {source_path}"
@@ -3588,6 +3588,14 @@ def _active_build_sources(paths: TasksetPaths) -> list[_BuildSource]:
             )
         )
     return sorted(active, key=lambda item: item.source_id)
+
+
+def _source_location(value: str) -> tuple[str, ...]:
+    parts = PurePosixPath(value.replace("\\", "/")).parts
+    for index in range(len(parts) - 2):
+        if parts[index : index + 2] == ("task-scorer", "sources"):
+            return tuple(parts[index:])
+    return tuple(parts)
 
 
 def default_build_id(

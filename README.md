@@ -36,6 +36,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Source extensions](#source-extensions)
 - [Storage layout](#storage-layout)
 - [Capture](#capture)
+- [Session catalog: ignoring noise and consolidating projects](#session-catalog-ignoring-noise-and-consolidating-projects)
 - [Signals](#signals)
 - [Mining](#mining)
 - [Time-consistent benchmarks](#time-consistent-benchmarks)
@@ -99,8 +100,8 @@ explicitly:
 
 ```bash
 retro setup \
-  --archive-root "$HOME/Library/Application Support/retro/rollout-memory" \
-  --dashboard-dir /Users/sajad/Dev/repos/Mem/dashboard \
+  --archive-root /Volumes/External/retro/rollout-memory \
+  --dashboard-dir /Volumes/External/retro/dashboard \
   --periodic 15m \
   --derived-every 6h
 ```
@@ -120,8 +121,17 @@ retro schedule uninstall
 
 Root precedence is `--root`, `RETRO_ROOT`, the legacy
 `RETRO_ARTIFACT_ROOT`, user config, then the platform per-user data directory.
-On macOS, operational state is under `~/Library/Application Support/retro/`
-and logs are under `~/Library/Logs/retro/`.
+Archive-coupled state and the cross-process lock live under
+`<archive>/state/`. Small configuration stays under the platform user data
+directory. On macOS, scheduler logs deliberately stay on the internal disk at
+`~/Library/Logs/retro/`, so an unmounted external archive cannot hide the
+failure.
+
+When an archive is under `/Volumes/<name>`, scheduled sync skips without
+creating a replacement directory if the volume is not mounted. macOS may also
+deny background jobs access to removable volumes; `retro doctor` and
+`retro schedule status` identify the `Python.app` bundle to grant Full Disk
+Access in System Settings.
 
 `retro sync` imports only new or changed local source sessions, preserves a raw
 revision when an upstream source was rewritten rather than appended, updates
@@ -130,6 +140,19 @@ It uses a cross-process archive lock, warns below 5 GiB free, and refuses a
 scheduled run below 2 GiB. Scheduled capture runs every 15 minutes; expensive
 signal and dashboard work is coalesced and runs at most every 6 hours by
 default. Manual `retro sync` refreshes pending derived work immediately.
+
+Sync records `capture → catalog → render → signals → memory → dashboard` in
+`<archive>/state/sync.json`. Each stage has status and timing data, while the
+`pending` section retains only unfinished inputs, so a dashboard failure does
+not cause completed signal work to run again.
+
+After moving an older archive, preview and repair absolute archive-internal
+normalized references:
+
+```bash
+retro archive repair-refs --dry-run
+retro archive repair-refs
+```
 
 ### Archive migration
 
@@ -158,14 +181,14 @@ directory before its old path becomes a compatibility symlink.
                   ┌──────────────────────────────────────────────────────────┐
                   │                       retro CLI                       │
                   ├──────────────┬─────────────┬──────────────┬───────────┤
-   ~/.claude  ──▶ │  importers   │   signals   │    mining    │  memory   │
-   ~/.codex   ──▶ │  (claude,    │  (heuristic │  (4 methods, │  index    │
- VS Code User ──▶ │ codex,       │  + external)│  + filters)  │  + weave  │
+   ~/.claude  ──▶ │  importers   │   catalog   │   signals    │  memory   │
+   ~/.codex   ──▶ │  (claude,    │ (identity,  │ + mining over│  index    │
+ VS Code User ──▶ │ codex,       │ tags, repos)│ included only│  + weave  │
                   │ copilot)     │             │              │           │
                   └──────┬───────┴──────┬──────┴───────┬──────┴─────┬─────┘
                          ▼              ▼              ▼            ▼
-                       raw/        normalized/      mined/      memories/
-                  (immutable)    (events.jsonl)   (per method) (files + SQLite)
+                       raw/        normalized/      catalog/     memories/
+                  (immutable)    (events.jsonl)   (sessions)   (files + SQLite)
                          │
                          ▼
                      rendered/   ← markdown view (any time)
@@ -243,15 +266,19 @@ rollout-memory/
 
   normalized/<host>/<session-id>.events.jsonl  # one normalized event per line
 
+  catalog/
+    sessions.jsonl                             # derived identity, context, project, tags, exclusion
+    state.json                                # derived policy/project invalidation digests
+    annotations.jsonl                          # canonical append-only user edits
+
   rendered/<host>/<session-id>.md             # human-readable markdown view
 
   mined/<method>/<host>/<session-id>.json     # mined candidates (structured)
   mined/<method>/<host>/<session-id>.prompt.md  # paste-ready prompt block
 
   signals/
-    readings.jsonl                            # one row per (session, signal)
-    aggregates.json                           # rolled-up stats per signal
-    summary.md                                # human view
+    definitions.json                          # the registered signal set + its digest
+    sessions.jsonl                            # one compact line per evaluated session
 
   memories/
     items.jsonl                               # canonical appended memory records
@@ -332,6 +359,11 @@ retro import claude --latest --force
 # Skip the markdown re-render step
 retro import codex --latest --no-render
 
+# Rebuild normalized events (and transcripts) from the archived raw copies after a
+# normalizer upgrade; only sessions whose normalizer version changed are rebuilt
+retro import renormalize --dry-run
+retro import renormalize [--host codex] [--since 2026-10-01] [--no-render]
+
 # Re-render markdown from an already-imported normalized stream
 retro render claude <session-id>
 retro render codex  <thread-id>
@@ -371,61 +403,165 @@ Copilot CLI and VS Code Agent Host sessions are captured from `~/.copilot/sessio
 
 ---
 
+## Session catalog: ignoring noise and consolidating projects
+
+The catalog derives one record per archived session without re-importing it.
+It identifies the agent surface, interactive/headless state, subagent parent,
+cwd, Git remote, project, models, event counts, markers, rule tags, and final
+`excluded` decision. Inspect it with:
+
+```bash
+retro sessions list --included --project github.com/sajjadgg/retro
+retro sessions list --excluded --tag scratch --json
+retro sessions show codex/<session-id>
+retro sessions explain codex/<session-id>
+```
+
+Ignore a test or mimic session while it is running by putting a directive in
+its title or a user-authored message:
+
+```text
+#retro:ignore
+#retro:keep
+#retro:tag=evaluation
+#retro:project=github.com/example/repo
+```
+
+Directives in assistant output, quote lines, inline code, and fenced code do
+not count. `#retro:keep` removes an automatic `ignore`; it does not override a
+manual ignore. For directory-wide policy, create `.retroignore` in the working
+directory or an ancestor. An empty file means `ignore`; otherwise put one tag
+per line. Canonical edits are append-only:
+
+```bash
+retro sessions tag codex/<session-id> ignore
+retro sessions untag codex/<session-id> ignore
+retro sessions set-project codex/<session-id> github.com/example/repo
+retro sessions set-project codex/<session-id> --clear
+```
+
+Built-in rules tag temporary-directory, empty, automated, and subagent
+sessions. Temporary roots include standard Unix/macOS temp locations and
+`$TMPDIR`; a session is empty when it lacks either a user prompt or all
+assistant/tool activity. Only tags listed in `exclude_tags` exclude; the
+default is `["ignore"]`, so `automated` alone remains reviewable. Add or
+dry-run a rule:
+
+```bash
+retro rules add '{"id":"eval","match":{"prompt":"(?i)^below is a math problem"},"tags":["ignore"]}'
+retro rules test --json
+retro rules disable builtin.empty
+```
+
+Project identity prefers the current repository remote, falls back to archived
+Git metadata, and normalizes HTTPS, SSH, and Copilot `owner/name` forms to one
+lowercase `host/owner/repo`. It follows Git worktree `commondir` files and
+resolves symlinked cwd prefixes. Temp directories without Git evidence collapse
+to `scratch:temp`; Copilot `session-state/<id>/files` sandboxes without Git
+evidence collapse to `scratch:copilot-session-state`. A Git remote/root wins
+over these synthetic projects. Persist exceptional merges and display names:
+
+```bash
+retro projects list
+retro projects merge path:/old/clone github.com/example/repo
+retro projects rename github.com/example/repo "Example"
+```
+
+Excluded sessions remain in raw, normalized, and catalog evidence but do not
+feed mining, memory reindexing, or task-scorer selection. Use
+`retro mine ... --include-excluded` only for an explicit diagnostic override.
+GhostLab's originator/UUID filter prevents newly marked synthetic sessions
+from being captured at all; catalog rules handle historical and unmarked test
+traffic. See [`specs/rollout_catalog_spec.md`](specs/rollout_catalog_spec.md).
+
+---
+
 ## Signals
 
-Signals are evaluators that observe a captured rollout and emit a comparable reading (numeric / boolean / categorical). They answer: *"how did this rollout go, by some objective measure?"*
+Signals are evaluators that observe a captured rollout and emit a comparable
+value (number / boolean / category). They answer *"how did this rollout go, by
+some objective measure?"*, and they are derived backwards from the decisions the
+archive exists to support: which agent/model/client to use for which work, where
+time and money go, where agents struggle, which steering habits to change,
+whether a session succeeded, what was risky, and whether the data is trustworthy.
 
-Signals are grouped by intent, not implementation:
+Each session is scanned **once** into a `SessionProfile` of facts; every signal is
+then a pure read over that profile. Signals are organized by category:
 
-| Group      | Question answered                       | Examples |
-| ---------- | --------------------------------------- | -------- |
-| `activity` | What did the agent do?                  | `command_count`, `unique_files_edited`, `web_search_count` |
-| `outcome`  | Did the work land?                      | `git_commits_made_during`, `failed_command_ratio`, `user_satisfaction_lexical` |
-| `cost`     | What did it cost (effort/tokens/time)?  | `session_duration_seconds`, `user_correction_count`, `time_to_first_edit_seconds` |
-| `risk`     | How trustworthy was the capture/work?   | `unknown_event_count`, `capture_gap_signal`, `secret_exposure_signal` |
+| Category | Question answered | Examples |
+| --- | --- | --- |
+| `usage` | What did it consume? | `usage.cost_usd`, `usage.tokens_total`, `usage.active_s`, `usage.credits` |
+| `activity` | What did the agent do? | `activity.user_turns`, `activity.tool_calls`, `activity.file_edits` |
+| `outcome` | Did the work land? | `outcome.status`, `outcome.validated`, `outcome.committed` |
+| `friction` | Where did it get stuck? | `friction.tool_error_rate`, `friction.user_corrections`, `friction.longest_error_streak` |
+| `efficiency` | What did it cost per unit of work? | `efficiency.cost_per_edit`, `efficiency.cache_read_share` |
+| `collaboration` | How did the human steer? | `collaboration.first_prompt_chars`, `collaboration.reply_latency_s` |
+| `risk` | What could hurt? | `risk.secret_exposure`, `risk.destructive_commands` |
+| `quality` | Can the numbers be trusted? | `quality.capture_score`, `quality.cost_basis`, `quality.usage_source` |
+| `work` | What kind of work was it? | `work.kind`, `work.primary_language`, `work.validation_commands` |
 
-Methods: `heuristic` (pure event walk), `regex` (text patterns), `external` (touches the world — e.g. `git log`). `llm_judge` is reserved for later.
+Every signal carries id, title, category, kind, unit, polarity, method, version,
+description and applicability, plus per-session evidence (`event_id`s) and
+confidence. Methods: `exact` (direct reading), `heuristic` (rules over facts),
+`regex` (text patterns), `llm` (reserved, unused).
+
+See `specs/rollout_signals_spec.md` for every algorithm, threshold, known bias
+and the hand-label validation numbers.
 
 ### Commands
 
 ```bash
 # Inventory of registered signals
 retro signal list
-retro signal list --group outcome
+retro signal list --category outcome --describe
 
-# Compute signals for every imported session
+# Update signals/sessions.jsonl (incremental: only changed sessions are recomputed)
 retro signal run
+retro signal run --force
 
-# Restrict scope
+# Restrict scope (keeps the rest of the store intact)
 retro signal run --host claude
 retro signal run --host codex --session-id <id>
-retro signal run --signal git_commits_made_during,failed_command_ratio
 
-# Inspect readings for one session
+# Inspect one session, or aggregate across all of them
 retro signal show claude <session-id>
-retro signal show codex  <thread-id>
+retro signal summary
+retro signal summary --signal outcome.status,usage.cost_usd --json
 ```
 
 ### Output
 
-- `rollout-memory/signals/readings.jsonl` — one row per `(session, signal)` reading.
-- `rollout-memory/signals/aggregates.json` — per-signal cross-session aggregates (mean / median / p90 / sum / histogram).
-- `rollout-memory/signals/summary.md` — human view.
+- `rollout-memory/signals/definitions.json` — the registered signal set and a
+  digest of it (`{"schema": 2, "version": "…", "signals": [...]}`).
+- `rollout-memory/signals/sessions.jsonl` — one line per evaluated session:
+  `{"key", "fingerprint", "version", "values", "evidence", "confidence"}`.
 
-Each reading carries `evidence_refs` (event_ids), `confidence`, and a `method` tag so it can be traced back to the rollout. External signals (e.g. `git_commits_made_during`) emit a `null` reading with a `reason` field when their context is missing (cwd gone, not a git repo) rather than silently skipping.
+A session is recomputed only when its catalog fingerprint changes or the signal
+set changes; a signal that does not apply is omitted rather than stored as a
+zero. On the reference archive the store is ~2 MB for 1,651 sessions and a
+no-change update takes well under a second.
 
 ### Adding a new signal
 
 ```python
-from retro.signals.base import SessionContext, reading, register
+from retro.signals import SessionProfile, SignalValue, register
 
-@register("my_signal", group="outcome", kind="boolean",
-          method="heuristic", description="…")
-def _my_signal(ctx: SessionContext):
-    return reading(ctx, _my_signal, value=True, evidence=[some_event])
+@register(
+    "friction.my_signal",
+    title="My signal",
+    category="friction",
+    kind="count",
+    unit="count",
+    polarity="lower_better",
+    description="What it measures and how.",
+)
+def _my_signal(profile: SessionProfile):
+    return SignalValue(len(profile.error_events), tuple(profile.error_events[:5]))
 ```
 
-`retro signal list`/`run`/`show` and the dashboard pick it up automatically.
+Register it in `src/retro/signals/definitions.py`; `retro signal list`/`run`/
+`show` and the dashboard pick it up automatically. Bump a signal's `version`
+whenever its algorithm changes — that invalidates the stored values.
 
 ---
 
@@ -473,6 +609,9 @@ retro mine codex <thread-id> --method all       --filter risk_aware
 retro mine '*' '*' --method all --filter risk_aware
 retro mine codex  '*' --method skill_pro
 retro mine claude '*' --method memp_procedural --all
+
+# Explicit diagnostic override for a catalog-excluded session
+retro mine codex <thread-id> --include-excluded
 ```
 
 ### Output
@@ -785,24 +924,26 @@ Optional embeddings are still intentionally out of the core path for now; keywor
 
 ## Dashboard
 
-A static, local HTML dashboard reads everything under `rollout-memory/` and produces:
+A static, offline dashboard over the session catalog and the signal store — no server, no
+bundler, no network. It opens straight from disk.
 
-- KPI strip (sessions, days, events, tool calls, tokens, est. cost).
-- Signals panel (color-coded by group, per-signal aggregates across sessions).
-- Activity-by-day bars.
-- Searchable / filterable session table.
-- Per-session drill-down with tabs: **Summary**, **Models**, **Signals**, **Transcript**, **Memory**.
-- Indexed memory sections for counts, top utility, lifecycle events, and source-session drill-downs when `retro memory reindex` has been run.
+| Page | Answers |
+| --- | --- |
+| Overview | What happened recently across all agents and projects, versus the previous period: sessions, active hours, estimated cost, outcome mix, work-kind mix, notable movers, streak |
+| Projects | Which projects cost time and money; one row per consolidated project (worktrees, clones and symlinked paths collapse into one), with the per-agent split, success rate, tool error rate and last activity |
+| Sessions | Every captured session, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable and virtualized for tens of thousands of rows, with toggles for excluded sessions and subagent roll-up |
+| Session | One session: header, tags and why each was applied, inline markers, signals grouped by category with evidence event ids, the subagent tree, and links to the transcript, normalized events and raw capture in the archive |
+| Signals | Every signal in `signals/definitions.json` with its distribution, compared across agents, clients, projects, models or work kinds with a minimum-sample guard |
+| Data quality | Why sessions were excluded (by tag and rule, with examples), interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run with its failures |
 
-The **Models** tab shows the per-model token + cost breakdown (input / cache_create / cache_read / output / total / cost) for each session.
+The build reads only derived files — `catalog/sessions.jsonl`, `signals/definitions.json`,
+`signals/sessions.jsonl` and the newest `sync/runs/*.json` — never the normalized event
+stream, so it stays fast as the archive grows. Rendered transcripts are linked in place and
+never copied.
 
-Portfolio totals and host/day aggregates cover every normalized session. To
-keep large archives responsive, the interactive table carries the 1,000 newest
-session details and the memory browser carries the 2,000 highest-ranked
-candidates. The table reports this explicitly as “showing N of total.”
-Transcripts are linked from the archive and loaded only when requested from a
-session's **Transcript** tab; they are not duplicated into every dashboard
-generation. Atomic publication retains the current and previous generations.
+Session rows are shipped as a compact fact table in `data/sessions-*.js` shards; the browser
+does the slicing and aggregation. Per-session detail lives in hashed buckets that are rebuilt
+only when a session's catalog fingerprint changes. `index.html` is a two-kilobyte shell.
 
 ### Preview
 
@@ -813,30 +954,27 @@ generation. Atomic publication retains the current and previous generations.
 ### Build
 
 ```bash
-# Default mode: auto (use embedded cost when present, else compute from tokens)
+# Build and publish a new generation (reuses unchanged detail shards)
 retro dashboard build
 
-# Force recomputation from token counts
-retro dashboard build --mode calculate
+# Rebuild every shard
+retro dashboard build --mode full
 
-# Show only provider-embedded costUSD; None when missing
-retro dashboard build --mode display
-
-# Build from a non-default artifact root / to a non-default output directory
+# Build from a non-default archive / into a non-default output directory
 retro dashboard build --root /path/to/rollout-memory --out /path/to/output
 
-# Module form (the builder ships inside the package; works from any install)
-RETRO_COST_MODE=calculate python -m retro.dashboard_build
-python -m retro.dashboard_build --artifact-root /path/to/rollout-memory
-
-# Experimental: trajectory-signals page (trajectory_experiments.html)
-retro dashboard experiments
+# Write straight into --out without the generation swap
+retro dashboard build --no-publish
 ```
 
-The artifact root and dashboard output come from the per-user config. Override
-either for one command with `--root` and `--out`.
+The archive root and dashboard output come from the per-user config; override either for one
+command with `--root` and `--out`. Then open the configured `dashboard/index.html` directly
+from disk. Each build stages into a temporary directory and swaps the `current` symlink
+atomically, keeping at most two generations.
 
-Then open the configured `dashboard/index.html` directly from disk.
+```bash
+retro dashboard view     # the same data in the terminal
+```
 
 ### Cost computation
 
@@ -931,14 +1069,17 @@ src/retro/
   storage.py             # artifact layout
   cli.py                 # Typer CLI (`retro`)
   renderer.py            # Markdown view
-  analyzer.py            # command/tool pattern analysis + operator diagnostics
   memory_store.py        # SQLite memory index (FTS5, wiki-links, weave)
   llm.py                 # headless `codex exec` helper
-  quest.py               # daily quests / streak progression (experimental)
-  trajectory.py          # trajectory extraction for experimental signals
-  dashboard_build.py     # static HTML + rollouts.json builder (`retro dashboard build`)
-  dashboard_experiments.py  # trajectory-signals page (experimental)
-  dashboard_terminal.py  # interactive terminal dashboard (`retro dashboard view`)
+  dashboard/
+    inputs.py            # readers for catalog/, signals/, sync/runs/
+    facts.py             # fact table, signal matrix, quality aggregates
+    metrics.py           # shared aggregation helpers
+    shards.py            # data/*.js shard writers + detail bucket cache
+    build.py             # build orchestration
+    publish.py           # atomic generation publication
+    terminal.py          # interactive terminal view (`retro dashboard view`)
+    assets/              # index.html, app.css, core.js, views.js, app.js
   pricing/
     litellm-pricing.json # bundled LiteLLM rates snapshot
   importers/
@@ -946,8 +1087,12 @@ src/retro/
     claude.py            # Claude Code transcript reader (multi-root + env override)
     codex.py             # Codex SQLite + JSONL reader (multi-root)
   signals/
-    base.py, runner.py, heuristics.py, external.py
-    trajectory.py        # experimental trajectory signals
+    profile.py           # one scan per session -> SessionProfile of facts
+    usage.py, pricing.py # per-host token accounting + model rates
+    commands.py, patterns.py, classify.py   # command/text understanding, outcome + work kind
+    registry.py, definitions.py             # signal metadata + the catalogue
+    store.py, sources.py, summary.py        # incremental store, inputs, aggregation
+    analyze.py           # cross-session command/tool report (`retro analyze`)
   mining/
     base.py              # MemoryCandidate, MiningResult, registries
     render.py            # prompt-block markdown rendering + write helpers
@@ -960,11 +1105,8 @@ src/retro/
       risk_aware.py      # prune high-risk / low-confidence / near-duplicates
 
 dashboard/
-  build_dashboard.py     # back-compat shim → retro.dashboard_build
   pricing/refresh.py     # refresh the bundled snapshot from upstream LiteLLM
   README.md
-  index.html             # generated
-  data/rollouts.json     # generated
 
 specs/                    # design docs (see top of this README)
 rollout-memory/          # captured artifacts (gitignored)

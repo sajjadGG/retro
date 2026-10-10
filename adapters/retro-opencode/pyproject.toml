@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retro-opencode"
-version = "0.1.0"
+version = "0.1.1"
 description = "OpenCode session source adapter for Retro"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["retro-ai>=0.4.0,<0.5"]
+dependencies = ["retro-ai>=0.4.0,<0.6"]
 
 [project.optional-dependencies]
 dev = [

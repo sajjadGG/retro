@@ -32,6 +32,9 @@ EventType = Literal[
     "permission",
     "attachment",
     "reasoning",
+    "usage",
+    "lifecycle",
+    "metadata",
     "unknown",
 ]
 BuiltinHost = Literal["claude-code", "codex", "vscode-copilot"]

@@ -1,22 +1,35 @@
 """Source extension runtime and built-in provider adapters."""
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import tempfile
+import time
 import uuid
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import user_state_dir
+from .importers.base import has_only_repo_state_capture
 from .importers.claude import ClaudeImporter
 from .importers.codex import CodexImporter
 from .importers.copilot import CopilotImporter
-from .importers.copilot_cli import CopilotCliSession
-from .importers.vscode_copilot import CopilotSession as VscodeCopilotSession
-from .locking import exclusive_lock
+from .importers.copilot_cli import (
+    CopilotCliSession,
+)
+from .importers.copilot_cli import (
+    _capture_fingerprint as _copilot_cli_fingerprint,
+)
+from .importers.vscode_copilot import (
+    CopilotSession as VscodeCopilotSession,
+)
+from .importers.vscode_copilot import (
+    _capture_fingerprint as _vscode_copilot_fingerprint,
+)
+from .locking import archive_lock
 from .schema import Host, validate_host_id, validate_session_id
 from .sdk.registry import (
     EXTENSION_API_VERSION,
@@ -34,6 +47,11 @@ _BUILTIN_ALIASES = {
     "vscode": "vscode-copilot",
     "gh-copilot": "vscode-copilot",
 }
+STALE_IMPORT_SECONDS = 24 * 60 * 60
+_RAW_BACKUP_RE = re.compile(r"\.(?P<session>[A-Za-z0-9][A-Za-z0-9._-]*)\.backup-(?P<suffix>[0-9a-f]{32})")
+_NORMALIZED_BACKUP_RE = re.compile(
+    r"\.(?P<session>[A-Za-z0-9][A-Za-z0-9._-]*)\.events\.jsonl\.backup-(?P<suffix>[0-9a-f]{32})"
+)
 
 
 class ClaudeSource:
@@ -45,22 +63,27 @@ class ClaudeSource:
         self.importer = ClaudeImporter(layout, **kwargs)
 
     def discover(self) -> list[SessionDescriptor]:
-        return [
-            SessionDescriptor(
-                host=self.host,
-                session_id=session.session_id,
-                title=session.project_slug,
-                cwd=session.cwd or None,
-                updated_at=session.mtime,
-                source_path=session.transcript_path,
-                metadata={
-                    "project_slug": session.project_slug,
-                    "size_bytes": session.size_bytes,
-                    "raw_filename": "transcript.jsonl",
-                },
+        descriptors = []
+        for session in self.importer.discover():
+            stat = session.transcript_path.stat()
+            descriptors.append(
+                SessionDescriptor(
+                    host=self.host,
+                    session_id=session.session_id,
+                    title=session.project_slug,
+                    cwd=session.cwd or None,
+                    updated_at=session.mtime,
+                    source_path=session.transcript_path,
+                    metadata={
+                        "project_slug": session.project_slug,
+                        "size_bytes": session.size_bytes,
+                        "raw_filename": "transcript.jsonl",
+                        "source_mtime_ns": stat.st_mtime_ns,
+                        "source_size_bytes": stat.st_size,
+                    },
+                )
             )
-            for session in self.importer.discover()
-        ]
+        return descriptors
 
     def import_session(self, *, identifier: str, force: bool = False) -> ImportResult:
         return self.importer.import_session(identifier=identifier, force=force)
@@ -75,22 +98,27 @@ class CodexSource:
         self.importer = CodexImporter(layout, **kwargs)
 
     def discover(self) -> list[SessionDescriptor]:
-        return [
-            SessionDescriptor(
-                host=self.host,
-                session_id=thread.thread_id,
-                title=thread.display_title,
-                cwd=thread.cwd or None,
-                updated_at=thread.updated_at,
-                source_path=thread.rollout_path,
-                metadata={
-                    "model_provider": thread.model_provider,
-                    "source_kind": thread.source_kind,
-                    "raw_filename": "rollout.jsonl",
-                },
+        descriptors = []
+        for thread in self.importer.discover():
+            stat = thread.rollout_path.stat()
+            descriptors.append(
+                SessionDescriptor(
+                    host=self.host,
+                    session_id=thread.thread_id,
+                    title=thread.display_title,
+                    cwd=thread.cwd or None,
+                    updated_at=thread.updated_at,
+                    source_path=thread.rollout_path,
+                    metadata={
+                        "model_provider": thread.model_provider,
+                        "source_kind": thread.source_kind,
+                        "raw_filename": "rollout.jsonl",
+                        "source_mtime_ns": stat.st_mtime_ns,
+                        "source_size_bytes": stat.st_size,
+                    },
+                )
             )
-            for thread in self.importer.discover()
-        ]
+        return descriptors
 
     def import_session(self, *, identifier: str, force: bool = False) -> ImportResult:
         return self.importer.import_session(identifier=identifier, force=force)
@@ -110,11 +138,14 @@ class CopilotSource:
             if isinstance(session, CopilotCliSession):
                 source_path = session.events_path
                 raw_filename = "events.jsonl"
+                fingerprint = _copilot_cli_fingerprint(session)
             elif isinstance(session, VscodeCopilotSession):
                 source_path = session.session_path
                 raw_filename = f"session.{session.core_format}"
+                fingerprint = _vscode_copilot_fingerprint(session)
             else:
                 raise TypeError(f"unsupported Copilot session type: {type(session).__name__}")
+            primary_stat = source_path.stat()
             descriptors.append(
                 SessionDescriptor(
                     host=self.host,
@@ -128,6 +159,10 @@ class CopilotSource:
                         "workspace_name": session.workspace_name,
                         "models": list(session.models),
                         "raw_filename": raw_filename,
+                        "source_mtime_ns": fingerprint[0],
+                        "source_size_bytes": fingerprint[1],
+                        "primary_mtime_ns": primary_stat.st_mtime_ns,
+                        "primary_size_bytes": primary_stat.st_size,
                     },
                 )
             )
@@ -234,6 +269,7 @@ class SourceHandle:
         self.layout = layout
         self.provider_kwargs = dict(provider_kwargs or {})
         self._adapter: Any = None
+        self._descriptors: dict[str, SessionDescriptor] = {}
 
     @property
     def host(self) -> Host:
@@ -267,6 +303,7 @@ class SourceHandle:
                 raise ValueError(
                     f"{self.host} discover() returned descriptor for {session.host!r}"
                 )
+        self._descriptors = {session.session_id: session for session in sessions}
         return sessions
 
     def import_session(
@@ -275,15 +312,39 @@ class SourceHandle:
         identifier: str,
         force: bool = False,
         acquire_lock: bool = True,
+        descriptor: SessionDescriptor | None = None,
     ) -> ImportResult:
         validate_session_id(identifier)
+        selected = descriptor or self._descriptors.get(identifier)
+        if selected is None:
+            selected = next(
+                (
+                    session
+                    for session in self.discover()
+                    if session.session_id == identifier
+                ),
+                None,
+            )
         lock = (
-            exclusive_lock(user_state_dir() / "archive.lock")
+            archive_lock(self.layout)
             if acquire_lock
             else nullcontext()
         )
         with lock:
-            return self._stage_and_publish(identifier=identifier, force=force)
+            if (
+                selected is not None
+                and not force
+                and _descriptor_is_unchanged(self.layout, selected)
+            ):
+                raise FileExistsError(
+                    f"Raw capture already exists at "
+                    f"{self.layout.raw_dir(self.host, identifier)} "
+                    "(pass force=True to overwrite)"
+                )
+            return self._stage_and_publish(
+                identifier=identifier,
+                force=force,
+            )
 
     def _stage_and_publish(self, *, identifier: str, force: bool) -> ImportResult:
         self.layout.ensure()
@@ -304,6 +365,7 @@ class SourceHandle:
                 staged_raw.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(target_raw, staged_raw)
             adapter = self._instantiate(staging_layout)
+            _share_discovery_state(self._live_adapter(), adapter)
             result = adapter.import_session(identifier=identifier, force=force)
             _validate_staged_result(
                 result,
@@ -343,6 +405,164 @@ def create_source(
         layout,
         provider_kwargs,
     )
+
+
+def cleanup_stale_import_staging(
+    layout: Layout,
+    *,
+    older_than_seconds: int = STALE_IMPORT_SECONDS,
+    now: float | None = None,
+) -> list[Path]:
+    if not layout.root.is_dir():
+        return []
+    cutoff = (time.time() if now is None else now) - older_than_seconds
+    removed: list[Path] = []
+    for path in layout.root.glob(".retro-import-*"):
+        try:
+            stale = path.is_dir() and not path.is_symlink() and path.stat().st_mtime < cutoff
+        except OSError:
+            continue
+        if stale:
+            shutil.rmtree(path)
+            removed.append(path)
+    return removed
+
+
+def recover_interrupted_publications(layout: Layout) -> list[str]:
+    """Restore archive pairs left half-published by a killed capture.
+
+    `_publish_capture` parks the previous raw directory and normalized file under
+    `.<name>.backup-<suffix>` before installing the staged pair. When both targets
+    exist the publication finished and the backups are leftovers; when either is
+    missing the pair is rolled back to the backups so raw and normalized agree.
+    """
+    recovered: list[str] = []
+    raw_root = layout.root / "raw"
+    normalized_root = layout.root / "normalized"
+    groups: dict[tuple[str, str, str], dict[str, Path]] = {}
+    for kind, root, suffix_pattern in (
+        ("raw", raw_root, _RAW_BACKUP_RE),
+        ("normalized", normalized_root, _NORMALIZED_BACKUP_RE),
+    ):
+        if not root.is_dir():
+            continue
+        for host_dir in root.iterdir():
+            if not host_dir.is_dir() or host_dir.name.startswith("."):
+                continue
+            for path in host_dir.glob(".*.backup-*"):
+                match = suffix_pattern.fullmatch(path.name)
+                if match is None:
+                    continue
+                key = (host_dir.name, match.group("session"), match.group("suffix"))
+                groups.setdefault(key, {})[kind] = path
+    for (host, session_id, _suffix), backups in sorted(groups.items()):
+        target_raw = raw_root / host / session_id
+        target_normalized = normalized_root / host / f"{session_id}.events.jsonl"
+        raw_backup = backups.get("raw")
+        normalized_backup = backups.get("normalized")
+        complete = (raw_backup is None or target_raw.exists()) and (
+            normalized_backup is None or target_normalized.exists()
+        )
+        if not complete:
+            if raw_backup is not None:
+                if target_raw.exists():
+                    _remove_path(target_raw)
+                os.replace(raw_backup, target_raw)
+            if normalized_backup is not None:
+                if target_normalized.exists():
+                    _remove_path(target_normalized)
+                os.replace(normalized_backup, target_normalized)
+            recovered.append(f"{host}/{session_id}")
+        else:
+            for backup in (raw_backup, normalized_backup):
+                if backup is not None:
+                    _remove_path(backup)
+    return recovered
+
+
+def _descriptor_is_unchanged(
+    layout: Layout,
+    descriptor: SessionDescriptor,
+) -> bool:
+    raw_dir = layout.raw_dir(descriptor.host, descriptor.session_id)
+    if not raw_dir.is_dir() or has_only_repo_state_capture(raw_dir):
+        return False
+    if not layout.normalized_path(descriptor.host, descriptor.session_id).is_file():
+        return False
+    fingerprint = _descriptor_fingerprint(descriptor)
+    if fingerprint is None:
+        return False
+
+    meta_path = raw_dir / "import_meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return False
+        previous_mtime = meta.get("captured_mtime_ns")
+        previous_size = meta.get("captured_size_bytes")
+        if isinstance(previous_mtime, int) and isinstance(previous_size, int):
+            return (
+                fingerprint[0] <= previous_mtime
+                and fingerprint[1] <= previous_size
+            )
+
+    raw_filename = descriptor.metadata.get("raw_filename")
+    if not isinstance(raw_filename, str):
+        return False
+    captured = raw_dir / raw_filename
+    try:
+        stat = captured.stat()
+    except OSError:
+        return False
+    return fingerprint[0] <= stat.st_mtime_ns and fingerprint[1] <= stat.st_size
+
+
+def _descriptor_fingerprint(
+    descriptor: SessionDescriptor,
+) -> tuple[int, int] | None:
+    mtime = descriptor.metadata.get("source_mtime_ns")
+    size = descriptor.metadata.get("source_size_bytes")
+    if isinstance(mtime, int) and isinstance(size, int):
+        if descriptor.source_path is not None:
+            try:
+                current = descriptor.source_path.stat()
+            except OSError:
+                return None
+            primary_mtime = descriptor.metadata.get("primary_mtime_ns", mtime)
+            primary_size = descriptor.metadata.get("primary_size_bytes", size)
+            if (
+                isinstance(primary_mtime, int)
+                and isinstance(primary_size, int)
+                and (
+                    current.st_mtime_ns > primary_mtime
+                    or current.st_size > primary_size
+                )
+            ):
+                return (
+                    max(mtime, current.st_mtime_ns),
+                    size + max(0, current.st_size - primary_size),
+                )
+        return mtime, size
+    if descriptor.source_path is None:
+        return None
+    try:
+        stat = descriptor.source_path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _share_discovery_state(source: Any, target: Any) -> None:
+    if type(source) is not type(target):
+        return
+    if hasattr(source, "_discover_cache") and hasattr(target, "_discover_cache"):
+        target._discover_cache = source._discover_cache
+    for name in ("importer", "vscode", "agent_host"):
+        source_child = getattr(source, name, None)
+        target_child = getattr(target, name, None)
+        if source_child is not None and target_child is not None:
+            _share_discovery_state(source_child, target_child)
 
 
 def _validate_staged_result(

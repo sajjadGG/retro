@@ -263,7 +263,7 @@ Each normalized event should include:
   "sequence": 123,
   "parent_event_id": "optional",
   "actor": "user|assistant|tool|system|subagent|hook",
-  "event_type": "message|tool_call|tool_result|file_read|file_edit|command|error|session_start|session_end|subagent_start|subagent_end|compaction|permission|unknown",
+  "event_type": "message|tool_call|tool_result|file_read|file_edit|command|error|session_start|session_end|subagent_start|subagent_end|compaction|permission|attachment|reasoning|usage|lifecycle|metadata|unknown",
   "summary": "short human-readable label",
   "raw_ref": {
     "path": "raw file path",
@@ -289,6 +289,173 @@ For human reading, generate a markdown transcript from normalized events:
 - mining summary links.
 
 Markdown is a view, not the source of truth.
+
+## Normalization Fidelity V2
+
+`attachment` means content injected into the model context. `usage` is token or
+cost telemetry, `lifecycle` is a content-free state transition, and `metadata`
+is a non-conversational state snapshot or update. A tool invocation can use a
+specialized call type (`command`, `file_read`, or `file_edit`), but every
+ordinary completion is `tool_result`. Both sides carry `payload.call_id`, and a
+completion's `parent_event_id` points to its normalized call. Subagent
+lifecycle uses `subagent_start` and `subagent_end`.
+
+Host payload values are retained verbatim, but each large value is serialized
+only once. Multi-part messages distribute their source parts across normalized
+events instead of copying the complete source record into every part. Normalized
+aliases are limited to small linkage/status fields such as `call_id`,
+`success`, and `exit_code`; text, input, and output stay under their original
+host keys. `retro.utils.event_text`, `event_tool_input`, and
+`event_tool_output` provide shape-independent access. Duplicate host
+representations use a small metadata pointer to the canonical normalized event;
+the complete duplicate remains available through `raw_ref`.
+
+When a raw record lacks a timestamp, the nearest preceding timestamp is copied
+and `payload.timestamp_inferred` is `true`. A record before the first timestamp
+remains untimestamped. No following timestamp is backfilled.
+
+### Codex mapping
+
+| Raw record | Normalized type | Notes |
+| --- | --- | --- |
+| `session_meta` | `session_start` | Detects `parent_thread_id`, `agent_path`, or subagent source metadata and attributes that session's agent events to `subagent`. |
+| `turn_context` | `metadata` | Turn model, cwd, policy, and instruction snapshot. |
+| `world_state` | `metadata` | Preserves the complete world-state payload. |
+| `compacted` | `compaction` | `lifecycle=compaction_complete`. |
+| `inter_agent_communication_metadata` | `metadata` | Actor is `subagent`. |
+| `event_msg.user_message` | `message` | Actor is `user`, or `subagent` in a child session. |
+| `event_msg.agent_message` | `message` | Actor is `assistant` or `subagent`. Duplicate host representations become filtered `metadata`. |
+| `event_msg.agent_reasoning` | `reasoning` | Source `text` is retained without a second text alias. |
+| `event_msg.task_started`, `task_complete` | `lifecycle` | `lifecycle=task_started|task_complete`. |
+| `event_msg.token_count` | `usage` | Original `info` and `rate_limits` shapes are unchanged. |
+| `event_msg.patch_apply_end`, `exec_command_end`, `mcp_tool_call_end`, `web_search_end` | `tool_result` | Normalizes call ID, output, success/error, and exit code when present. |
+| `event_msg.item_completed` | `lifecycle` | Host item acknowledgement; filtered from transcripts by default. |
+| `event_msg.thread_settings_applied` | `metadata` | Preserves the complete settings snapshot. |
+| `event_msg.context_compacted` | `compaction` | `lifecycle=compaction_complete`. |
+| `event_msg.sub_agent_activity` | `subagent_start`, `subagent_end`, or `lifecycle` | `started`/terminal kinds use the existing subagent types; other activity uses `lifecycle`. |
+| `event_msg.turn_aborted`, `thread_rolled_back` | `lifecycle` | Interruption/rollback reason remains in the payload. |
+| `response_item.message` | `message`, `attachment`, or `metadata` | Developer content is injected `attachment`; user/assistant content is `message`; duplicate host copies are compact metadata pointers. |
+| `response_item.reasoning` | `reasoning` | Keeps plaintext summary/content and encrypted envelope. |
+| `response_item.function_call`, `custom_tool_call` | specialized call or `tool_call` | `exec_command`/`shell` → `command`; `apply_patch` → `file_edit`; read tools → `file_read`. |
+| `response_item.function_call_output`, `custom_tool_call_output` | `tool_result` | Linked to the call by `call_id` and `parent_event_id`. |
+| `response_item.web_search_call`, `tool_search_call` | `tool_call` | Uses the source ID only when the host omitted a call ID. |
+| `response_item.tool_search_output` | `tool_result` | Linked to `tool_search_call`. |
+| `response_item.agent_message` | `message` | Actor follows the source `author` path (`/root` vs child agent). |
+| Any unlisted top-level or payload kind | `unknown` | Complete source payload is retained and reported as a capture gap. |
+
+Codex message mirrors are compacted only when records share an explicit source
+item ID, or when adjacent `event_msg`/`response_item` representations have the
+same actor and text with compatible turn and phase IDs. Text equality elsewhere
+in the session is never sufficient: repeated prompts or answers in later turns
+remain independent `message` events.
+
+### Claude Code mapping
+
+| Raw record | Normalized type | Notes |
+| --- | --- | --- |
+| Synthetic first/last boundaries | `session_start`, `session_end` | Boundaries reference the first/last transcript line and carry cwd. |
+| `user` string/text | `message` | `isMeta=true` is injected `attachment`; `isSidechain=true` is attributed to `subagent`. |
+| `user` `tool_result` block | `tool_result` | Always a result regardless of call specialization; includes `toolUseResult`, normalized status, call ID, and exact call parent. |
+| `user` image block | `attachment` | Image envelope is retained. |
+| `assistant` text | `message` | Sidechain output is attributed to `subagent`. |
+| `assistant` thinking | `reasoning` | Sidechain reasoning is attributed to `subagent`. |
+| `assistant` `tool_use` | specialized call or `tool_call` | Read/Edit/Write/Notebook/Bash tools use `file_read`/`file_edit`/`command`. |
+| `attachment` | `attachment` | Includes reminders, deferred tools, environment/instructions, skills, queued commands, dates, model/session context, and other injected context. |
+| `permission-mode` | `permission` | Preserves the permission mode record. |
+| `mode` | `lifecycle` | `lifecycle=mode_change`. |
+| `queue-operation` | `lifecycle` | `lifecycle=queue_enqueue|queue_dequeue|queue_remove`. |
+| `cost-state` | `usage` | Preserves cost, duration, line, and per-model token fields. |
+| `last-prompt`, `ai-title`, `file-history-snapshot`, `file-history-delta`, `pr-link` | `metadata` | Cached prompt/title/file/PR state, not injected content. |
+| `bridge-session`, `atis-latch`, `agent-name`, `worktree-state`, `frame-link` | `metadata` | Actor is `subagent` for `agent-name`, otherwise `system`. |
+| `system.local_command` | `command` | Preserves slash-command markup. |
+| `system.turn_duration` | `lifecycle` | `lifecycle=turn_end`. |
+| `system.stop_hook_summary` | `lifecycle` | Actor `hook`, `lifecycle=hook_end`. |
+| `system.scheduled_task_fire` | `lifecycle` | Scheduled wake-up transition. |
+| `system.away_summary` | `attachment` | Recap injected when resuming. |
+| `system.informational` | `message` | User-visible host notice. |
+| `system.api_error` | `error` | Preserves retry and structured connection fields. |
+| Any unlisted record or content-block kind | `unknown` | Complete source record is retained and reported. |
+
+All currently observed Claude attachment subtypes remain `attachment`:
+`total_tokens_reminder`, `task_reminder`, `edited_text_file`,
+`deferred_tools_record`, `queued_command`, `skill_listing`,
+`deferred_tools_delta`, `environment`, `agent_listing_delta`,
+`mcp_instructions_delta`, `date_change`, `silent_turn_reminder`,
+`command_permissions`, `date`, `todo_reminder`, `prompt_snapshot`,
+`auto_mode`, `plan_mode`, `plan_mode_exit`, `model`, `session_context`,
+`instructions`, `credential_org`, `remote_session_change`, and
+`hook_system_message`.
+
+### Copilot CLI / VS Code Agent Host mapping
+
+| Raw record | Normalized type | Notes |
+| --- | --- | --- |
+| `session.start`, `session.shutdown` | `session_start`, `session_end` | Shutdown payload retains aggregate usage and code-change metrics. |
+| `session.resume` | `lifecycle` | `lifecycle=session_resume`. |
+| `user.message` | `message` | No source means user-authored. `agent-*` is actor `subagent`; `skill-*`, system content, and autopilot continuations are injected `attachment`; empty system steering is `lifecycle`. |
+| `assistant.message` | `message`, `reasoning`, and calls | Chunk streams are independently reassembled. Empty encrypted messages remain `attachment`; empty non-content envelopes are `metadata`. |
+| `assistant.turn_start`, `assistant.turn_end` | `lifecycle` | Actor follows `agentId`/parent tool attribution. |
+| `tool.execution_start` | specialized call or `tool_call` | Call payload includes arguments and stable call ID. Subagent tool invocation remains a call because separate subagent lifecycle records exist. |
+| `tool.execution_complete` | `tool_result` | Parent is the exact call; normalizes success/error and `shellExecution.exitCode`. |
+| `external_tool.requested`, `external_tool.completed` | call / `tool_result` | Request ID is resolved to the source tool call ID on both sides. |
+| `permission.requested`, `permission.completed`, `session.permissions_changed` | `permission` | Completion links to the corresponding tool call when available. |
+| `hook.start`, `hook.end` | `lifecycle` | `lifecycle=hook_start|hook_end`; end links to start by invocation ID. |
+| `subagent.started`, `subagent.completed`, `subagent.failed` | `subagent_start`, `subagent_end` | Carries call ID, normalized success/error, model, duration, and token totals. |
+| `subagent.configured`, `subagent.selected`, `subagent.deselected` | `metadata` | Actor is `subagent`; parent follows `agentId` when available. |
+| `session.workspace_file_changed` | `file_edit` | Host-observed workspace mutation. |
+| `session.mode_changed`, `session.task_complete` | `lifecycle` | `lifecycle=mode_change|task_complete`. |
+| `session.model_change`, `session.auto_mode_resolved`, `session.mode_notice_delivered` | `metadata` | Model/routing/mode state without conversational content. |
+| `session.usage_checkpoint` | `usage` | Payload shape remains unchanged for token/cost consumers. |
+| `session.compaction_start`, `session.compaction_complete` | `compaction` | Complete summary and token accounting are retained. |
+| `session.binary_asset` | `attachment` | Binary data is retained; renderers bound displayed JSON. |
+| `skill.invoked` | `attachment` | Full delivered skill content is retained. |
+| `skill.context_delivered_ref` | `attachment` | Reference/prefix/suffix describe injected context. |
+| `skill.invoked_ref` | `metadata` | Invocation metadata without content. |
+| `system.message` | `message` | System-visible conversation content. |
+| `system.notification` | `metadata` | Agent-idle and other host notifications are filtered by default. |
+| `session.error`, `abort` | `error` | Structured error/reason remains in payload. |
+| Any unlisted Agent Host kind | `unknown` | Complete envelope is retained and reported. |
+
+### VS Code Copilot chat mapping
+
+Direct transcript records use the same mappings for `session.start`,
+`user.message`, assistant turns/messages, and tool execution. Unlike Agent
+Host logs, `run_subagent`/`task` transcript calls use `subagent_start` and
+`subagent_end` because no separate lifecycle records exist. Every completion
+is linked directly to its call.
+
+Core snapshot response parts map as follows:
+
+| Core response `kind` | Normalized type |
+| --- | --- |
+| absent string value | `message` |
+| `thinking` | `reasoning` |
+| `toolInvocationSerialized` | specialized call plus `tool_result` when complete |
+| `textEditGroup` | `file_edit` |
+| `codeblockUri`, `inlineReference` | `attachment` |
+| `confirmation` | `permission` |
+| `prepareToolInvocation` | `metadata` |
+| `disabledClaudeHooks`, `mcpServersStarting`, `questionCarousel` | `metadata` |
+| `undoStop` | `lifecycle` |
+| `progressMessage`, `progressTaskSerialized` | `message` |
+| Any other kind | `unknown` |
+
+### Rendering and archived renormalization
+
+Rendered transcripts omit `lifecycle`, `metadata`, usage checkpoints, and
+legacy no-op attachment markers by default. `retro render --include-noise`
+shows them. Tool results render immediately beneath their call, first by
+`parent_event_id` and then by call ID for legacy events.
+
+`retro import renormalize` reads only `raw/`, holds the archive lock, and
+stages/replaces normalized JSONL and rendered Markdown as one per-session
+transaction. `--host`, `--session`, `--since`, `--dry-run`, and `--no-render`
+bound the operation. `normalized/normalizer-index.json` records the per-host
+normalizer version, per-session raw stat fingerprint, renderer version,
+counts, size, and completion time. A session is skipped only when its raw
+fingerprint and both requested derived versions are current. Failures leave
+the previous normalized/rendered pair intact and are reported without stopping
+other sessions.
 
 ## Mining Layer
 

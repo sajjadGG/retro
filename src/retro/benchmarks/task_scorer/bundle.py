@@ -516,13 +516,22 @@ class BundleOutcome:
     code: str | None = None
     detail: str = ""
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, path_root: Path | None = None) -> dict[str, Any]:
+        stored_path: str | None = None
+        if self.path is not None:
+            if path_root is not None:
+                try:
+                    stored_path = self.path.relative_to(path_root).as_posix()
+                except ValueError:
+                    stored_path = str(self.path)
+            else:
+                stored_path = str(self.path)
         return {
             "source_id": self.source_id,
             "host": self.host,
             "session_id": self.session_id,
             "status": self.status,
-            "path": str(self.path) if self.path is not None else None,
+            "path": stored_path,
             "content_sha256": self.content_sha256,
             "code": self.code,
             "detail": self.detail,
@@ -551,11 +560,13 @@ class TasksetBundleReport:
             counts[outcome.status] = counts.get(outcome.status, 0) + 1
         return dict(sorted(counts.items()))
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, path_root: Path | None = None) -> dict[str, Any]:
         return {
             "schema_version": BUNDLE_REPORT_SCHEMA,
             "name": self.name,
-            "sources": [outcome.to_dict() for outcome in self.outcomes],
+            "sources": [
+                outcome.to_dict(path_root=path_root) for outcome in self.outcomes
+            ],
             "counts": {
                 "bundled": len(self.bundled),
                 "skipped": len(self.skipped),
@@ -749,7 +760,13 @@ def bundle_taskset(
     if write:
         report_path = bundle_report_path(layout, name)
         atomic_write_text(
-            report_path, json.dumps(report.to_dict(), indent=2, ensure_ascii=False) + "\n"
+            report_path,
+            json.dumps(
+                report.to_dict(path_root=layout.benchmark_dir(name)),
+                indent=2,
+                ensure_ascii=False,
+            )
+            + "\n",
         )
     return TasksetBundleReport(name=name, outcomes=outcomes, path=report_path)
 

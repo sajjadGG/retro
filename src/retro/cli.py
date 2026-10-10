@@ -9,13 +9,14 @@ Commands:
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import shutil
-import sys
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -54,12 +55,16 @@ from .benchmarks.task_scorer.selection import (
     SourceCandidate,
     select_taskset,
 )
+from .catalog import Catalog, SessionRecord, load_catalog, update_catalog
+from .catalog.cli import projects_app, rules_app, sessions_app
 from .config import (
-    RetroConfig,
     config_path,
     load_config,
     resolve_dashboard_dir,
     save_config,
+    update_config,
+    user_data_dir,
+    user_log_dir,
 )
 from .extensions import (
     SourceHandle,
@@ -69,6 +74,7 @@ from .extensions import (
     extension_records,
     source_host_names,
 )
+from .locking import archive_lock
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -80,10 +86,16 @@ from .mining import (
     write_mining_artifacts,
 )
 from .renderer import render_file
+from .renormalize import parse_since, renormalize_archive
 from .schema import BUILTIN_HOSTS, Host, read_events
 from .sdk import SessionDescriptor
 from .signals import REGISTRY as SIGNAL_REGISTRY
-from .signals import run_signals, write_signal_artifacts
+from .signals import (
+    definitions_version,
+    load_signal_store,
+    summarize,
+    update_signals,
+)
 from .storage import Layout, default_layout
 
 app = typer.Typer(
@@ -129,12 +141,6 @@ memory_app = typer.Typer(
 )
 app.add_typer(memory_app, name="memory")
 
-quest_app = typer.Typer(
-    no_args_is_help=True,
-    help="Manage daily quests and streaks.",
-)
-app.add_typer(quest_app, name="quest")
-
 config_app = typer.Typer(no_args_is_help=True, help="Inspect and update per-user configuration.")
 app.add_typer(config_app, name="config")
 
@@ -149,6 +155,9 @@ extensions_app = typer.Typer(
     help="Inspect built-in and installed source providers.",
 )
 app.add_typer(extensions_app, name="extensions")
+app.add_typer(sessions_app, name="sessions")
+app.add_typer(rules_app, name="rules")
+app.add_typer(projects_app, name="projects")
 
 console = Console()
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -528,6 +537,72 @@ def import_all(
         raise typer.Exit(1)
 
 
+@import_app.command("renormalize")
+def import_renormalize(
+    root: Optional[Path] = typer.Option(None, "--root", help="rollout-memory root"),
+    host: Optional[str] = typer.Option(None, "--host", help="Only rebuild this host"),
+    session_id: Optional[str] = typer.Option(
+        None,
+        "--session",
+        help="Only rebuild this archived session ID",
+    ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help="Only consider raw captures updated at or after this ISO-8601 time",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report outdated sessions without writing derived artifacts",
+    ),
+    no_render: bool = typer.Option(
+        False,
+        "--no-render",
+        help="Rebuild normalized JSONL without rendered markdown",
+    ),
+) -> None:
+    """Rebuild derived events from archived raw captures without touching raw/."""
+    lay = _layout(root)
+    try:
+        host_full = canonical_source_host(host) if host else None
+        since_value = parse_since(since)
+        report = renormalize_archive(
+            lay,
+            host=host_full,
+            session_id=session_id,
+            since=since_value,
+            dry_run=dry_run,
+            render=not no_render,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    action = "would rebuild" if dry_run else "rebuilt"
+    console.print(
+        f"[bold]{action} {report.outdated if dry_run else report.rebuilt}/"
+        f"{report.scanned} archived sessions[/bold]"
+    )
+    console.print(
+        f"  skipped current: {report.skipped:,}  failures: {len(report.failures):,}"
+    )
+    if not dry_run:
+        console.print(
+            f"  events: {report.event_count:,}  unknown: "
+            f"{report.unknown_event_count:,}  rendered: {report.rendered:,}"
+        )
+        rate = report.rebuilt / report.elapsed_seconds if report.elapsed_seconds else 0.0
+        console.print(
+            f"  normalized: {report.normalized_bytes:,} bytes  "
+            f"elapsed: {report.elapsed_seconds:.2f}s  rate: {rate:.2f} sessions/s"
+        )
+    for failure in report.failures:
+        console.print(
+            f"[red]failed {failure.host}/{failure.session_id}: {failure.error}[/red]"
+        )
+    if report.failures:
+        raise typer.Exit(1)
+
+
 def _do_import(
     source: SourceHandle,
     identifier: str,
@@ -561,12 +636,17 @@ def _do_import(
         console.print(f"  rendered:   {dest}  ({n:,} bytes)")
 
     try:
-        from .analyzer import check_operator_diagnostics
+        from .signals import build_profile, session_tips
 
-        events = list(read_events(result.normalized_path))
-        tips = check_operator_diagnostics(events)
-        for tip in tips:
-            console.print(f"[yellow]{tip}[/yellow]")
+        profile = build_profile(
+            key=f"{result.host}/{result.session_id}",
+            host=result.host,
+            session_id=result.session_id,
+            events=list(read_events(result.normalized_path)),
+            raw_dir=result.raw_dir,
+        )
+        for tip in session_tips(profile):
+            console.print(f"[yellow]retro tip:[/yellow] {tip}")
     except Exception as exc:
         console.print(
             f"[yellow]operator diagnostics unavailable: "
@@ -727,6 +807,11 @@ def mine_cmd(
     all_sessions: bool = typer.Option(
         False, "--all", help="Mine all imported normalized sessions for the host"
     ),
+    include_excluded: bool = typer.Option(
+        False,
+        "--include-excluded",
+        help="Mine sessions excluded by the catalog.",
+    ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Mine prompt-time memory from an imported normalized rollout."""
@@ -748,7 +833,15 @@ def mine_cmd(
             )
 
     lay = _layout(root)
-    targets = _mine_targets(lay, host, session_id, all_sessions=all_sessions)
+    with archive_lock(lay):
+        update_catalog(lay)
+    targets = _mine_targets(
+        lay,
+        host,
+        session_id,
+        all_sessions=all_sessions,
+        include_excluded=include_excluded,
+    )
     if not targets:
         console.print("[yellow]No normalized sessions found to mine.[/yellow]")
         raise typer.Exit(0)
@@ -816,6 +909,7 @@ def _mine_targets(
     session_id: str,
     *,
     all_sessions: bool,
+    include_excluded: bool = False,
 ) -> list[tuple[Host, str]]:
     hosts = (
         lay.list_normalized_hosts()
@@ -826,10 +920,32 @@ def _mine_targets(
         targets: list[tuple[Host, str]] = []
         for h in hosts:
             targets.extend((h, sid) for sid in lay.list_normalized(h))
-        return targets
+        return _included_mining_targets(lay, targets, include_excluded)
     if len(hosts) != 1:
         raise typer.BadParameter("When host is *, session_id must be * or --all must be used")
-    return [(hosts[0], session_id)]
+    return _included_mining_targets(
+        lay,
+        [(hosts[0], session_id)],
+        include_excluded,
+    )
+
+
+def _included_mining_targets(
+    lay: Layout,
+    targets: list[tuple[Host, str]],
+    include_excluded: bool,
+) -> list[tuple[Host, str]]:
+    if include_excluded:
+        return targets
+    catalog = load_catalog(lay)
+    return [
+        (host, session_id)
+        for host, session_id in targets
+        if not (
+            (record := catalog.get(f"{host}/{session_id}"))
+            and record.excluded
+        )
+    ]
 
 
 # ---- benchmark ---------------------------------------------------------------
@@ -1513,6 +1629,11 @@ def render_cmd(
     host: str = typer.Argument(..., help="registered or archived host ID"),
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    include_noise: bool = typer.Option(
+        False,
+        "--include-noise",
+        help="Include lifecycle, metadata, and usage telemetry",
+    ),
 ):
     """Re-render markdown from already-imported normalized events."""
     lay = _layout(root)
@@ -1522,7 +1643,7 @@ def render_cmd(
         console.print(f"[red]No normalized events at {normalized}[/red]")
         raise typer.Exit(1)
     dest = lay.rendered_path(host_full, session_id)
-    n = render_file(normalized, dest)
+    n = render_file(normalized, dest, include_noise=include_noise)
     console.print(f"rendered {dest}  ({n:,} bytes)")
 
 
@@ -1610,33 +1731,32 @@ def config_set(
     value: str = typer.Argument(...),
 ) -> None:
     """Update one per-user setting."""
-    current = load_config()
-    values = current.to_dict()
     normalized = key.lower().replace("_", "-")
+    updates: dict[str, object]
     if normalized == "archive-root":
-        values["archive_root"] = str(Path(value).expanduser().resolve())
+        updates = {"archive_root": str(Path(value).expanduser().resolve())}
     elif normalized == "dashboard-dir":
-        values["dashboard_dir"] = str(Path(value).expanduser().resolve())
+        updates = {"dashboard_dir": str(Path(value).expanduser().resolve())}
     elif normalized == "sync-interval":
         from .schedule import parse_interval
 
-        values["sync_interval_seconds"] = parse_interval(value)
+        updates = {"sync_interval_seconds": parse_interval(value)}
     elif normalized == "derived-interval":
         from .schedule import parse_interval
 
-        values["derived_interval_seconds"] = parse_interval(value)
+        updates = {"derived_interval_seconds": parse_interval(value)}
     elif normalized == "sync-on-login":
         lowered = value.lower()
         if lowered not in {"true", "false", "yes", "no", "1", "0"}:
             raise typer.BadParameter("sync-on-login must be true or false")
-        values["sync_on_login"] = lowered in {"true", "yes", "1"}
+        updates = {"sync_on_login": lowered in {"true", "yes", "1"}}
     else:
         raise typer.BadParameter(
             "key must be archive-root, dashboard-dir, sync-interval, "
             "derived-interval, or sync-on-login"
         )
-    updated = RetroConfig(**values)
-    path = save_config(updated)
+    update_config(**updates)
+    path = config_path()
     console.print(f"[green]updated[/green] {path}")
 
 
@@ -1661,22 +1781,29 @@ def setup_cmd(
     no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
 ) -> None:
     """Configure global storage and optionally install periodic capture."""
+    from .archive_health import archive_access
     from .schedule import install_schedule, parse_interval
 
     current = load_config()
     interval = parse_interval(periodic)
     derived_interval = parse_interval(derived_every)
-    config = RetroConfig(
-        archive_root=str(
-            (archive_root or Path(current.archive_root)).expanduser().resolve()
-        ),
-        dashboard_dir=str(
-            (dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()
-        ),
+    config = dataclasses.replace(
+        current,
+        archive_root=str((archive_root or Path(current.archive_root)).expanduser().resolve()),
+        dashboard_dir=str((dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()),
         sync_interval_seconds=interval,
         derived_interval_seconds=derived_interval,
         sync_on_login=True,
     )
+    for label, target in (
+        ("archive", Path(config.archive_root)),
+        ("dashboard", Path(config.dashboard_dir)),
+    ):
+        access = archive_access(target)
+        if not access.mounted or not access.accessible:
+            raise typer.BadParameter(
+                access.message or f"{label} path is not accessible: {target}"
+            )
     path = save_config(config)
     Layout(Path(config.archive_root)).ensure()
     Path(config.dashboard_dir).mkdir(parents=True, exist_ok=True)
@@ -1757,6 +1884,20 @@ def archive_cutover(
     console.print(f"[green]compatibility path ready:[/green] {link} -> {link.resolve()}")
 
 
+@archive_app.command("repair-refs")
+def archive_repair_refs(
+    root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report without rewriting files"),
+) -> None:
+    """Make archive-internal normalized raw references relocatable."""
+    from .archive import repair_archive_refs
+
+    report = repair_archive_refs(default_layout(root), dry_run=dry_run)
+    console.print_json(data=report)
+    if not report["ok"]:
+        raise typer.Exit(1)
+
+
 @app.command("sync")
 def sync_cmd(
     root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
@@ -1772,7 +1913,7 @@ def sync_cmd(
     from .sync import run_sync
 
     report = run_sync(
-        _layout(root),
+        default_layout(root),
         dashboard_dir=dashboard_dir,
         scheduled=scheduled,
         force_derived=force_derived,
@@ -1789,7 +1930,11 @@ def sync_cmd(
         console.print(f"[yellow]{report.warning}[/yellow]")
     for failure in report.failures:
         console.print(f"[red]{failure['session']}: {failure['error']}[/red]")
-    if report.status not in {"success"}:
+    if report.status == "skipped" and report.skip_reason:
+        console.print(f"[yellow]{report.skip_reason}[/yellow]")
+    if report.status not in {"success"} and not (
+        scheduled and report.status == "skipped"
+    ):
         raise typer.Exit(1)
 
 
@@ -1801,16 +1946,7 @@ def schedule_install(
     from .schedule import install_schedule, parse_interval
 
     interval = parse_interval(every)
-    config = load_config()
-    save_config(
-        RetroConfig(
-            archive_root=config.archive_root,
-            dashboard_dir=config.dashboard_dir,
-            sync_interval_seconds=interval,
-            derived_interval_seconds=config.derived_interval_seconds,
-            sync_on_login=config.sync_on_login,
-        )
-    )
+    update_config(sync_interval_seconds=interval)
     path = install_schedule(interval)
     console.print(f"[green]schedule installed:[/green] {path}")
 
@@ -1844,40 +1980,122 @@ def schedule_uninstall() -> None:
 @app.command("doctor")
 def doctor_cmd() -> None:
     """Report global archive, source, disk, and scheduler health."""
+    from .archive_health import (
+        archive_access,
+        duplicate_volume_mounts,
+        scheduled_archive_access,
+    )
     from .schedule import schedule_status
+    from .sync import STAGE_NAMES
 
     layout = default_layout()
-    layout.ensure()
-    free = shutil.disk_usage(layout.root.parent).free
+    dashboard = resolve_dashboard_dir()
+    access = archive_access(layout.root)
+    scheduled_access = scheduled_archive_access(layout.root)
+    errors: list[str] = []
+    warnings: list[str] = []
     table = Table(title="Retro global archive")
     table.add_column("check")
     table.add_column("value")
     table.add_row("config", str(config_path()))
     table.add_row("archive", str(layout.root))
-    table.add_row("dashboard", str(resolve_dashboard_dir()))
-    table.add_row("free space", f"{free / 1024**3:.1f} GiB")
-    table.add_row(
-        "normalized sessions",
-        str(
+    table.add_row("dashboard", str(dashboard))
+    table.add_row("archive volume", access.volume or "internal filesystem")
+    table.add_row("archive volume mounted", str(access.mounted))
+    table.add_row("scheduled archive access", str(scheduled_access["accessible"]))
+    table.add_row("scheduled access evidence", str(scheduled_access["evidence"]))
+    if access.message:
+        table.add_row("archive access detail", access.message)
+    if scheduled_access.get("message") and scheduled_access["message"] != access.message:
+        table.add_row("scheduled access detail", str(scheduled_access["message"]))
+    if not access.mounted or not access.accessible:
+        errors.append(access.message or "archive is unavailable")
+    elif not scheduled_access["accessible"]:
+        errors.append(str(scheduled_access["message"]))
+    if access.volume:
+        duplicates = duplicate_volume_mounts(Path(access.volume))
+        if duplicates:
+            message = (
+                f"Expected {access.volume}, but duplicate mounted volume(s) exist: "
+                + ", ".join(str(path) for path in duplicates)
+            )
+            table.add_row("duplicate volume mounts", f"ERROR: {message}")
+            errors.append(message)
+    table.add_row("archive state", str(layout.state_dir()))
+    table.add_row("archive lock", str(layout.lock_path()))
+    table.add_row("sync state", str(layout.sync_state_path()))
+    if access.mounted and access.accessible:
+        usage_path = Path(access.volume) if access.volume else layout.root.parent
+        while not usage_path.exists() and usage_path.parent != usage_path:
+            usage_path = usage_path.parent
+        free = shutil.disk_usage(usage_path).free
+        table.add_row("free space", f"{free / 1024**3:.1f} GiB")
+        normalized_count = (
             sum(
                 len(layout.list_normalized(host))
                 for host in layout.list_normalized_hosts()
             )
-        ),
-    )
-    for host in source_host_names():
+            if layout.root.is_dir()
+            else 0
+        )
+        table.add_row("normalized sessions", str(normalized_count))
         try:
-            count = len(create_source(host, layout).discover())
-            table.add_row(f"discoverable {host}", str(count))
-        except Exception as exc:
-            table.add_row(
-                f"discoverable {host}",
-                f"ERROR: {type(exc).__name__}: {exc}",
+            sync_state = json.loads(
+                layout.sync_state_path().read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            sync_state = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            sync_state = {}
+            message = f"cannot read sync state: {type(exc).__name__}: {exc}"
+            warnings.append(message)
+            table.add_row("sync state detail", f"WARNING: {message}")
+        stages = sync_state.get("stages") if isinstance(sync_state, dict) else {}
+        for name in STAGE_NAMES:
+            record = stages.get(name) if isinstance(stages, dict) else None
+            value = (
+                record.get("status", "never run")
+                if isinstance(record, dict)
+                else "never run"
+            )
+            table.add_row(f"last sync {name}", str(value))
+    legacy_root = user_data_dir() / "rollout-memory"
+    if legacy_root != layout.root and legacy_root.is_dir():
+        try:
+            has_legacy_data = next(legacy_root.iterdir(), None) is not None
+        except OSError:
+            has_legacy_data = True
+        if has_legacy_data:
+            message = f"legacy archive data remains at {legacy_root}"
+            warnings.append(message)
+            table.add_row("legacy archive", f"WARNING: {message}")
+    stale_dashboard = (
+        sorted(dashboard.parent.glob(".retro-dashboard-*"))
+        if dashboard.parent.is_dir()
+        else []
+    )
+    if stale_dashboard:
+        message = ", ".join(str(path) for path in stale_dashboard)
+        warnings.append(f"stale dashboard staging directories: {message}")
+        table.add_row("dashboard staging", f"WARNING: {message}")
+    for result in doctor_sources():
+        table.add_row(
+            f"source provider {result.record.name}",
+            "ok" if result.ok else f"ERROR: {result.message}",
+        )
+        if not result.ok:
+            errors.append(
+                f"{result.record.name} provider failed: {result.message}"
             )
     status = schedule_status()
     table.add_row("schedule installed", str(status.get("installed")))
     table.add_row("schedule loaded", str(status.get("loaded")))
+    table.add_row("schedule logs", str(user_log_dir()))
+    for warning in warnings:
+        table.add_row("warning", warning)
     console.print(table)
+    if errors:
+        raise typer.Exit(1)
 
 
 # ---- signals ----------------------------------------------------------------
@@ -1885,52 +2103,116 @@ def doctor_cmd() -> None:
 
 @signal_app.command("list")
 def signal_list(
-    group: Optional[str] = typer.Option(None, help="Filter by group: activity|outcome|cost|risk"),
+    category: Optional[str] = typer.Option(
+        None,
+        "--category",
+        help="Filter by category: usage|activity|outcome|friction|efficiency|collaboration|risk|quality|work",
+    ),
+    describe: bool = typer.Option(
+        False, "--describe", help="Include the full definition of each signal"
+    ),
 ):
-    """List registered signals grouped by intent."""
-    table = Table(title=f"Signals ({len(SIGNAL_REGISTRY)} registered)")
-    table.add_column("name")
-    table.add_column("group")
-    table.add_column("kind")
-    table.add_column("method")
-    table.add_column("unit")
-    table.add_column("description")
-    for name in sorted(SIGNAL_REGISTRY):
-        s = SIGNAL_REGISTRY[name]
-        if group and s.group != group:
+    """List registered signals with their metadata."""
+    table = Table(
+        title=f"Signals ({len(SIGNAL_REGISTRY)} registered, set {definitions_version()})"
+    )
+    table.add_column("id", no_wrap=True, style="cyan")
+    table.add_column("category", no_wrap=True)
+    table.add_column("kind", no_wrap=True)
+    table.add_column("unit", no_wrap=True)
+    table.add_column("polarity", no_wrap=True)
+    table.add_column("method", no_wrap=True)
+    table.add_column("v", justify="right", no_wrap=True)
+    if describe:
+        table.add_column("description", overflow="fold", ratio=2)
+    for signal_id in sorted(SIGNAL_REGISTRY):
+        definition = SIGNAL_REGISTRY[signal_id]
+        if category and definition.category != category:
             continue
-        table.add_row(s.name, s.group, s.kind, s.method, s.unit or "", s.description)
+        row = [
+            definition.id,
+            definition.category,
+            definition.kind,
+            definition.unit or "",
+            definition.polarity,
+            definition.method,
+            str(definition.version),
+        ]
+        if describe:
+            row.append(definition.description)
+        table.add_row(*row)
     console.print(table)
+
+
+class _CatalogSlice:
+    """Included catalog records, optionally narrowed to one host or session list."""
+
+    def __init__(
+        self,
+        catalog: Catalog,
+        *,
+        host: str | None,
+        session_ids: list[str] | None,
+    ) -> None:
+        self._catalog = catalog
+        self._host = host
+        self._session_ids = set(session_ids) if session_ids else None
+
+    def included(self) -> Iterator[SessionRecord]:
+        for record in self._catalog.included():
+            if self._host is not None and record.host != self._host:
+                continue
+            if self._session_ids is not None and record.session_id not in self._session_ids:
+                continue
+            yield record
 
 
 @signal_app.command("run")
 def signal_run(
     host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
     session_id: Optional[str] = typer.Option(
-        None, "--session-id", help="Restrict to one session id (repeatable via comma)"
+        None, "--session-id", help="Restrict to session ids (comma separated)"
     ),
-    signal: Optional[str] = typer.Option(
-        None, "--signal", help="Restrict to one signal name (repeatable via comma)"
+    force: bool = typer.Option(False, "--force", help="Recompute every session"),
+    include_scratch: bool = typer.Option(
+        False,
+        "--include-scratch",
+        help="Also evaluate sessions whose working directory is a temp directory",
     ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
-    """Compute signals over imported sessions and write readings + aggregates."""
+    """Update signals/sessions.jsonl for every included catalog session."""
     lay = _layout(root)
     host_full = _expand_host(host) if host else None
-    sids = [s.strip() for s in session_id.split(",")] if session_id else None
-    sigs = [s.strip() for s in signal.split(",")] if signal else None
-    try:
-        readings = run_signals(lay, host=host_full, session_ids=sids, signal_names=sigs)
-    except KeyError as e:
-        console.print(f"[red]{e}[/red]")
-        raise typer.Exit(1) from None
-    if not readings:
-        console.print("[yellow]No readings produced (no matching sessions or signals).[/yellow]")
-        raise typer.Exit(0)
-    paths = write_signal_artifacts(lay, readings)
-    console.print(f"[green]wrote {len(readings)} readings[/green]")
-    for label, p in paths.items():
-        console.print(f"  {label:<10} {p}")
+    sids = [s.strip() for s in session_id.split(",") if s.strip()] if session_id else None
+    with archive_lock(lay):
+        source: Any
+        if include_scratch:
+            from .signals import NormalizedSource
+
+            source = NormalizedSource(
+                layout=lay, host=host_full, session_ids=sids, skip_temp=False
+            )
+        else:
+            update_catalog(lay)
+            source = _CatalogSlice(load_catalog(lay), host=host_full, session_ids=sids)
+        update = update_signals(
+            lay,
+            source,
+            force=force,
+            host=host_full,
+            session_ids=sids,
+            prune=not (host_full or sids),
+        )
+    console.print(
+        f"[green]signals up to date[/green] set={update.version} sessions={update.total:,} "
+        f"added={len(update.added_keys):,} changed={len(update.changed_keys):,} "
+        f"removed={len(update.removed_keys):,} reused={update.reused:,} "
+        f"in {update.duration_s:.1f}s"
+    )
+    signals_root = lay.root / "signals"
+    console.print(f"  definitions {signals_root / 'definitions.json'}")
+    console.print(f"  sessions    {signals_root / 'sessions.jsonl'}")
 
 
 @signal_app.command("show")
@@ -1939,51 +2221,82 @@ def signal_show(
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
-    """Show all signal readings stored for one session."""
+    """Show every stored signal value for one session."""
     lay = _layout(root)
     host_full = _expand_host(host)
-    readings_path = lay.root / "signals" / "readings.jsonl"
-    if not readings_path.exists():
-        console.print(f"[red]No readings found at {readings_path}. Run `retro signal run` first.[/red]")
+    key = f"{host_full}/{session_id}"
+    store = load_signal_store(lay)
+    record = store.record(key)
+    if record is None:
+        console.print(
+            f"[yellow]No stored signals for {key}. Run `retro signal run` first.[/yellow]"
+        )
         raise typer.Exit(1)
-    import json as _json
+    definitions = {item["id"]: item for item in store.definitions}
+    evidence = store.evidence(key)
+    confidence = store.confidence(key)
 
-    table = Table(title=f"Signals for {host_full}/{session_id}")
-    table.add_column("signal")
-    table.add_column("group")
-    table.add_column("kind")
+    table = Table(title=f"Signals for {key}")
+    table.add_column("id")
+    table.add_column("category")
     table.add_column("value")
     table.add_column("unit")
-    table.add_column("notes")
-    found = 0
-    with readings_path.open("r", encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            r = _json.loads(line)
-            if r["host"] != host_full or r["session_id"] != session_id:
-                continue
-            found += 1
-            note_bits = []
-            if r.get("confidence") not in (None, 1.0):
-                note_bits.append(f"conf={r['confidence']}")
-            meta = r.get("metadata") or {}
-            if "reason" in meta:
-                note_bits.append(f"reason={meta['reason']}")
-            if "error" in meta:
-                note_bits.append(f"err={meta['error'][:40]}")
-            table.add_row(
-                r["signal"],
-                r["group"],
-                r["kind"],
-                str(r["value"]),
-                r.get("unit") or "",
-                ", ".join(note_bits),
-            )
-    if found == 0:
-        console.print(f"[yellow]No readings for {host_full}/{session_id}[/yellow]")
+    table.add_column("conf", justify="right")
+    table.add_column("evidence")
+    for signal_id, value in sorted(record.get("values", {}).items()):
+        definition = definitions.get(signal_id, {})
+        refs = evidence.get(signal_id) or []
+        table.add_row(
+            signal_id,
+            str(definition.get("category") or ""),
+            str(value),
+            str(definition.get("unit") or ""),
+            f"{confidence.get(signal_id, 1.0):.2f}",
+            ", ".join(refs[:2]),
+        )
+    console.print(table)
+
+
+@signal_app.command("summary")
+def signal_summary(
+    signal: Optional[str] = typer.Option(
+        None, "--signal", help="Restrict to signal ids (comma separated)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the raw summary as JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+):
+    """Aggregate stored signal values across every evaluated session."""
+    lay = _layout(root)
+    store = load_signal_store(lay)
+    if not len(store):
+        console.print("[yellow]No signal store yet. Run `retro signal run` first.[/yellow]")
         raise typer.Exit(1)
+    wanted = {s.strip() for s in signal.split(",") if s.strip()} if signal else None
+    summary = summarize(store.all_values(), store.definitions)
+    blocks = summary["signals"]
+    if wanted:
+        blocks = {k: v for k, v in blocks.items() if k in wanted}
+    if as_json:
+        import json as _json
+
+        console.print_json(_json.dumps({"sessions": summary["sessions"], "signals": blocks}))
+        return
+    table = Table(title=f"Signal summary ({summary['sessions']:,} sessions)")
+    table.add_column("id")
+    table.add_column("category")
+    table.add_column("n", justify="right")
+    table.add_column("summary")
+    for signal_id, block in sorted(blocks.items()):
+        if "true_rate" in block:
+            text = f"true {block['true']}/{block['n']} ({block['true_rate']:.0%})"
+        elif "counts" in block:
+            text = ", ".join(f"{k}={v}" for k, v in list(block["counts"].items())[:4])
+        else:
+            text = (
+                f"median {block['median']:g}  p90 {block['p90']:g}  "
+                f"mean {block['mean']:g}  sum {block['sum']:g}"
+            )
+        table.add_row(signal_id, str(block.get("category") or ""), f"{block['n']:,}", text)
     console.print(table)
 
 
@@ -1995,72 +2308,73 @@ def dashboard_build(
     mode: str = typer.Option(
         "auto",
         "--mode",
-        help="Cost mode: auto, calculate, or display.",
+        help="auto reuses unchanged session-detail shards; full rebuilds every shard.",
     ),
-    root: Optional[Path] = typer.Option(
-        None,
-        help="rollout-memory root (default ./rollout-memory)",
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    out: Optional[Path] = typer.Option(None, "--out", help="dashboard directory"),
+    publish: bool = typer.Option(
+        True,
+        "--publish/--no-publish",
+        help="Publish a new generation atomically, or write straight into --out.",
     ),
-    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
 ):
-    """Build dashboard/data/rollouts.json and dashboard/index.html."""
-    if mode not in {"auto", "calculate", "display"}:
-        raise typer.BadParameter("mode must be one of: auto, calculate, display")
+    """Build the static dashboard from the session catalog and the signal store."""
+    from .dashboard import BUILD_MODES, build_dashboard
 
-    from .dashboard_build import build as build_dashboard_html
+    if mode not in BUILD_MODES:
+        raise typer.BadParameter(f"mode must be one of: {', '.join(BUILD_MODES)}")
 
-    index_path = build_dashboard_html(
-        mode=mode,
-        artifact_root=root,
-        out_dir=resolve_dashboard_dir(out),
+    layout = _layout(root)
+    report = build_dashboard(layout, resolve_dashboard_dir(out), mode=mode, publish=publish)
+    console.print(f"[green]dashboard ready:[/green] {report.index_path}")
+    console.print(
+        f"  sessions={report.sessions:,} included={report.included:,} "
+        f"scored={report.with_signals:,} signals={report.signal_definitions}"
     )
-    console.print(f"[green]dashboard ready:[/green] {index_path}")
-
-
-@dashboard_app.command("experiments")
-def dashboard_experiments(
-    root: Optional[Path] = typer.Option(
-        None,
-        help="rollout-memory root (default ./rollout-memory)",
-    ),
-    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
-):
-    """Build the experimental trajectory-signals page (trajectory_experiments.html)."""
-    from .dashboard_experiments import build as build_experiments_html
-
-    html_path = build_experiments_html(
-        artifact_root=root,
-        out_dir=resolve_dashboard_dir(out),
+    console.print(
+        f"  shards: included={report.session_shards} excluded={report.excluded_shards} "
+        f"signals={report.signal_shards} detail={report.detail_shards}"
+        f"+{report.excluded_detail_shards} (reused {report.detail_cached})"
     )
-    console.print(f"[green]experiments page ready:[/green] {html_path}")
+    console.print(
+        f"  size={report.bytes_total / 1_048_576:.1f} MiB "
+        f"index={report.index_bytes / 1024:.0f} KiB in {report.duration_s:.1f}s"
+    )
+    for warning in report.warnings:
+        console.print(f"[yellow]  ! {warning}[/yellow]")
 
 
 @dashboard_app.command("view")
 def dashboard_view(
-    mode: str = typer.Option(
-        "auto",
-        "--mode",
-        help="Cost mode: auto, calculate, or display.",
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    limit: int = typer.Option(25, "--limit", help="rows per table"),
+    interactive: Optional[bool] = typer.Option(
+        None,
+        "--interactive/--no-interactive",
+        help="Force or suppress the interactive loop (default: auto-detect a TTY).",
     ),
 ):
-    """View the rollout dashboard interactively in the terminal."""
-    if mode not in {"auto", "calculate", "display"}:
-        raise typer.BadParameter("mode must be one of: auto, calculate, display")
+    """Browse the catalog, projects, sessions and signals in the terminal."""
+    from .dashboard import run_terminal_dashboard
 
-    from .dashboard_terminal import run_terminal_dashboard
-
-    run_terminal_dashboard(mode=mode)
+    run_terminal_dashboard(
+        _layout(root),
+        interactive=interactive,
+        console=console,
+        limit=limit,
+    )
 
 
 @app.command("analyze")
 def analyze(
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
 ) -> None:
     """Analyze command and tool call patterns across imported sessions."""
-    from .analyzer import analyze_sessions, generate_report, render_console_report
+    from .signals import analyze_sessions, generate_report, render_console_report
 
     lay = _layout(root)
-    stats = analyze_sessions(lay)
+    stats = analyze_sessions(lay, host=_expand_host(host) if host else None)
     render_console_report(stats)
 
     report_path = lay.root / "analysis_report.md"
@@ -2092,7 +2406,9 @@ def memory_reindex(
     from .memory_store import reindex
 
     lay = _layout(root)
-    report = reindex(lay)
+    with archive_lock(lay):
+        update_catalog(lay)
+        report = reindex(lay)
     console.print(f"[green]indexed {report.indexed} memories[/green]")
     console.print(f"  items.jsonl records: {report.source_records}")
     console.print(f"  mined artifacts:     {report.mined_records}")
@@ -2255,107 +2571,6 @@ def callback(
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """retro: local-first coding agent session capture and memory tool."""
-    # Print streak message on execution if in a TTY
-    if sys.stdout.isatty():
-        try:
-            from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-            lay = default_layout(root)
-            state = load_quest_state(lay)
-            gen_new = ensure_daily_quests(lay, state)
-            if gen_new:
-                save_quest_state(lay, state)
-            
-            streak = state.get("streak_count", 0)
-            active_quests_count = sum(1 for q in state.get("daily_quests", []) if q["status"] == "active")
-            if active_quests_count > 0:
-                console.print(
-                    f"[bold teal]\\[retro][/bold teal] Streak: {streak} Days. "
-                    f"{active_quests_count} New Quests Available."
-                )
-        except Exception:
-            pass
-
-
-@quest_app.command("list")
-def quest_list(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """List active daily quests, progression, and streak count."""
-    from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-    lay = _layout(root)
-    state = load_quest_state(lay)
-    ensure_daily_quests(lay, state)
-    save_quest_state(lay, state)
-
-    console.print()
-    console.print("[bold teal]Operator Ranks & Progression[/bold teal]")
-    console.print(f"  Current Rank:   [bold green]{state.get('user_level')}[/bold green]")
-    console.print(f"  Streak Count:   [bold yellow]{state.get('streak_count')} Days[/bold yellow]")
-    console.print(f"  Streak Freezes: [bold cyan]{state.get('streak_freezes', 0)}[/bold cyan]")
-    console.print(f"  Experience:     [bold]{state.get('experience_points')} XP[/bold]")
-    console.print()
-
-    console.print("[bold]Active Daily Quests:[/bold]")
-    quests = state.get("daily_quests", [])
-    if not quests:
-        console.print("  No quests available.")
-    else:
-        for q in quests:
-            is_comp = q["status"] == "completed"
-            status_str = "[green]Completed[/green]" if is_comp else "[yellow]Active[/yellow]"
-            console.print(f"  • [bold]{q['name']}[/bold] ({status_str})")
-            console.print(f"    Objective: {q['objective']}")
-            console.print(f"    Rationale: {q['rationale']}")
-            console.print()
-
-
-@quest_app.command("verify")
-def quest_verify(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """Run local metrics checks to verify active daily quests."""
-    from .quest import load_quest_state, save_quest_state, verify_quests
-    lay = _layout(root)
-    state = load_quest_state(lay)
-
-    report = verify_quests(lay, state)
-    save_quest_state(lay, state)
-
-    console.print()
-    console.print("[bold teal]Quest Verification Summary[/bold teal]")
-    console.print()
-
-    for q, verified, reason in report["results"]:
-        status_str = "[green]✓ Verified[/green]" if verified else "[red]✗ Not Verified[/red]"
-        console.print(f"  • [bold]{q['name']}[/bold]: {status_str}")
-        console.print(f"    {reason}")
-        console.print()
-
-    if report["xp_gained"] > 0:
-        console.print(f"[bold green]+{report['xp_gained']} XP Gained![/bold green]")
-        console.print(
-            f"New Experience: [bold]{report['new_xp']} XP[/bold] "
-            f"(Rank: [bold]{report['new_level']}[/bold])"
-        )
-        for q_id in report["now_completed_ids"]:
-            console.print(f"Completed Quest: [bold]{q_id}[/bold]")
-    else:
-        console.print("No quests verified this run. Keep working on them!")
-    console.print()
-
-
-@quest_app.command("buy-freeze")
-def quest_buy_freeze(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """Purchase a Streak Freeze to protect your streak on inactive days (costs 200 XP)."""
-    from .quest import buy_streak_freeze, load_quest_state, save_quest_state
-    lay = _layout(root)
-    state = load_quest_state(lay)
-
-    msg = buy_streak_freeze(state)
-    save_quest_state(lay, state)
-    console.print(msg)
 
 
 if __name__ == "__main__":

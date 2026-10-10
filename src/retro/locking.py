@@ -8,9 +8,27 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .archive_health import require_archive_volume
+from .storage import Layout
+
 
 class LockUnavailableError(RuntimeError):
     pass
+
+
+@contextmanager
+def config_lock() -> Iterator[None]:
+    from .config import config_path
+
+    with exclusive_lock(config_path().parent / "config.lock"):
+        yield
+
+
+@contextmanager
+def archive_lock(layout: Layout) -> Iterator[None]:
+    require_archive_volume(layout.root)
+    with exclusive_lock(layout.lock_path()):
+        yield
 
 
 @contextmanager

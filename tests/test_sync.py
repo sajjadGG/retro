@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -11,6 +12,7 @@ from retro.extensions import SourceHandle
 from retro.importers.copilot_cli import CopilotCliSession
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.sdk import ImportResult, SessionDescriptor, SourceRegistry
+from retro.signals import SignalUpdate
 from retro.storage import Layout
 from retro.sync import _preserve_rewritten_raw, run_sync
 
@@ -40,20 +42,12 @@ def test_noop_sync_does_not_rebuild_dashboard(monkeypatch, tmp_path: Path):
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-
-    def write_signals(layout, readings):
-        path = layout.root / "signals" / "readings.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-        return {"readings": path}
 
     def reindex(layout):
         path = layout.memory_index_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"index")
 
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", write_signals)
     monkeypatch.setattr("retro.sync.reindex_memory", reindex)
     rebuilt = []
     monkeypatch.setattr(
@@ -120,8 +114,6 @@ def test_sync_report_is_structured(monkeypatch, tmp_path: Path):
     layout.ensure()
     dashboard = tmp_path / "dashboard"
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
 
@@ -176,7 +168,20 @@ def test_sync_imports_registered_extension_source(monkeypatch, tmp_path: Path):
                             path=f"raw/{self.host}/{identifier}/session.jsonl",
                             line=1,
                         ),
-                    )
+                    ),
+                    NormalizedEvent(
+                        event_id="message-2",
+                        session_id=identifier,
+                        host=self.host,
+                        sequence=2,
+                        actor="assistant",
+                        event_type="message",
+                        summary="hi",
+                        raw_ref=RawRef(
+                            path=f"raw/{self.host}/{identifier}/session.jsonl",
+                            line=1,
+                        ),
+                    ),
                 ],
             )
             return ImportResult(
@@ -195,8 +200,6 @@ def test_sync_imports_registered_extension_source(monkeypatch, tmp_path: Path):
         "retro.sync.create_source",
         lambda host, layout: SourceHandle(record, layout),
     )
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
     layout = Layout(tmp_path / "archive")
@@ -222,8 +225,6 @@ def test_low_space_only_blocks_scheduled_sync(monkeypatch, tmp_path: Path):
         "retro.sync.shutil.disk_usage",
         lambda path: _ntuple_diskusage(10 * 1024**3, 9 * 1024**3, 1024**3),
     )
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._rebuild_dashboard_atomically", lambda layout, output: None)
 
@@ -253,7 +254,7 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     (layout.root / "signals").mkdir()
-    (layout.root / "signals" / "readings.jsonl").write_text("", encoding="utf-8")
+    (layout.root / "signals" / "sessions.jsonl").write_text("", encoding="utf-8")
     state = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
     state.parent.mkdir(parents=True)
     state.write_text(
@@ -266,8 +267,6 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
         encoding="utf-8",
     )
     _patch_empty_sources(monkeypatch)
-    monkeypatch.setattr("retro.sync.run_signals", lambda layout: [])
-    monkeypatch.setattr("retro.sync.write_signal_artifacts", lambda layout, readings: {})
     monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
     monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "")
     rebuilt = []
@@ -278,7 +277,7 @@ def test_signal_schema_change_rebuilds_dashboard(monkeypatch, tmp_path: Path):
 
     report = run_sync(layout, dashboard_dir=dashboard)
 
-    assert report.signals_recomputed is True
+    assert report.stages["signals"]["status"] == "success"
     assert report.dashboard_rebuilt is True
     assert rebuilt == [dashboard.resolve()]
 
@@ -293,7 +292,7 @@ def test_scheduled_sync_defers_derived_work_until_interval(
     dashboard.mkdir()
     (dashboard / "index.html").write_text("existing", encoding="utf-8")
     (layout.root / "signals").mkdir()
-    (layout.root / "signals" / "readings.jsonl").write_text("", encoding="utf-8")
+    (layout.root / "signals" / "sessions.jsonl").write_text("", encoding="utf-8")
     layout.memory_index_path().parent.mkdir(parents=True, exist_ok=True)
     layout.memory_index_path().write_bytes(b"index")
     state = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
@@ -336,3 +335,196 @@ def test_scheduled_sync_defers_derived_work_until_interval(
     assert report.dashboard_rebuilt is False
     assert rebuilt == []
     assert rendered == []
+
+
+def test_dashboard_failure_retries_without_recomputing_signals(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    signal_runs = []
+
+    def refresh_signals(layout, catalog, *, force=False):
+        signal_runs.append(force)
+        return SignalUpdate(version="test", added_keys=["codex/x"] if force else [])
+
+    def reindex(layout):
+        path = layout.memory_index_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"index")
+
+    dashboard_attempts = []
+
+    def build_dashboard(layout, output):
+        dashboard_attempts.append(output)
+        if len(dashboard_attempts) == 1:
+            raise RuntimeError("dashboard exploded")
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.refresh_signals", refresh_signals)
+    monkeypatch.setattr("retro.sync.reindex_memory", reindex)
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+
+    first = run_sync(layout, dashboard_dir=dashboard, force_derived=True)
+    second = run_sync(layout, dashboard_dir=dashboard)
+
+    assert first.status == "failed"
+    assert first.stages["signals"]["status"] == "success"
+    assert first.stages["dashboard"]["status"] == "failed"
+    assert second.status == "success"
+    assert second.stages["signals"]["status"] == "success"
+    assert second.stages["dashboard"]["status"] == "success"
+    assert signal_runs == [True, False]
+    assert first.signals_recomputed is True
+    assert second.signals_recomputed is False
+    assert len(dashboard_attempts) == 2
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert state["schema_version"] == 2
+    assert state["pending"]["dashboard"]["needed"] is False
+
+
+def test_scheduled_sync_skips_unmounted_external_volume(monkeypatch):
+    volume = Path("/Volumes/retro-test-unmounted-volume")
+    layout = Layout(volume / "archive")
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+    monkeypatch.setattr(
+        "retro.sync.source_host_names",
+        lambda: (_ for _ in ()).throw(AssertionError("capture must not start")),
+    )
+
+    report = run_sync(
+        layout,
+        dashboard_dir=volume / "dashboard",
+        scheduled=True,
+    )
+
+    assert report.status == "skipped"
+    assert report.skip_reason is not None
+    assert "Archive volume is not mounted" in report.skip_reason
+    assert str(volume) in report.skip_reason
+    assert report.stages["capture"]["status"] == "skipped"
+    assert not volume.exists()
+
+
+def test_sync_reports_external_volume_tcc_denial(monkeypatch):
+    volume = Path("/Volumes/retro-test-tcc-volume")
+    layout = Layout(volume / "archive")
+    python_app = Path("/Applications/TestPython.app")
+    real_stat = os.stat
+
+    def denied_stat(path, *args, **kwargs):
+        if str(path).startswith(str(volume)):
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("retro.archive_health.sys.platform", "darwin")
+    monkeypatch.setattr("retro.archive_health.os.path.ismount", lambda path: True)
+    monkeypatch.setattr("retro.archive_health.os.stat", denied_stat)
+    monkeypatch.setattr("retro.archive_health.python_app_bundle", lambda: python_app)
+
+    report = run_sync(layout, dashboard_dir=volume / "dashboard", scheduled=True)
+
+    assert report.status == "failed"
+    message = report.failures[0]["error"]
+    assert "macOS denied Retro access" in message
+    assert str(python_app) in message
+    assert "Privacy & Security → Full Disk Access" in message
+
+
+def test_legacy_sync_state_is_copied_into_archive_and_preserved(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "index.html").write_text("existing", encoding="utf-8")
+    legacy = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "signal_signature": "same",
+                "memory_signature": "same",
+                "last_derived_at": "2999-01-01T00:00:00+00:00",
+                "pending_sessions": ["codex/session-1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync._signal_signature", lambda: "same")
+    monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "same")
+
+    report = run_sync(layout, dashboard_dir=dashboard, scheduled=True)
+
+    assert report.status == "success"
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert state["migrated_from"] == str(legacy)
+    assert state["pending"]["catalog"]["keys"] == ["codex/session-1"]
+    assert legacy.is_file()
+
+
+def test_dashboard_stage_sees_in_progress_report_and_counts_unchanged(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
+    seen_reports = []
+
+    def build_dashboard(layout, output):
+        runs = sorted((layout.root / "sync" / "runs").glob("*.json"))
+        seen_reports.append(json.loads(runs[-1].read_text(encoding="utf-8")))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+
+    report = run_sync(layout, dashboard_dir=dashboard, force_derived=True)
+
+    assert report.status == "success"
+    assert seen_reports[0]["status"] == "running"
+    assert seen_reports[0]["stages"]["signals"]["status"] == "success"
+    final = json.loads(
+        sorted((layout.root / "sync" / "runs").glob("*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert final["status"] == "success"
+    assert final["unchanged"] == 0
+
+
+def test_clean_scheduled_derived_pass_advances_last_derived_at(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
+    builds = []
+
+    def build_dashboard(layout, output):
+        builds.append(output)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+    run_sync(layout, dashboard_dir=dashboard)
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    state["last_derived_at"] = "2000-01-01T00:00:00+00:00"
+    layout.sync_state_path().write_text(json.dumps(state), encoding="utf-8")
+
+    report = run_sync(layout, dashboard_dir=dashboard, scheduled=True)
+
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert report.status == "success"
+    assert len(builds) == 1
+    assert state["last_derived_at"] > "2000-01-01T00:00:00+00:00"

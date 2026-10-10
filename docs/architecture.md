@@ -3,7 +3,7 @@
 `retro` is a layered local artifact pipeline.
 
 ```text
-raw/ -> normalized/ -> signals/ -> mined/ -> memories/ -> dashboard/
+raw/ -> normalized/ -> catalog/ -> signals/ -> mined/ -> memories/ -> dashboard/
 ```
 
 ## Layers
@@ -12,7 +12,8 @@ raw/ -> normalized/ -> signals/ -> mined/ -> memories/ -> dashboard/
 | --- | --- |
 | `raw/` | Immutable or revision-preserved source copies from registered hosts. |
 | `normalized/` | Common `NormalizedEvent` JSONL stream. |
-| `signals/` | Evidence-linked readings and aggregates. |
+| `catalog/` | Session identity, client context, consolidated project, tags, and exclusion decisions. |
+| `signals/` | Registered signal definitions plus one evidence-linked line per evaluated session. |
 | `mined/` | Prompt-time memory candidates per method. |
 | `memories/` | Canonical memory records, lifecycle events, and derived SQLite index. |
 | `rendered/` | Human-readable markdown transcripts. |
@@ -24,14 +25,17 @@ Flat files are canonical:
 
 - raw source captures are immutable;
 - normalized events are replayable;
+- `catalog/annotations.jsonl` owns user tags, project overrides, and notes;
 - mined artifacts remain inspectable;
 - `memories/items.jsonl` and `memories/events.jsonl` own memory state.
 
 Derived artifacts can be rebuilt:
 
+- `catalog/sessions.jsonl`;
+- `catalog/state.json`;
 - `memories/index.sqlite`;
-- `dashboard/data/rollouts.json`;
-- `dashboard/index.html`.
+- `catalog/sessions.jsonl` and `signals/`;
+- the published dashboard generations (`index.html`, `assets/`, `data/*.js`).
 
 ## Source Discovery
 
@@ -46,11 +50,36 @@ published artifacts atomically while holding the archive lock. Providers
 cannot select arbitrary publication paths through their returned
 `ImportResult`.
 
-Built-in providers exclude synthetic Ghostlab evaluation traffic before it enters the
-archive. Codex sessions are identified by `session_meta.originator: ghostlab`;
-Copilot CLI sessions use Ghostlab's reserved UUID prefix. The marker is attached
-to session metadata rather than prompts, so excluding it does not change the
-recorded conversation.
+Built-in providers exclude explicitly marked synthetic Ghostlab evaluation
+traffic before it enters the archive. Codex sessions are identified by
+`session_meta.originator: ghostlab`; Copilot CLI sessions use Ghostlab's
+reserved UUID prefix. This pre-capture filter prevents archive growth. The
+catalog separately classifies already-archived and unmarked automation using
+metadata, `.retroignore`, rules, markers, and annotations. Catalog exclusion
+never deletes raw or normalized evidence.
+
+## Catalog Boundary
+
+`retro.catalog.update_catalog` gives each record a content-only fingerprint of
+normalized files, archived host metadata, and the extractor version. Rules,
+project config, annotations, `.retroignore`, and local Git context use separate
+digests in `catalog/state.json`. A policy-only change re-evaluates the stored
+record without reading raw metadata or normalized events and does not invalidate
+content-keyed signals. Unchanged sessions require stat checks only; changed
+records are republished as one sorted atomic `catalog/sessions.jsonl`.
+
+Git resolution reads `.git` directories, linked-worktree `gitdir:` and
+`commondir` files, refs, and remote config directly. No Git process or network
+lookup is involved. Remotes are normalized to `host/owner/repo`; cwd symlinks
+and worktree paths converge on the same main repository. Temp cwd values and
+Copilot session-state sandboxes without Git evidence collapse into stable
+synthetic scratch projects instead of one project per ephemeral directory.
+
+Tags retain exact sources (`rule:<id>`, `dotfile:<path>`, `marker`, `manual`).
+Rules apply first, then `.retroignore`, markers, and append-only user
+annotations. A session is excluded only when one of its tags appears in
+`exclude_tags`. Mining, memory reindex, signals, task selection, and dashboard
+aggregation consume included records by default.
 
 ## Key Modules
 
@@ -61,7 +90,8 @@ recorded conversation.
 | `src/retro/sdk/` | Stable extension API, source contracts, and lazy entry-point registry. |
 | `src/retro/extensions.py` | Built-in adapters, diagnostics, staging, validation, and publication. |
 | `src/retro/importers/` | Host-specific importers. |
-| `src/retro/signals/` | Signal registry and evaluators. |
+| `src/retro/catalog/` | Metadata extraction, rules, markers, Git/project resolution, annotations, persistence, and CLI groups. |
+| `src/retro/signals/` | Session profile builder, signal registry, incremental store, token/cost accounting. |
 | `src/retro/mining/` | Mining method and filter registries. |
 | `src/retro/memory_store.py` | SQLite schema, reindex, retrieval, authored import, utility updates, weave. |
 | `src/retro/renderer.py` | Markdown transcript rendering. |
@@ -76,7 +106,7 @@ API version `1` and import public types from `retro.sdk`.
 
 Signals and mining methods self-register with decorators.
 
-Signals use `@register(...)` in `src/retro/signals/`.
+Signals use `@register(...)` in `src/retro/signals/definitions.py` and read a `SessionProfile`.
 
 Mining methods use `@register_method(...)` in `src/retro/mining/methods/` and must be imported in `src/retro/mining/methods/__init__.py`.
 

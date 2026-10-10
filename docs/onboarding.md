@@ -86,7 +86,7 @@ retro signal run
 retro signal show codex <thread-id>
 ```
 
-Signals produce evidence-linked readings under `rollout-memory/signals/`.
+Signals produce `rollout-memory/signals/definitions.json` and one evidence-linked line per session in `sessions.jsonl`.
 
 ## 5. Mine Prompt-Time Memory
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from retro.config import (
     RetroConfig,
     config_path,
@@ -10,6 +12,7 @@ from retro.config import (
     resolve_archive_root,
     resolve_dashboard_dir,
     save_config,
+    update_config,
 )
 from retro.storage import default_layout
 
@@ -75,3 +78,91 @@ def test_saved_config_is_valid_json(tmp_path: Path):
     raw = json.loads(config_path().read_text(encoding="utf-8"))
     assert raw["sync_interval_seconds"] == 900
     assert raw["derived_interval_seconds"] == 21600
+
+
+def test_catalog_config_validates_and_preserves_unknown_keys(tmp_path: Path):
+    config_path().parent.mkdir(parents=True)
+    config_path().write_text(
+        json.dumps(
+            {
+                "archive_root": str(tmp_path / "archive"),
+                "dashboard_dir": str(tmp_path / "dashboard"),
+                "exclude_tags": ["ignore", "private"],
+                "disabled_rules": ["builtin.automated"],
+                "rules": [
+                    {
+                        "id": "eval",
+                        "description": "evaluation sessions",
+                        "enabled": True,
+                        "match": {"client": ["copilot-cli"], "interactive": False},
+                        "tags": ["ignore"],
+                    }
+                ],
+                "projects": {
+                    "aliases": {"path:/old": "github.com/example/repo"},
+                    "paths": [{"glob": "~/Dev/repo/**", "project": "github.com/example/repo"}],
+                    "names": {"github.com/example/repo": "Example"},
+                },
+                "future_setting": {"preserve": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_config()
+    updated = update_config(sync_interval_seconds=1200)
+    raw = json.loads(config_path().read_text(encoding="utf-8"))
+
+    assert loaded.exclude_tags == ["ignore", "private"]
+    assert updated.rules[0]["id"] == "eval"
+    assert raw["future_setting"] == {"preserve": True}
+    assert raw["projects"]["names"]["github.com/example/repo"] == "Example"
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("exclude_tags", ["bad tag"], "exclude_tags[0]"),
+        ("disabled_rules", [""], "disabled_rules[0]"),
+        ("rules", [{"id": "x", "match": {"title": "("}, "tags": ["ignore"]}], "regex"),
+        (
+            "rules",
+            [{"id": "builtin.fake", "match": {}, "tags": ["ignore"]}],
+            "reserved",
+        ),
+        ("projects", {"aliases": {"a": "b", "b": "a"}}, "cycle"),
+    ],
+)
+def test_catalog_config_errors_are_clear(tmp_path: Path, key, value, message):
+    payload = {
+        "archive_root": str(tmp_path / "archive"),
+        "dashboard_dir": str(tmp_path / "dashboard"),
+        key: value,
+    }
+    config_path().parent.mkdir(parents=True)
+    config_path().write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as error:
+        load_config()
+    assert message in str(error.value)
+
+
+@pytest.mark.parametrize("pattern", [r"(a+)+$", r"(\w+\s?)*", r"^(ab+){2,}$", r"(?:x*)*y"])
+def test_rule_regex_rejects_nested_unbounded_repetition(pattern):
+    from retro.config import validate_rule_spec
+
+    with pytest.raises(ValueError, match="backtrack"):
+        validate_rule_spec({"id": "bad", "match": {"prompt": pattern}, "tags": ["ignore"]})
+
+
+def test_rule_regex_accepts_ordinary_alternation():
+    from retro.config import validate_rule_spec
+
+    rule = validate_rule_spec(
+        {
+            "id": "eval",
+            "match": {"prompt": r"^\s*You are (being evaluated\b|the agent-under-test\b)"},
+            "tags": ["ignore"],
+        }
+    )
+    assert rule["match"]["prompt"].startswith("^")

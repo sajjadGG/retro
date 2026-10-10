@@ -4,7 +4,7 @@ Instructions for AI coding agents working on this project.
 
 ## Project overview
 
-`retro` is a local-first CLI tool that captures Codex, Claude Code, and VS Code GitHub Copilot Chat agent sessions, normalizes them into a common event schema, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-ai`; the installed CLI command is `retro`.
+`retro` is a local-first CLI tool that captures Codex, Claude Code, and GitHub Copilot (CLI, VS Code agent host, VS Code chat) agent sessions, normalizes them into a common event schema, catalogs them into consolidated projects with ignore rules, evaluates them with signals, mines them into reusable prompt-time memory, and generates a static HTML dashboard. Published on PyPI as `retro-ai`; the installed CLI command is `retro`.
 
 ## Architecture
 
@@ -12,12 +12,17 @@ The pipeline is layered and composable — each stage reads from disk and can be
 
 ```
 raw/ (immutable source copy)
-  → normalized/ (NormalizedEvent JSONL)
-    → signals/ (readings + aggregates)
-    → mined/ (memory candidates per method)
-    → rendered/ (markdown views)
-    → dashboard/ (static HTML)
+  → normalized/ (NormalizedEvent JSONL, rebuildable with `retro import renormalize`)
+    → catalog/ (one record per session: client, project, tags, exclusion)
+      → signals/ (definitions + one record per included session)
+      → mined/ (memory candidates per method)
+      → rendered/ (markdown views of included sessions)
+      → dashboard/ (static HTML shell + data shards)
+state/ (archive lock + staged sync state, inside the archive)
 ```
+
+`retro sync` runs the stages `capture → catalog → render → signals → memory → dashboard`,
+persisting state after each stage so a late failure never forces earlier work to be redone.
 
 Key packages under `src/retro/`:
 
@@ -25,13 +30,15 @@ Key packages under `src/retro/`:
 |---------|---------|
 | `schema.py` | `NormalizedEvent` dataclass — the canonical event type everything consumes |
 | `storage.py` | `Layout` — filesystem path conventions for `rollout-memory/` |
-| `utils.py` | Shared helpers: `iter_jsonl`, `event_text`, `iter_messages`, `truncate` |
+| `utils.py` | Shared helpers: `iter_jsonl`, `event_text`, `event_tool_input`, `event_tool_output`, `iter_messages`, `truncate` |
 | `sdk/` | Stable public contracts and lazy registry for installed source adapters |
 | `extensions.py` | Built-in provider adapters and managed staged publication |
 | `importers/` | Host-specific importers (Claude Code, Codex, VS Code Copilot) that produce normalized events |
-| `signals/` | Evaluators that emit readings (numeric/boolean/categorical) about a session |
+| `catalog/` | Session catalog: client/interactive/subagent detection, Git-based project consolidation, `#retro:` markers, `.retroignore`, rules, annotations, exclusion |
+| `signals/` | Single-pass `SessionProfile`, registered signals with metadata, incremental store, token/cost accounting, aggregation helpers |
 | `mining/` | Methods that extract reusable memory candidates from normalized events |
 | `renderer.py` | Markdown transcript renderer |
+| `dashboard/` | Static dashboard over `catalog/` + `signals/` (readers, fact table, shard writers, atomic publish, terminal view, assets) |
 | `cli.py` | Typer CLI entry point |
 
 ## Plugin system
@@ -44,7 +51,7 @@ the installed entry point plus capture/normalization with fixtures.
 
 Signals and mining methods use decorator-based registration. To add a new one:
 
-- **Signal:** Create a function in `signals/heuristics.py` (or a new file) decorated with `@register(name, group=..., kind=..., ...)`. It auto-registers on import.
+- **Signal:** Add a function of a `SessionProfile` in `signals/definitions.py` decorated with `@register("<category>.<name>", title=..., category=..., kind=..., unit=..., method=..., description=...)`. Bump its `version` whenever the algorithm changes; the store recomputes affected sessions automatically.
 - **Mining method:** Create `mining/methods/your_method.py` with `@register_method(name, ...)`. Import it in `mining/methods/__init__.py`.
 - **Mining filter:** Create `mining/filters/your_filter.py` with `@register_filter(name, ...)`. Import it in `mining/filters/__init__.py`.
 
@@ -82,6 +89,8 @@ python3 -m venv .venv
 - **`raw/` is immutable.** Re-imports refuse to overwrite unless `--force` is passed.
 - **Unknown events are preserved, not dropped.** Importers emit `event_type="unknown"` with the original payload so nothing is silently lost.
 - **Everything is evidence-linked.** Signal readings and mined memories carry `event_id` references back to source events.
+- **Excluded sessions stay out of analysis.** Signals, rendering, mining, memory, benchmarks, and dashboards consult the catalog (`retro.catalog.load_catalog`) and skip `excluded` records; never re-implement ignore logic locally.
+- **Read payloads through accessors.** Normalized payloads keep host-native keys only; use `event_text`, `event_tool_input`, and `event_tool_output` from `utils.py` instead of hard-coded keys.
 - **The default archive is per-user, not cwd-local.** Resolve paths through `config.py` / `default_layout()` and keep tests isolated with `RETRO_DATA_DIR`.
 - **Archive publication is atomic.** Migration, sync, signal, normalized-event, and dashboard writes must stage and replace rather than expose partial files.
 - **Source providers write only to their supplied `Layout`.** The extension runtime stages and atomically publishes provider output.
@@ -112,9 +121,16 @@ python3 -m venv .venv
 
 ### Adding a new signal
 
-1. Write the signal function in `signals/heuristics.py` (or `external.py` if it touches the filesystem).
-2. Decorate with `@register(name, group=..., kind=..., method=..., description=...)`.
-3. Add a test in `tests/test_signals.py`.
+1. Derive any new facts once in `signals/profile.py` (`SessionProfile`), not inside the signal.
+2. Write the signal in `signals/definitions.py` with `@register(...)` metadata (category, kind, unit, polarity, method, version).
+3. Document the algorithm and its validation in `specs/rollout_signals_spec.md`.
+4. Add a test in `tests/test_signals.py`.
+
+### Adding a catalog rule
+
+1. Built-in rules live in `catalog/rules.py`; user rules live in the per-user config (`retro rules add`).
+2. Rules only tag sessions; the `exclude_tags` setting decides what is excluded.
+3. Add tests in `tests/test_catalog*.py`, including a `retro rules test` dry run.
 
 ### Adding a new mining method
 
@@ -130,13 +146,14 @@ python3 -m venv .venv
 - Don't publish a source provider that collides with a built-in host ID.
 - Don't add `event_text` / `iter_jsonl` / `truncate` helpers locally — use `utils.py`.
 - Don't skip tests for new functionality.
-- Don't hardcode model pricing — add entries to `dashboard/pricing/litellm-pricing.json` and run `refresh.py`.
+- Don't hardcode model pricing — add entries to `src/retro/pricing/litellm-pricing.json` and run `python dashboard/pricing/refresh.py`.
 
 ## Specs
 
 Design documents live in `specs/`. Read these for deeper context:
 
 - `full_rollout_capture_feature_spec.md` — the capture contract
+- `rollout_catalog_spec.md` — session catalog, ignore rules, markers, and project consolidation
 - `rollout_signals_spec.md` — signal taxonomy and aggregation
 - `rollout_mining_methods.md` — mining method catalog
 - `rollout_dashboard_spec.md` — dashboard design
