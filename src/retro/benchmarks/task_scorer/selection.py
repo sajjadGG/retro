@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from ...catalog import Catalog, load_catalog
 from ...schema import BUILTIN_HOSTS, Host, NormalizedEvent, read_events
 from ...storage import Layout
 from ...utils import atomic_write_text
@@ -241,6 +242,7 @@ def select_source(
     environment_resolver: EnvironmentResolver | None = None,
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+    _catalog: Catalog | None = None,
 ) -> tuple[SourceCandidate | None, SourceRejection | None]:
     """Evaluate one rollout against every §5.1 eligibility condition."""
     host = normalize_host(host)
@@ -255,6 +257,16 @@ def select_source(
             code=code,
             detail=detail,
             evidence=dict(evidence),
+        )
+
+    catalog = _catalog if _catalog is not None else load_catalog(layout)
+    catalog_record = catalog.get(f"{host}/{session_id}")
+    if catalog_record is not None and catalog_record.excluded:
+        return reject(
+            "EXCLUDED_BY_CATALOG",
+            "excluded by catalog",
+            tags=catalog_record.tags,
+            tag_sources=catalog_record.tag_sources,
         )
 
     normalized_path = layout.normalized_path(host, session_id)
@@ -411,6 +423,7 @@ def select_sources(
 ) -> SelectionResult:
     selected: list[SourceCandidate] = []
     rejections: list[SourceRejection] = []
+    catalog = load_catalog(layout)
     for host, session_id in sessions:
         candidate, rejection = select_source(
             layout=layout,
@@ -420,6 +433,7 @@ def select_sources(
             environment_resolver=environment_resolver,
             require_environment=require_environment,
             stability_horizon_days=stability_horizon_days,
+            _catalog=catalog,
         )
         if candidate is not None:
             selected.append(candidate)

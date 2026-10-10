@@ -36,6 +36,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 - [Source extensions](#source-extensions)
 - [Storage layout](#storage-layout)
 - [Capture](#capture)
+- [Session catalog: ignoring noise and consolidating projects](#session-catalog-ignoring-noise-and-consolidating-projects)
 - [Signals](#signals)
 - [Mining](#mining)
 - [Time-consistent benchmarks](#time-consistent-benchmarks)
@@ -158,14 +159,14 @@ directory before its old path becomes a compatibility symlink.
                   ┌──────────────────────────────────────────────────────────┐
                   │                       retro CLI                       │
                   ├──────────────┬─────────────┬──────────────┬───────────┤
-   ~/.claude  ──▶ │  importers   │   signals   │    mining    │  memory   │
-   ~/.codex   ──▶ │  (claude,    │  (heuristic │  (4 methods, │  index    │
- VS Code User ──▶ │ codex,       │  + external)│  + filters)  │  + weave  │
+   ~/.claude  ──▶ │  importers   │   catalog   │   signals    │  memory   │
+   ~/.codex   ──▶ │  (claude,    │ (identity,  │ + mining over│  index    │
+ VS Code User ──▶ │ codex,       │ tags, repos)│ included only│  + weave  │
                   │ copilot)     │             │              │           │
                   └──────┬───────┴──────┬──────┴───────┬──────┴─────┬─────┘
                          ▼              ▼              ▼            ▼
-                       raw/        normalized/      mined/      memories/
-                  (immutable)    (events.jsonl)   (per method) (files + SQLite)
+                       raw/        normalized/      catalog/     memories/
+                  (immutable)    (events.jsonl)   (sessions)   (files + SQLite)
                          │
                          ▼
                      rendered/   ← markdown view (any time)
@@ -242,6 +243,10 @@ rollout-memory/
     sidecars/               # Claude todos/tasks or Copilot edits/resources/session-store rows
 
   normalized/<host>/<session-id>.events.jsonl  # one normalized event per line
+
+  catalog/
+    sessions.jsonl                             # derived identity, context, project, tags, exclusion
+    annotations.jsonl                          # canonical append-only user edits
 
   rendered/<host>/<session-id>.md             # human-readable markdown view
 
@@ -371,6 +376,73 @@ Copilot CLI and VS Code Agent Host sessions are captured from `~/.copilot/sessio
 
 ---
 
+## Session catalog: ignoring noise and consolidating projects
+
+The catalog derives one record per archived session without re-importing it.
+It identifies the agent surface, interactive/headless state, subagent parent,
+cwd, Git remote, project, models, event counts, markers, rule tags, and final
+`excluded` decision. Inspect it with:
+
+```bash
+retro sessions list --included --project github.com/sajjadgg/retro
+retro sessions list --excluded --tag scratch --json
+retro sessions show codex/<session-id>
+retro sessions explain codex/<session-id>
+```
+
+Ignore a test or mimic session while it is running by putting a directive in
+its title or a user-authored message:
+
+```text
+#retro:ignore
+#retro:keep
+#retro:tag=evaluation
+#retro:project=github.com/example/repo
+```
+
+Directives in assistant output, quote lines, inline code, and fenced code do
+not count. `#retro:keep` removes an automatic `ignore`; it does not override a
+manual ignore. For directory-wide policy, create `.retroignore` in the working
+directory or an ancestor. An empty file means `ignore`; otherwise put one tag
+per line. Canonical edits are append-only:
+
+```bash
+retro sessions tag codex/<session-id> ignore
+retro sessions untag codex/<session-id> ignore
+retro sessions set-project codex/<session-id> github.com/example/repo
+retro sessions set-project codex/<session-id> --clear
+```
+
+Built-in rules tag temporary-directory, empty, automated, and subagent
+sessions. Only tags listed in `exclude_tags` exclude; the default is
+`["ignore"]`, so `automated` alone remains reviewable. Add or dry-run a rule:
+
+```bash
+retro rules add '{"id":"eval","match":{"prompt":"(?i)^below is a math problem"},"tags":["ignore"]}'
+retro rules test --json
+retro rules disable builtin.empty
+```
+
+Project identity prefers the current repository remote, falls back to archived
+Git metadata, and normalizes HTTPS, SSH, and Copilot `owner/name` forms to one
+lowercase `host/owner/repo`. It follows Git worktree `commondir` files and
+resolves symlinked cwd prefixes. Persist exceptional merges and display names:
+
+```bash
+retro projects list
+retro projects merge path:/old/clone github.com/example/repo
+retro projects rename github.com/example/repo "Example"
+```
+
+Excluded sessions remain in raw, normalized, and catalog evidence but do not
+feed mining, memory reindexing, or task-scorer selection. Use
+`retro mine ... --include-excluded` only for an explicit diagnostic override.
+GhostLab's originator/UUID filter prevents newly marked synthetic sessions
+from being captured at all; catalog rules handle historical and unmarked test
+traffic. See [`specs/rollout_catalog_spec.md`](specs/rollout_catalog_spec.md).
+
+---
+
 ## Signals
 
 Signals are evaluators that observe a captured rollout and emit a comparable reading (numeric / boolean / categorical). They answer: *"how did this rollout go, by some objective measure?"*
@@ -473,6 +545,9 @@ retro mine codex <thread-id> --method all       --filter risk_aware
 retro mine '*' '*' --method all --filter risk_aware
 retro mine codex  '*' --method skill_pro
 retro mine claude '*' --method memp_procedural --all
+
+# Explicit diagnostic override for a catalog-excluded session
+retro mine codex <thread-id> --include-excluded
 ```
 
 ### Output

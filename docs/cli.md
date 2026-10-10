@@ -32,6 +32,52 @@ retro show codex <thread-id>
 retro analyze
 ```
 
+## Session Catalog
+
+Read commands refresh changed catalog records before displaying them:
+
+```bash
+retro sessions list \
+  [--host <host>] [--agent <agent>] [--client <client>] \
+  [--project <id-or-name>] [--tag <tag>] \
+  [--excluded|--included] [--automated|--interactive] \
+  [--since <ISO-8601>] [--search <text>] [--limit 100] [--json]
+retro sessions show <host/session-id> [--json]
+retro sessions explain <host/session-id> [--json]
+retro sessions tag <host/session-id> <tag>
+retro sessions untag <host/session-id> <tag>
+retro sessions set-project <host/session-id> <project>
+retro sessions set-project <host/session-id> --clear
+```
+
+`explain` reports the configured exclusion tags, their intersection with the
+session's tags, every tag source, markers and annotations, and the one project
+decision/evidence that won.
+
+Manage classification rules with a JSON object or JSON file:
+
+```bash
+retro rules list [--json]
+retro rules add '{"id":"aime","match":{"prompt":"(?i)^below is a math problem"},"tags":["ignore"]}'
+retro rules remove aime
+retro rules enable builtin.empty
+retro rules disable builtin.empty
+retro rules test [<json-or-file>] [--samples 5] [--json]
+```
+
+`rules test` reads the existing catalog and never writes. Manage cross-path and
+cross-agent project identity:
+
+```bash
+retro projects list [--json]
+retro projects show <project-id> [--json]
+retro projects merge <source-id> <target-id>
+retro projects rename <project-id> <display-name>
+```
+
+All catalog/config write commands use the per-user archive lock. Project merges
+persist in `projects.aliases`; renames persist in `projects.names`.
+
 ## Signals
 
 ```bash
@@ -49,10 +95,12 @@ retro mine codex <thread-id>
 retro mine claude <session-id> --method skill_pro
 retro mine codex <thread-id> --method all --filter risk_aware
 retro mine '*' '*' --method all --filter risk_aware
+retro mine codex <thread-id> --include-excluded
 ```
 
 The `*` mining selector scans every host represented in normalized artifacts,
-including extension hosts.
+including extension hosts. Catalog-excluded sessions are skipped unless
+`--include-excluded` is explicit.
 
 Registered methods:
 
@@ -111,9 +159,10 @@ runtime input into the attempt identity, and executes from a verified temporary
 snapshot. All other candidate image declarations are overridden by the
 published image.
 
-Selection and construction write explicit rejection records. A rollout with no
-replayable goal is a valid zero-task result. Scorer or harness failures remain
-invalid attempts and are never converted into numeric zeroes.
+Selection and construction write explicit rejection records. Catalog-excluded
+sources receive `EXCLUDED_BY_CATALOG` with reason `excluded by catalog`. A
+rollout with no replayable goal is a valid zero-task result. Scorer or harness
+failures remain invalid attempts and are never converted into numeric zeroes.
 
 ## Memory
 

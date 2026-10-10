@@ -66,6 +66,7 @@ ignore = ["B008"]
 "src/retro/dashboard_experiments.py" = ["E501"]
 # Typer evaluates CLI annotations at runtime; Optional is required on Python 3.9.
 "src/retro/cli.py" = ["UP045"]
+"src/retro/catalog/cli.py" = ["UP045"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
