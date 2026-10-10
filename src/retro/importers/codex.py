@@ -49,7 +49,81 @@ _FUNCTION_TYPE_OVERRIDES: dict[str, EventType] = {
 _CUSTOM_TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "apply_patch": "file_edit",
 }
-NORMALIZER_VERSION = 3
+NORMALIZER_VERSION = 4
+
+
+@dataclass(frozen=True)
+class _MessageRecord:
+    actor: Actor
+    text: str
+    representation: str
+    source_index: int
+    event_id: str
+    turn_id: str | None
+    phase: str | None
+    duplicate: bool
+
+
+class _MessageMirrorTracker:
+    def __init__(self) -> None:
+        self.previous: _MessageRecord | None = None
+        self.by_source_item: dict[tuple[Actor, str], tuple[str, str]] = {}
+
+    def register(
+        self,
+        *,
+        actor: Actor,
+        text: str,
+        representation: str,
+        source_index: int,
+        event_id: str,
+        turn_id: str | None,
+        source_item_id: str | None,
+        phase: str | None,
+    ) -> str | None:
+        duplicate_of: str | None = None
+        item_key = (actor, source_item_id) if source_item_id else None
+        if item_key is not None:
+            previous_item = self.by_source_item.get(item_key)
+            if previous_item is not None and previous_item[1] == text:
+                duplicate_of = previous_item[0]
+
+        previous = self.previous
+        if (
+            duplicate_of is None
+            and previous is not None
+            and not previous.duplicate
+            and previous.source_index + 1 == source_index
+            and previous.actor == actor
+            and previous.text == text
+            and previous.representation != representation
+            and (
+                previous.turn_id is None
+                or turn_id is None
+                or previous.turn_id == turn_id
+            )
+            and (
+                previous.phase is None
+                or phase is None
+                or previous.phase == phase
+            )
+        ):
+            duplicate_of = previous.event_id
+
+        canonical_event_id = duplicate_of or event_id
+        if item_key is not None:
+            self.by_source_item[item_key] = canonical_event_id, text
+        self.previous = _MessageRecord(
+            actor=actor,
+            text=text,
+            representation=representation,
+            source_index=source_index,
+            event_id=event_id,
+            turn_id=turn_id,
+            phase=phase,
+            duplicate=duplicate_of is not None,
+        )
+        return duplicate_of
 
 
 @dataclass
@@ -351,7 +425,8 @@ class CodexImporter:
         gaps: set[str] = set()
         call_id_to_name: dict[str, str] = {}
         call_id_to_event_id: dict[str, str] = {}
-        represented_messages: dict[tuple[Actor, str], str] = {}
+        message_mirrors = _MessageMirrorTracker()
+        source_index = 0
         last_sequence = 0
         last_timestamp: str | None = None
         last_raw_ref: RawRef | None = None
@@ -359,6 +434,7 @@ class CodexImporter:
         assistant_actor: Actor = "assistant"
 
         for line_no, raw in iter_jsonl(rollout_path):
+            source_index += 1
             seq = line_no
             etype = raw.get("type")
             raw_timestamp = raw.get("timestamp")
@@ -427,7 +503,8 @@ class CodexImporter:
                     common,
                     timestamp_inferred=timestamp_inferred,
                     assistant_actor=assistant_actor,
-                    represented_messages=represented_messages,
+                    message_mirrors=message_mirrors,
+                    source_index=source_index,
                     call_id_to_name=call_id_to_name,
                     call_id_to_event_id=call_id_to_event_id,
                 )
@@ -455,7 +532,8 @@ class CodexImporter:
                     common,
                     timestamp_inferred=timestamp_inferred,
                     assistant_actor=assistant_actor,
-                    represented_messages=represented_messages,
+                    message_mirrors=message_mirrors,
+                    source_index=source_index,
                     call_id_to_name=call_id_to_name,
                     call_id_to_event_id=call_id_to_event_id,
                 )
@@ -556,15 +634,24 @@ class CodexImporter:
         *,
         timestamp_inferred: bool,
         assistant_actor: Actor,
-        represented_messages: dict[tuple[Actor, str], str],
+        message_mirrors: _MessageMirrorTracker,
+        source_index: int,
         call_id_to_name: dict[str, str],
         call_id_to_event_id: dict[str, str],
     ) -> NormalizedEvent | None:
         if ptype == "user_message":
             text = str(payload.get("message") or "")
             actor: Actor = "subagent" if assistant_actor == "subagent" else "user"
-            duplicate_of = represented_messages.get((actor, text))
-            represented_messages.setdefault((actor, text), str(common["event_id"]))
+            duplicate_of = message_mirrors.register(
+                actor=actor,
+                text=text,
+                representation="event_msg",
+                source_index=source_index,
+                event_id=str(common["event_id"]),
+                turn_id=_message_turn_id(payload),
+                source_item_id=_message_source_item_id(payload),
+                phase=_optional_string(payload.get("phase")),
+            )
             return NormalizedEvent(
                 actor=actor,
                 event_type="metadata" if duplicate_of else "message",
@@ -578,10 +665,15 @@ class CodexImporter:
             )
         if ptype == "agent_message":
             text = str(payload.get("message") or "")
-            duplicate_of = represented_messages.get((assistant_actor, text))
-            represented_messages.setdefault(
-                (assistant_actor, text),
-                str(common["event_id"]),
+            duplicate_of = message_mirrors.register(
+                actor=assistant_actor,
+                text=text,
+                representation="event_msg",
+                source_index=source_index,
+                event_id=str(common["event_id"]),
+                turn_id=_message_turn_id(payload),
+                source_item_id=_message_source_item_id(payload),
+                phase=_optional_string(payload.get("phase")),
             )
             return NormalizedEvent(
                 actor=assistant_actor,
@@ -750,7 +842,8 @@ class CodexImporter:
         *,
         timestamp_inferred: bool,
         assistant_actor: Actor,
-        represented_messages: dict[tuple[Actor, str], str],
+        message_mirrors: _MessageMirrorTracker,
+        source_index: int,
         call_id_to_name: dict[str, str],
         call_id_to_event_id: dict[str, str],
     ) -> NormalizedEvent:
@@ -775,8 +868,16 @@ class CodexImporter:
                 if role == "user"
                 else "assistant"
             )
-            duplicate_of = represented_messages.get((actor, text))
-            represented_messages.setdefault((actor, text), str(common["event_id"]))
+            duplicate_of = message_mirrors.register(
+                actor=actor,
+                text=text,
+                representation="response_item",
+                source_index=source_index,
+                event_id=str(common["event_id"]),
+                turn_id=_message_turn_id(payload),
+                source_item_id=_message_source_item_id(payload),
+                phase=_optional_string(payload.get("phase")),
+            )
             return NormalizedEvent(
                 actor=actor,
                 event_type="metadata" if duplicate_of else "message",
@@ -976,6 +1077,28 @@ def _message_payload(
         payload,
         timestamp_inferred=timestamp_inferred,
     )
+
+
+def _message_turn_id(payload: dict[str, Any]) -> str | None:
+    turn_id = payload.get("turn_id")
+    if turn_id:
+        return str(turn_id)
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, dict) and metadata.get("turn_id"):
+        return str(metadata["turn_id"])
+    return None
+
+
+def _message_source_item_id(payload: dict[str, Any]) -> str | None:
+    for key in ("item_id", "id", "client_id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _optional_string(value: Any) -> str | None:
+    return str(value) if value not in (None, "") else None
 
 
 def _deduplicate_tool_results(events: list[NormalizedEvent]) -> None:

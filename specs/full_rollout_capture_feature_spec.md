@@ -343,6 +343,12 @@ remains untimestamped. No following timestamp is backfilled.
 | `response_item.agent_message` | `message` | Actor follows the source `author` path (`/root` vs child agent). |
 | Any unlisted top-level or payload kind | `unknown` | Complete source payload is retained and reported as a capture gap. |
 
+Codex message mirrors are compacted only when records share an explicit source
+item ID, or when adjacent `event_msg`/`response_item` representations have the
+same actor and text with compatible turn and phase IDs. Text equality elsewhere
+in the session is never sufficient: repeated prompts or answers in later turns
+remain independent `message` events.
+
 ### Claude Code mapping
 
 | Raw record | Normalized type | Notes |

@@ -16,9 +16,16 @@ from retro.renormalize import (
 )
 from retro.schema import NormalizedEvent, RawRef
 from retro.storage import Layout
-from retro.utils import event_tool_input, event_tool_output
+from retro.utils import event_text, event_tool_input, event_tool_output
 
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
 
 
 def test_codex_v2_maps_known_records_and_pairs_results(tmp_path: Path):
@@ -80,6 +87,240 @@ def test_codex_v2_maps_known_records_and_pairs_results(tmp_path: Path):
     assert inferred
     assert all(event.timestamp == "2026-10-01T00:00:00Z" for event in inferred)
     assert all(event.payload.get("timestamp_inferred") is True for event in inferred)
+
+
+def test_codex_adjacent_cross_representation_messages_are_deduplicated(
+    tmp_path: Path,
+):
+    path = tmp_path / "mirror.jsonl"
+    _write_jsonl(
+        path,
+        [
+            {
+                "type": "session_meta",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "payload": {"id": "mirror", "cwd": "/workspace"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "user-item",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "client_id": "user-client",
+                    "turn_id": "turn-1",
+                    "message": "continue",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "turn_id": "turn-1",
+                    "phase": "commentary",
+                    "message": "Working",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "assistant-item",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Working"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"},
+                },
+            },
+        ],
+    )
+    importer = CodexImporter(Layout(tmp_path / "archive"), codex_home=tmp_path / "disabled")
+
+    events, unknown, gaps = importer._normalize(path, "mirror")
+
+    assert unknown == 0
+    assert gaps == []
+    messages = [
+        event
+        for event in events
+        if event.event_type == "message" and event.actor in {"user", "assistant"}
+    ]
+    duplicates = [
+        event
+        for event in events
+        if event.payload.get("metadata_kind") == "duplicate_message"
+    ]
+    assert [(event.actor, event_text(event)) for event in messages] == [
+        ("user", "continue"),
+        ("assistant", "Working"),
+    ]
+    assert [event.actor for event in duplicates] == ["user", "assistant"]
+    assert {event.payload["duplicate_of"] for event in duplicates} == {
+        event.event_id for event in messages
+    }
+
+
+def test_codex_repeated_text_in_separate_turns_is_not_deduplicated(
+    tmp_path: Path,
+):
+    path = tmp_path / "repeated-turns.jsonl"
+    records = [
+        {
+            "type": "session_meta",
+            "timestamp": "2026-10-01T00:00:00Z",
+            "payload": {"id": "repeated-turns", "cwd": "/workspace"},
+        }
+    ]
+    for turn_id in ("turn-1", "turn-2"):
+        records.extend(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": f"user-{turn_id}",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id
+                        },
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "client_id": f"client-{turn_id}",
+                        "turn_id": turn_id,
+                        "message": "continue",
+                    },
+                },
+            ]
+        )
+    for turn_id, phase in (("turn-1", "commentary"), ("turn-2", "final_answer")):
+        records.extend(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "turn_id": turn_id,
+                        "phase": phase,
+                        "message": "Done",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": f"assistant-{turn_id}",
+                        "role": "assistant",
+                        "phase": phase,
+                        "content": [{"type": "output_text", "text": "Done"}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "turn_id": turn_id
+                        },
+                    },
+                },
+            ]
+        )
+    _write_jsonl(path, records)
+    importer = CodexImporter(Layout(tmp_path / "archive"), codex_home=tmp_path / "disabled")
+
+    events, unknown, gaps = importer._normalize(path, "repeated-turns")
+
+    assert unknown == 0
+    assert gaps == []
+    messages = [
+        event
+        for event in events
+        if event.event_type == "message" and event.actor in {"user", "assistant"}
+    ]
+    duplicates = [
+        event
+        for event in events
+        if event.payload.get("metadata_kind") == "duplicate_message"
+    ]
+    assert [(event.actor, event_text(event)) for event in messages] == [
+        ("user", "continue"),
+        ("user", "continue"),
+        ("assistant", "Done"),
+        ("assistant", "Done"),
+    ]
+    assert [event.actor for event in duplicates] == [
+        "user",
+        "user",
+        "assistant",
+        "assistant",
+    ]
+
+
+def test_claude_and_copilot_preserve_repeated_message_text(tmp_path: Path):
+    claude_path = tmp_path / "claude.jsonl"
+    _write_jsonl(
+        claude_path,
+        [
+            {
+                "type": "user",
+                "uuid": "claude-1",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "continue"},
+            },
+            {
+                "type": "user",
+                "uuid": "claude-2",
+                "timestamp": "2026-10-01T00:01:00Z",
+                "isSidechain": False,
+                "message": {"role": "user", "content": "continue"},
+            },
+        ],
+    )
+    claude = ClaudeImporter(Layout(tmp_path / "claude-archive"), claude_home=tmp_path)
+    claude_events, _, _ = claude._normalize(claude_path, "claude-repeated")
+
+    copilot_path = tmp_path / "copilot.jsonl"
+    _write_jsonl(
+        copilot_path,
+        [
+            {
+                "type": "user.message",
+                "id": "copilot-1",
+                "timestamp": "2026-10-01T00:00:00Z",
+                "data": {"content": "continue"},
+            },
+            {
+                "type": "user.message",
+                "id": "copilot-2",
+                "timestamp": "2026-10-01T00:01:00Z",
+                "data": {"content": "continue"},
+            },
+        ],
+    )
+    copilot = CopilotCliImporter(
+        Layout(tmp_path / "copilot-archive"),
+        session_state_dir=tmp_path,
+    )
+    copilot_events, _, _ = copilot._normalize(copilot_path, "copilot-repeated")
+
+    assert [
+        event_text(event)
+        for event in claude_events
+        if event.actor == "user" and event.event_type == "message"
+    ] == ["continue", "continue"]
+    assert [
+        event_text(event)
+        for event in copilot_events
+        if event.actor == "user" and event.event_type == "message"
+    ] == ["continue", "continue"]
 
 
 def test_claude_v2_maps_metadata_injection_and_tool_results(tmp_path: Path):
