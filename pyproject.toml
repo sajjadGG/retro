@@ -39,6 +39,7 @@ Changelog = "https://github.com/sajjadGG/retro/blob/main/CHANGELOG.md"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/retro"]
+artifacts = ["src/retro/dashboard/assets/*"]
 
 [tool.mypy]
 python_version = "3.9"
@@ -46,11 +47,6 @@ warn_return_any = false
 warn_unused_configs = true
 disallow_untyped_defs = false
 check_untyped_defs = true
-
-[[tool.mypy.overrides]]
-# HTML-template modules moved in from dashboard/; never type-checked before.
-module = ["retro.dashboard_build", "retro.dashboard_experiments"]
-ignore_errors = true
 
 [tool.ruff]
 target-version = "py39"
@@ -61,9 +57,6 @@ select = ["E", "F", "I", "UP", "B"]
 ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
-# Generated-HTML modules: long template lines are deliberate.
-"src/retro/dashboard_build.py" = ["E501"]
-"src/retro/dashboard_experiments.py" = ["E501"]
 # Typer evaluates CLI annotations at runtime; Optional is required on Python 3.9.
 "src/retro/cli.py" = ["UP045"]
 

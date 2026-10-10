@@ -245,13 +245,9 @@ def rebuild_derived_artifacts(
         readings = run_signals(layout)
         signal_paths = write_signal_artifacts(layout, readings)
 
-        from .dashboard_publish import build_and_publish_dashboard
+        from .dashboard import build_and_publish
 
-        index_path = build_and_publish_dashboard(
-            artifact_root=layout.root,
-            output_dir=output_dir,
-            backup_dir=migration_dir / "backups" / "dashboard",
-        )
+        index_path = build_and_publish(layout, output_dir)
 
         report = {
             "rendered_sessions": render_count,

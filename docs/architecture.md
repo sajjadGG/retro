@@ -30,8 +30,8 @@ Flat files are canonical:
 Derived artifacts can be rebuilt:
 
 - `memories/index.sqlite`;
-- `dashboard/data/rollouts.json`;
-- `dashboard/index.html`.
+- `catalog/sessions.jsonl` and `signals/`;
+- the published dashboard generations (`index.html`, `assets/`, `data/*.js`).
 
 ## Source Discovery
 

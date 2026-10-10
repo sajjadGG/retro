@@ -1,0 +1,27 @@
+{
+  "started_at": "2026-10-09T02:00:00+00:00",
+  "completed_at": "2026-10-09T02:14:00+00:00",
+  "status": "failed",
+  "scheduled": true,
+  "archive_root": "/archive",
+  "dashboard_dir": "/dash",
+  "free_bytes": 37200158720,
+  "imported": [
+    "codex/019d0001-0000-7000-8000-000000000001"
+  ],
+  "unchanged": [],
+  "rendered": [],
+  "revisions": [],
+  "failures": [
+    {
+      "session": "vscode-copilot/f15d510d-e6aa-4a6b-a674-de5d65900004",
+      "error": "transcript vanished"
+    }
+  ],
+  "signals_recomputed": true,
+  "memory_reindexed": false,
+  "dashboard_rebuilt": false,
+  "derived_deferred": false,
+  "pending_sessions": [],
+  "warning": null
+}

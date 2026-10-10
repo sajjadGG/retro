@@ -64,12 +64,12 @@ jobs:
           retro dashboard build \
             --root /tmp/dash-smoke/rollout-memory \
             --out /tmp/dash-smoke/dashboard
-          retro dashboard experiments \
-            --root /tmp/dash-smoke/rollout-memory \
-            --out /tmp/dash-smoke/dashboard
           test -f dashboard/index.html
-          test -f dashboard/data/rollouts.json
-          test -f dashboard/trajectory_experiments.html
+          test -f dashboard/data/manifest.js
+          test -f dashboard/assets/app.js
+          retro dashboard view \
+            --root /tmp/dash-smoke/rollout-memory \
+            --no-interactive
 
       - name: Build distributions
         run: |

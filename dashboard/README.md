@@ -1,18 +1,25 @@
-# Rollout Dashboard
+# dashboard/
 
-Static dashboard for browsing captured rollout sessions and their metrics.
+This folder holds dashboard-adjacent tooling that is not part of the installed package.
 
-Build it from the repo root:
+The dashboard itself lives in `src/retro/dashboard/`:
 
 ```bash
-.venv/bin/retro dashboard build
+retro dashboard build     # build and publish
+retro dashboard view      # terminal view
 ```
 
-Then open:
+See `docs/dashboard.md` for usage and `specs/rollout_dashboard_spec.md` for the design.
 
-```text
-dashboard/index.html
+## pricing/
+
+`pricing/refresh.py` refreshes the curated LiteLLM rate snapshot at
+`src/retro/pricing/litellm-pricing.json`, which the signal pipeline uses to estimate
+`usage.cost_usd`. The dashboard only displays that signal.
+
+```bash
+python dashboard/pricing/refresh.py
 ```
 
-The builder ships inside the `retro` package (`retro.dashboard_build`); `build_dashboard.py` here is a back-compat shim. It reads the artifacts under `rollout-memory/` and writes a self-contained HTML file plus `dashboard/data/rollouts.json`.
-
+The published dashboard generations are written to the configured dashboard directory
+(`retro config` → `dashboard-dir`), not here.

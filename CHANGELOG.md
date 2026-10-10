@@ -4,6 +4,12 @@
 
 ### Added
 
+- Rebuilt the dashboard as `retro.dashboard`: a static, offline site driven by the
+  session catalog and the signal store, with Overview, Projects, Sessions explorer,
+  Session detail, Signals and Data-quality pages, URL-hash deep links, light/dark
+  themes and keyboard navigation. Session rows ship as a compact fact table in
+  `data/*.js` shards that the browser aggregates, per-session detail loads on demand
+  from fingerprint-keyed buckets, and `index.html` is a two-kilobyte shell.
 - Versioned `retro.sources` extension API with lazy entry-point discovery,
   `retro extensions list/doctor`, managed staged imports, and atomic raw plus
   normalized publication.
@@ -21,6 +27,22 @@
   independent sandboxes, exact repository snapshots, constrained Copilot tools
   and egress, a digest-pinned base image, private runner traces, and immutable
   scoring.
+
+### Changed
+
+- `retro dashboard build` takes `--mode auto|full` (shard reuse) instead of the old
+  cost modes, plus `--no-publish`; `retro dashboard view` reads the same inputs and
+  accepts `--root`, `--limit` and `--interactive/--no-interactive`.
+
+### Removed
+
+- `retro.dashboard_build`, `retro.dashboard_experiments`, `retro.dashboard_publish`,
+  `retro.dashboard_terminal` and `retro dashboard experiments`: the embedded-HTML
+  builder re-read every normalized event and emitted gigabyte-scale pages.
+- `retro quest` and `retro.quest`: the streak and XP state duplicated metrics by
+  re-reading normalized events, required an LLM call to generate quests, and ran on
+  every CLI invocation. Streaks and active days are now computed from the catalog and
+  shown on the dashboard Overview.
 
 ## 0.3.0 - 2026-08-27
 
