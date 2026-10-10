@@ -423,27 +423,32 @@ def commit_was_noop(output: str) -> bool:
 
 
 def command_text(event: NormalizedEvent) -> str:
-    """Extract the command line from a normalized call event, any host."""
+    """Extract the command line from a normalized call event, any host or schema.
+
+    v1 kept the command under `payload.arguments`/`payload.input`; v3 keeps the
+    host-native container instead (Claude `part.input`, Copilot
+    `request.arguments`, Codex `arguments` as a JSON string), so the shared
+    `payload_tool_input` accessor has to do the walking.
+    """
     payload = event.payload or {}
     if not isinstance(payload, dict):
         return ""
-    for container in (
-        payload,
-        payload.get("arguments"),
-        payload.get("input"),
-        event_tool_input(event),
-    ):
+    # Union of both extraction paths: the explicit v1 containers, the shared v3
+    # accessor, and a JSON-encoded tool input (Codex serializes its arguments).
+    for container in (payload, payload.get("arguments"), payload.get("input"), event_tool_input(event)):
         text = _command_from_container(container)
         if text:
             return text
+    for raw in (event_tool_input(event), payload.get("arguments")):
+        if isinstance(raw, str):
+            text = _command_from_container(_maybe_json(raw))
+            if text:
+                return text
+    # A bare `arguments` string is the v1 Codex shape for a shell call; a bare
+    # `input` string is ambiguous (apply_patch bodies live there) and is not one.
     arguments = payload.get("arguments")
-    if isinstance(arguments, str):
-        parsed = _maybe_json(arguments)
-        text = _command_from_container(parsed)
-        if text:
-            return text
-        if event.event_type == "command" and parsed is None:
-            return arguments
+    if event.event_type == "command" and isinstance(arguments, str) and _maybe_json(arguments) is None:
+        return arguments
     return ""
 
 
@@ -460,6 +465,9 @@ def _command_from_container(container: Any) -> str:
                 return parts[2]
             if parts:
                 return " ".join(parts)
+    nested = container.get("input")
+    if isinstance(nested, dict):
+        return _command_from_container(nested)
     return ""
 
 

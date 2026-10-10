@@ -373,6 +373,239 @@ class TestProfileCounts:
         assert profile.time_to_first_edit_s == pytest.approx(10.0)
 
 
+class TestNormalizationV3Payloads:
+    """v3 keeps host-native containers instead of duplicated alias keys."""
+
+    def test_claude_v3_tool_call_and_result_through_part(self):
+        events = [
+            event(
+                1,
+                "assistant",
+                "command",
+                payload={
+                    "call_id": "toolu_1",
+                    "name": "Bash",
+                    "part": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": {"command": "pytest -q", "description": "run tests"},
+                    },
+                    "message": {"role": "assistant", "id": "msg_1"},
+                },
+                host="claude-code",
+            ),
+            event(
+                2,
+                "tool",
+                "tool_result",
+                payload={
+                    "call_id": "toolu_1",
+                    "name": "Bash",
+                    "part": {
+                        "tool_use_id": "toolu_1",
+                        "type": "tool_result",
+                        "content": "1 failed, 2 passed\nExit code 1",
+                        "is_error": True,
+                    },
+                    "message": {"role": "user"},
+                },
+                host="claude-code",
+            ),
+        ]
+        profile = profile_for(events, host="claude-code")
+        assert profile.command_calls == 1
+        assert profile.base_commands["pytest"] == 1
+        assert profile.unlinked_results == 0
+        assert profile.tool_errors == 1
+        assert [(run.category, run.ok) for run in profile.validation_runs] == [("test", False)]
+
+    def test_claude_v3_edit_through_part_counts_paths_and_lines(self):
+        events = [
+            event(
+                1,
+                "assistant",
+                "file_edit",
+                payload={
+                    "call_id": "toolu_2",
+                    "name": "Write",
+                    "part": {
+                        "type": "tool_use",
+                        "id": "toolu_2",
+                        "name": "Write",
+                        "input": {"file_path": "/w/a.py", "content": "line1\nline2\nline3"},
+                    },
+                },
+                host="claude-code",
+            )
+        ]
+        profile = profile_for(events, host="claude-code")
+        assert profile.file_edits == 1
+        assert profile.files_edited == {"/w/a.py"}
+        assert profile.edited_lines == 3
+
+    def test_copilot_v3_command_through_request(self):
+        events = [
+            event(
+                1,
+                "subagent",
+                "command",
+                payload={
+                    "call_id": "call_1",
+                    "name": "bash",
+                    "model": "claude-sonnet-5",
+                    "request": {
+                        "toolCallId": "call_1",
+                        "name": "bash",
+                        "arguments": {"command": "git commit -m x", "description": "commit"},
+                    },
+                },
+                host="vscode-copilot",
+            ),
+            event(
+                2,
+                "tool",
+                "tool_result",
+                payload={"call_id": "call_1", "name": "bash", "success": True, "result": "1 file changed"},
+                host="vscode-copilot",
+            ),
+        ]
+        profile = profile_for(events, host="vscode-copilot")
+        assert profile.command_calls == 1
+        assert profile.committed is True
+        assert profile.unlinked_results == 0
+
+    def test_codex_v3_json_string_arguments(self):
+        events = [
+            event(
+                1,
+                "assistant",
+                "command",
+                payload={
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd": "ruff check src", "workdir": "/w"}',
+                    "call_id": "call_1",
+                },
+            ),
+            event(
+                2,
+                "tool",
+                "tool_result",
+                payload={
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "output": "Process exited with code 0",
+                    "success": True,
+                    "is_error": False,
+                    "exit_code": 0,
+                },
+            ),
+        ]
+        profile = profile_for(events)
+        assert profile.base_commands["ruff"] == 1
+        assert profile.tool_errors == 0
+        assert [(run.category, run.ok) for run in profile.validation_runs] == [("lint", True)]
+
+    def test_codex_v3_json_string_file_read_paths(self):
+        events = [
+            event(
+                1,
+                "assistant",
+                "file_read",
+                payload={
+                    "type": "function_call",
+                    "name": "read_file",
+                    "arguments": '{"path": "/w/src/app.py"}',
+                    "call_id": "c1",
+                },
+            )
+        ]
+        profile = profile_for(events)
+        assert profile.files_read == {"/w/src/app.py"}
+
+    def test_codex_v3_patch_input_is_a_bare_string(self):
+        patch = "*** Begin Patch\n*** Update File: /w/a.py\n@@\n+added\n-removed\n*** End Patch\n"
+        events = [
+            event(
+                1,
+                "assistant",
+                "file_edit",
+                payload={"type": "custom_tool_call", "name": "apply_patch", "input": patch, "call_id": "c1"},
+            )
+        ]
+        profile = profile_for(events)
+        assert profile.files_edited == {"/w/a.py"}
+        assert profile.edited_lines == 2
+
+    def test_repeated_results_for_one_call_are_counted_once(self):
+        events = [
+            event(1, "assistant", "file_edit", payload={"call_id": "c1", "name": "apply_patch"}),
+            event(
+                2,
+                "tool",
+                "tool_result",
+                payload={"call_id": "c1", "type": "patch_apply_begin", "output": "start"},
+            ),
+            event(
+                3, "tool", "tool_result", payload={"call_id": "c1", "type": "patch_apply_end", "output": "ok"}
+            ),
+        ]
+        profile = profile_for(events)
+        assert profile.tool_results == 1
+        assert profile.unlinked_results == 0
+
+    def test_a_late_failure_overturns_an_early_success(self):
+        events = [
+            event(1, "assistant", "command", payload={"call_id": "c1", "arguments": {"cmd": "make build"}}),
+            event(2, "tool", "tool_result", payload={"call_id": "c1", "output": "building"}),
+            event(
+                3, "tool", "tool_result", payload={"call_id": "c1", "output": "Process exited with code 2"}
+            ),
+        ]
+        profile = profile_for(events)
+        assert profile.tool_results == 1
+        assert profile.tool_errors == 1
+        assert profile.ended_in_error is True
+
+    def test_v3_lifecycle_hooks_are_not_tool_results(self):
+        events = [
+            event(1, "hook", "lifecycle", payload={"hookType": "preToolUse", "lifecycle": "hook_start"}),
+            event(
+                2,
+                "hook",
+                "lifecycle",
+                payload={"hookType": "preToolUse", "lifecycle": "hook_end", "success": True},
+            ),
+        ]
+        profile = profile_for(events, host="vscode-copilot")
+        assert profile.tool_results == 0
+        assert profile.tool_calls == 0
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>\nstuff\n</INSTRUCTIONS>",
+            '<skill-context name="commit">Base instructions</skill-context>',
+            "<task-notification> <task-id>b3q</task-id> </task-notification>",
+            "<turn_aborted> The user interrupted the turn",
+            '<subagent_notification> {"agent_path": "x"}',
+            "<environment_context>\n<cwd>/w</cwd>\n</environment_context>",
+        ],
+    )
+    def test_v3_injected_user_envelopes_are_not_human_turns(self, text):
+        profile = profile_for([event(1, "user", "message", payload={"message": {"content": text}})])
+        assert profile.user_turns == 0
+        assert profile.injected_user_messages == 1
+
+    def test_injected_envelope_followed_by_a_real_request_still_counts(self):
+        text = "<environment_context>\n<cwd>/w</cwd>\n</environment_context>\n\nadd a retry to the client"
+        profile = profile_for([event(1, "user", "message", payload={"message": {"content": text}})])
+        assert profile.user_turns == 1
+        assert profile.first_prompt == "add a retry to the client"
+
+
 class TestUsageExtraction:
     def test_codex_token_count_from_normalized_events(self):
         events = [
@@ -516,6 +749,66 @@ class TestUsageExtraction:
         assert stats.by_model["copilot/auto"]["input"] == 18145
         assert stats.by_model["copilot/auto"]["output"] == 180
         assert stats.credits == pytest.approx(0.98)
+
+    def test_claude_v3_usage_is_deduplicated_across_message_parts(self):
+        usage = {
+            "input_tokens": 6,
+            "cache_creation_input_tokens": 7416,
+            "cache_read_input_tokens": 16526,
+            "output_tokens": 333,
+        }
+        message = {"id": "msg_1", "model": "claude-opus-4-7", "usage": usage}
+        events = [
+            event(
+                index,
+                "assistant",
+                kind,
+                payload={"requestId": "req_1", "message": dict(message)},
+                host="claude-code",
+            )
+            for index, kind in enumerate(("message", "command", "file_edit", "reasoning"), start=1)
+        ]
+        stats = extract_usage("claude-code", "s1", events, Path("/nonexistent"))
+        assert stats.source == "normalized"
+        assert stats.by_model["claude-opus-4-7"] == {
+            "input": 6,
+            "cache_read": 16526,
+            "cache_create": 7416,
+            "output": 333,
+            "reasoning": 0,
+        }
+
+    def test_distinct_claude_responses_are_both_counted(self):
+        def usage_event(index, message_id, request_id):
+            return event(
+                index,
+                "assistant",
+                "message",
+                payload={
+                    "requestId": request_id,
+                    "message": {
+                        "id": message_id,
+                        "model": "claude-opus-4-7",
+                        "usage": {"input_tokens": 10, "output_tokens": 5},
+                    },
+                },
+                host="claude-code",
+            )
+
+        stats = extract_usage(
+            "claude-code",
+            "s1",
+            [usage_event(1, "msg_1", "req_1"), usage_event(2, "msg_2", "req_2")],
+            Path("/nonexistent"),
+        )
+        assert stats.by_model["claude-opus-4-7"]["input"] == 20
+
+    def test_codex_v3_usage_event_with_null_info_is_ignored(self):
+        events = [
+            event(1, "system", "usage", payload={"type": "token_count", "info": None, "rate_limits": {}}),
+        ]
+        stats = extract_usage("codex", "s1", events, Path("/nonexistent"))
+        assert stats.has_usage is False
 
     def test_no_usage_reports_none(self):
         stats = extract_usage("codex", "s1", [event(1, "user", "message")], Path("/nonexistent"))

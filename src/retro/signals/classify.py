@@ -46,6 +46,8 @@ _KIND_SPECIFICITY: tuple[str, ...] = (
     "other",
 )
 _KIND_PRECEDENCE = {kind: index for index, kind in enumerate(_KIND_SPECIFICITY)}
+CUE_WINDOW = 600
+IDLE_CUE_WINDOW = 300
 _CUE_WEIGHTS: dict[str, int] = {
     "debug": 3,
     "test": 3,
@@ -147,6 +149,10 @@ def classify_work_kind(profile: SessionProfile) -> Judgement:
     opaque = not profile.first_prompt and not profile.assistant_messages and not profile.file_edits
     if not prompt or opaque:
         return Judgement("other", 0.3, (), "opaque run: no human prompt or assistant output")
+    # Nothing was realized: no reply, no tools, no edits. Only an intent stated
+    # up front counts; a keyword buried in a long prompt is not evidence.
+    idle = not profile.assistant_messages and not profile.tool_calls and not profile.file_edits
+    cue_window = IDLE_CUE_WINDOW if idle else CUE_WINDOW
     scores: Counter[str] = Counter()
     cue_hits = []
     positions = {}
@@ -156,9 +162,12 @@ def classify_work_kind(profile: SessionProfile) -> Judgement:
             scores[kind] += _CUE_WEIGHTS.get(kind, 2)
             cue_hits.append(kind)
             positions[kind] = match.start()
-    if positions:
+    early = {kind: at for kind, at in positions.items() if at < cue_window}
+    if early:
         # The intent stated first is usually the real one.
-        scores[min(positions, key=lambda kind: positions[kind])] += 2
+        scores[min(early, key=lambda kind: early[kind])] += 2
+    elif idle:
+        return Judgement("other", 0.3, (), "no realized work and no up-front intent")
 
     edits = profile.file_edits
     edited = profile.files_edited

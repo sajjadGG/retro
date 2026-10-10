@@ -57,9 +57,13 @@ Three properties follow from this shape and are non-negotiable:
    `work.kind`) so their rules can be argued with and re-tuned against hand
    labels without touching extraction.
 3. **Payload-driven, not type-driven.** Extraction keys on actor plus payload
-   content, never on `event_type` alone, because the normalized taxonomy is
-   changing (`usage`, `lifecycle`, `metadata` are being added) and the same
-   logical thing is typed differently per importer and per schema version.
+   content, never on `event_type` alone, and reads tool input/output through the
+   shared `retro.utils` accessors (`event_text`, `event_tool_input`,
+   `event_tool_output`) rather than hard-coded keys. Normalization v3 stopped
+   serializing duplicated alias keys and keeps the host-native container
+   instead — Claude under `part`, Copilot under `request`, Codex as a
+   JSON-encoded `arguments` string — so every extractor must accept both the v1
+   and v3 shapes. §11 records the measured v1-vs-v3 behavior.
 
 ### Module map
 
@@ -139,15 +143,19 @@ everything to one bucket — `input` (fresh, uncached), `cache_read`,
 
 | Source | Location | Conversion |
 | --- | --- | --- |
-| Codex | normalized events, `payload.type == "token_count"`; `info.last_token_usage` (per-turn delta) or `info.total_token_usage` (cumulative, differenced); model from the preceding `turn_context` payload | `input = input_tokens − cached_input_tokens`, `cache_read = cached_input_tokens` |
-| Claude Code | `raw/claude-code/<id>/transcript.jsonl`, assistant `message.usage` + `message.model`, deduplicated on `(message.id, requestId)`, `<synthetic>` skipped | fields are already disjoint; the `cache_creation` dict is summed when the scalar is absent |
+| Codex | normalized events, `payload.type == "token_count"`; `info.last_token_usage` (per-turn delta) or `info.total_token_usage` (cumulative, differenced); `info` is `null` on rate-limit-only snapshots and those are skipped; model from the preceding `turn_context` payload | `input = input_tokens − cached_input_tokens`, `cache_read = cached_input_tokens` |
+| Claude Code | v3 normalized events carry the host record, so `message.usage` + `message.model` are read from the event stream; v1 archives fall back to `raw/claude-code/<id>/transcript.jsonl`. Either way deduplicated on `(message.id, requestId)`, `<synthetic>` skipped | fields are already disjoint; the `cache_creation` dict is summed when the scalar is absent |
 | Copilot CLI / Agent Host | `raw/vscode-copilot/<id>/sidecars/session-store.json` → `assistant_usage_events[]` | `input = input_tokens − cache_read_tokens − cache_write_tokens`; `request_multiplier` summed into `usage.credits` |
 | VS Code chat | `raw/vscode-copilot/<id>/session.snapshot.json` → `requests[]` (`modelTotals` preferred) | `input = promptTokens`, `output = completionTokens`; no cache split exists, so `cache_read = 0` |
 
 Normalized events are tried first and the raw copy is the fallback, keyed on
-payload shape. When the normalization workstream starts emitting `usage` events
-for Claude and Copilot, those are picked up with no change here and
-`quality.usage_source` flips from `raw` to `normalized`.
+payload shape. Deduplication is not optional: v3 repeats one Anthropic
+response's `message.usage` on every part of a multi-part message, so the same
+token block appears on the text event and on each `tool_use` event — 12,540
+copies of 6,170 distinct responses in the 43-session Claude sample, a 2.03×
+over-count if counted naively. With the `(message.id, requestId)` key the
+normalized totals match the raw totals exactly, and `quality.usage_source`
+flips from `raw` to `normalized`.
 
 Pricing: model ids are normalized (`copilot/claude-sonnet-4.6` →
 `claude-sonnet-4-6`; date and `-latest` suffixes stripped) and looked up in
@@ -409,16 +417,28 @@ re-validate after any rule change.
 
 ### Measured agreement (n = 60)
 
-| Signal | Result |
-| --- | --- |
-| `outcome.status` | 87% exact agreement. `success` precision 0.86 / recall 1.00; `unknown` precision 1.00 / recall 0.93; `abandoned` precision 1.00 / recall 0.67; `partial` and `failed` recall ≈ 0 |
-| `work.kind` | 77% exact agreement over 11 classes |
-| `outcome.validated` | 98% agreement including the `null` (no validation ran) case |
-| `friction.interruptions` | precision 1.00, recall 1.00 |
-| `friction.user_corrections` | precision 0.78, recall 0.30; exact per-session count agreement 50/60 |
+Re-measured after the archive was re-normalized to v3. 35 of the 60 bundles had
+materially different evidence under v3 (host-injected envelopes removed,
+per-part duplicates collapsed, conversations that v1 mis-typed restored) and
+were blind-relabeled from the v3 evidence; the other 25 labels were unchanged.
+
+| Signal | Result (v3) | Result (v1) |
+| --- | --- | --- |
+| `outcome.status` | 85% exact. `success` precision 0.88 / recall 0.98; `unknown` precision 1.00 / recall 1.00; `abandoned` precision 1.00 / recall 0.67; `partial` and `failed` recall ≈ 0 | 87% |
+| `work.kind` | 67% exact over 11 classes | 77% |
+| `outcome.validated` | 98% including the `null` (no validation ran) case | 98% |
+| `friction.interruptions` | precision 1.00, recall 1.00 | 1.00 / 1.00 |
+| `friction.user_corrections` | precision 1.00, recall 0.23; exact per-session count agreement 48/60 | 0.78 / 0.30 |
+
+The two figures are not directly comparable: the v3 label set is a different
+population (far fewer content-free sessions, so `research`/`chat`/`explore`
+replace much of the old `other` mass, and 11 classes over 60 sessions leaves
+~5 sessions per class). `work.kind` lost the easy `other` cases; corrections
+gained precision because the injected-envelope filter removed the task briefs
+that used to trip the weak patterns.
 
 Targets for future changes: `outcome.status` ≥ 85% accuracy with `success`
-precision ≥ 0.85; `work.kind` ≥ 75%; `friction.user_corrections` precision ≥ 0.75;
+precision ≥ 0.85; `work.kind` ≥ 65%; `friction.user_corrections` precision ≥ 0.75;
 `outcome.validated` ≥ 0.95; `friction.interruptions` precision ≥ 0.95. A change
 that trades precision for recall on corrections must be rejected: the signal
 drives a behavioral recommendation, and a false "you corrected the agent nine
@@ -476,6 +496,55 @@ of them included after temp-directory exclusion), single process, Python 3.9.6:
 
 Against v0: 600 MB → 2.3 MB on disk, and a re-run with nothing changed goes from
 a full rebuild to a fingerprint comparison.
+
+## 11. Normalization v1 vs v3
+
+Measured on the 348-session sample normalized both ways (same `raw/`, same
+code). "Equal" means byte-identical signal values for all 348 sessions.
+
+| Signal | Δ | Explanation |
+| --- | --- | --- |
+| `usage.tokens_*`, `usage.cost_usd` | **equal** | Claude usage moved from the raw transcript into the event stream; deduplicated on `(message.id, requestId)` it reproduces the raw totals exactly (10,461,252,852 tokens, $7,743.01) |
+| `usage.duration_s`, `usage.active_s` | **equal** | timestamps unchanged for events that had them |
+| `activity.commands`, `activity.files_touched`, `activity.files_read`, `activity.edited_lines`, `work.validation_commands`, `risk.destructive_commands`, `outcome.committed`, `outcome.validated`, `outcome.ended_in_error` | **equal** | extraction now goes through the shared accessors, so the host-native containers yield the same values as the v1 alias keys |
+| `activity.user_turns` | −35% (113 sessions up, 64 down) | v3 surfaces real Codex conversations that v1 mis-typed (+), stops emitting one user event per message *part* (Copilot), routes agent→subagent task prompts to `actor="subagent"`, and exposes host-injected envelopes (`# AGENTS.md instructions for`, `<skill-context>`, `<task-notification>`, `<turn_aborted>`) which the profile now filters |
+| `activity.assistant_turns` | −0.14% (16 Codex sessions) | two sessions gain a whole conversation (0 → 50, 0 → 20); the rest lose one duplicate record each |
+| `activity.tool_calls` | +0.60% (46 up, 2 down) | v3 drops duplicate call records (one Copilot session: 819 records / 634 distinct ids → 648 records / 640 distinct ids) and types a few previously-`unknown` records as calls |
+| `activity.file_edits` | −0.10% (2 Copilot sessions) | v1 emitted the same `copilot_createFile` call twice; v3 emits it once |
+| `friction.tool_errors` / `tool_error_rate` | +0.10% / +1.32% | v3 carries normalized `success` / `is_error` / `exit_code` on results, so failures that were only visible as text are now exact |
+| `friction.interruptions` | +8.7% | `<turn_aborted>` envelopes are now in the stream |
+| `friction.longest_error_streak` | +0.29% | follows the error changes |
+| `friction.user_corrections` | +2.6% (4 sessions) | follows the human-turn changes |
+| `outcome.status` | 12 sessions move | `success → unknown ×7` (Codex sessions whose "conversation" was 83 injected pseudo-messages), `unknown → success ×4` (conversations v1 dropped entirely), `success → failed ×1` (the genuine last human turn is now visible) |
+| `work.kind` | 12 sessions move | follows the prompt changes; no systematic drift |
+| `risk.secret_exposure` | 1 session `False → True` | v3 preserves a payload v1 dropped |
+| `quality.unknown_events` | **−100%** (8,132 → 0) | v3 classifies every record |
+| `quality.untimed_event_ratio` | −78% | v3 infers timestamps for records that had none |
+| `quality.unlinked_result_ratio` | −6.7% (31 sessions better, 3 worse) | normalized `call_id` on both sides of every pair |
+| `quality.capture_score` | +13.6%, **220 sessions up, 0 down** | the composite of the four rows above |
+| `quality.usage_source` | `raw → normalized` ×34 | Claude no longer needs its raw transcript read |
+
+Two v3 shapes required code changes beyond the accessors, and both are now
+tested:
+
+- **Repeated results for one call.** v3 emits every host record of a single tool
+  invocation (`patch_apply_begin` + `patch_apply_end`, output deltas), so one
+  Codex session produced 664 result events for 351 calls. The profile scores the
+  first result per `call_id` and lets a later failure overturn an early success;
+  without this, `quality.unlinked_result_ratio` regressed by +27%.
+- **JSON-encoded tool input.** Codex serializes `arguments` as a JSON string, so
+  `event_file_paths` saw text where it expects a mapping and reported no paths
+  for reads. The profile parses the string and re-runs the shared extractor.
+
+Still lossy in v3, independent of this layer:
+
+- Agent→subagent task prompts (`actor="subagent"`, `event_type="message"`) are
+  neither human turns nor assistant turns, so a session whose only instruction
+  came from a parent agent has no `first_prompt` and classifies as `other`.
+- Copilot still reports no per-request token usage in the normalized stream;
+  `usage.*` for that host continues to read `sidecars/session-store.json`.
+- Structured provider errors are still absent from the stream, so
+  `friction.provider_errors` remains a regex over text at confidence 0.6.
 
 ## 10. CLI
 
