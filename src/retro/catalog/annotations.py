@@ -25,8 +25,19 @@ class AnnotationState:
 
     @property
     def digest(self) -> str:
+        return self._digest_ops(ANNOTATION_OPS)
+
+    @property
+    def tag_digest(self) -> str:
+        return self._digest_ops({"tag", "untag"})
+
+    @property
+    def project_digest(self) -> str:
+        return self._digest_ops({"set-project", "clear-project"})
+
+    def _digest_ops(self, operations: set[str]) -> str:
         encoded = json.dumps(
-            self.entries,
+            [entry for entry in self.entries if entry["op"] in operations],
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

@@ -1,6 +1,7 @@
 """Catalog rule matching and built-in quality filters."""
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,7 +43,7 @@ _BUILTIN_RULES = (
     ),
     CatalogRule(
         id="builtin.empty",
-        description="Sessions with no normalized user-authored messages.",
+        description="Sessions missing a user prompt or any assistant/tool activity.",
         enabled=True,
         match={},
         tags=["empty", "ignore"],
@@ -176,7 +177,14 @@ def rule_matches(record: SessionRecord, rule: CatalogRule | dict[str, Any]) -> b
 
 def _builtin_matches(record: SessionRecord, rule_id: str) -> bool:
     if rule_id == "builtin.empty":
-        return record.counts.get("user_messages", 0) == 0
+        has_prompt = bool(
+            record.first_prompt and record.first_prompt.strip()
+        )
+        has_activity = bool(
+            record.counts.get("assistant_messages", 0)
+            or record.counts.get("tool_calls", 0)
+        )
+        return not has_prompt or not has_activity
     if rule_id == "builtin.automated":
         return record.interactive is False
     if rule_id == "builtin.subagent":
@@ -187,12 +195,38 @@ def _builtin_matches(record: SessionRecord, rule_id: str) -> bool:
 
 
 def is_temp_path(value: str) -> bool:
-    normalized = value.replace("\\", "/")
-    return bool(
-        re.match(r"^/(?:private/)?var/folders/.+/T/tmp[^/]*(?:/|$)", normalized)
-        or re.match(r"^/(?:private/)?tmp(?:/|$)", normalized)
-        or re.search(r"/AppData/Local/Temp(?:/|$)", normalized, re.IGNORECASE)
+    normalized = os.path.expandvars(value).replace("\\", "/").rstrip("/")
+    static_roots = (
+        "/tmp",
+        "/private/tmp",
+        "/var/tmp",
+        "/private/var/tmp",
     )
+    if any(_path_under(normalized, root) for root in static_roots):
+        return True
+    if re.match(
+        r"^/(?:private/)?var/folders/[^/]+/[^/]+/T(?:/|$)",
+        normalized,
+    ):
+        return True
+    configured = os.environ.get("TMPDIR")
+    if configured:
+        tmpdir = os.path.expandvars(
+            os.path.expanduser(configured)
+        ).replace("\\", "/").rstrip("/")
+        if tmpdir and _path_under(normalized, tmpdir):
+            return True
+    return bool(
+        re.search(
+            r"/AppData/Local/Temp(?:/|$)",
+            normalized,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _path_under(value: str, root: str) -> bool:
+    return value == root or value.startswith(root + "/")
 
 
 def _one_of(actual: Any, expected: list[str]) -> bool:

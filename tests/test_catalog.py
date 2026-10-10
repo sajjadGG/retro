@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import retro.catalog.store as catalog_store
 from retro.catalog import SessionRecord, load_catalog, update_catalog
 from retro.catalog.annotations import append_annotation
 from retro.catalog.markers import parse_markers
@@ -16,7 +17,12 @@ from retro.catalog.projects import (
     path_glob_matches,
     resolve_cwd,
 )
-from retro.catalog.rules import CatalogRule, rule_matches
+from retro.catalog.rules import (
+    CatalogRule,
+    catalog_rules,
+    is_temp_path,
+    rule_matches,
+)
 from retro.config import RetroConfig, save_config
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.storage import Layout
@@ -438,7 +444,11 @@ plain #ReTrO:tag=useful and #retro:project=Owner/Repo
     assert len(record.title or "") == 200
 
 
-def test_retroignore_keep_and_annotation_precedence(tmp_path: Path):
+def test_retroignore_keep_and_annotation_precedence(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("TMPDIR", "/not-this-test-workspace")
     workspace = tmp_path / "workspace"
     nested = workspace / "subdir"
     nested.mkdir(parents=True)
@@ -466,6 +476,7 @@ def test_retroignore_keep_and_annotation_precedence(tmp_path: Path):
     assert record.tag_sources["evaluation"] == [
         f"dotfile:{workspace / '.retroignore'}"
     ]
+    before_fingerprint = record.fingerprint
 
     append_annotation(layout.root, key=record.key, op="untag", value="evaluation")
     append_annotation(layout.root, key=record.key, op="tag", value="curated")
@@ -475,8 +486,14 @@ def test_retroignore_keep_and_annotation_precedence(tmp_path: Path):
         op="set-project",
         value="github.com/example/manual",
     )
+    monkeypatch.setattr(
+        catalog_store,
+        "_scan_events",
+        lambda path: pytest.fail(f"unexpected event scan: {path}"),
+    )
     update_catalog(layout, keys=[record.key])
     updated = load_catalog(layout)[record.key]
+    assert updated.fingerprint == before_fingerprint
     assert "evaluation" not in updated.tags
     assert updated.tag_sources["curated"] == ["manual"]
     assert updated.project == {
@@ -487,7 +504,8 @@ def test_retroignore_keep_and_annotation_precedence(tmp_path: Path):
     }
 
 
-def test_empty_retroignore_means_ignore(tmp_path: Path):
+def test_empty_retroignore_means_ignore(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("TMPDIR", "/not-this-test-workspace")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / ".retroignore").write_text("", encoding="utf-8")
@@ -621,6 +639,142 @@ def test_rule_fields_are_anded_and_empty_lists_are_unconstrained():
     assert not rule_matches(record, failing)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/tmp",
+        "/tmp/session",
+        "/private/tmp",
+        "/private/tmp/copilot-probe2",
+        "/var/tmp",
+        "/var/tmp/session",
+        "/private/var/tmp",
+        "/private/var/tmp/session",
+        "/var/folders/aa/bb/T",
+        "/var/folders/aa/bb/T/session",
+        "/private/var/folders/aa/bb/T",
+        "/private/var/folders/aa/bb/T/session",
+        "$TMPDIR",
+        "$TMPDIR/session",
+    ],
+)
+def test_temp_dir_rule_covers_platform_roots(
+    monkeypatch,
+    path: str,
+):
+    monkeypatch.setenv("TMPDIR", "/Volumes/External/custom-tmp/")
+    assert is_temp_path(path)
+
+
+def test_temp_dir_rule_rejects_neighboring_paths(monkeypatch):
+    monkeypatch.setenv("TMPDIR", "/Volumes/External/custom-tmp")
+    assert not is_temp_path("/var/folders/aa/bb/not-T/session")
+    assert not is_temp_path("/Volumes/External/custom-tmp-other")
+    assert not is_temp_path("/workspace/project")
+
+
+@pytest.mark.parametrize(
+    ("first_prompt", "user_messages", "assistant_messages", "tool_calls", "expected"),
+    [
+        (None, 0, 1, 0, True),
+        (None, 1, 1, 0, True),
+        ("prompt", 1, 0, 0, True),
+        ("prompt", 1, 1, 0, False),
+        ("prompt", 1, 0, 1, False),
+    ],
+)
+def test_empty_rule_requires_prompt_and_activity(
+    tmp_path: Path,
+    first_prompt: str | None,
+    user_messages: int,
+    assistant_messages: int,
+    tool_calls: int,
+    expected: bool,
+):
+    record = _rule_record()
+    record.first_prompt = first_prompt
+    record.counts["user_messages"] = user_messages
+    record.counts["assistant_messages"] = assistant_messages
+    record.counts["tool_calls"] = tool_calls
+    config = RetroConfig(
+        archive_root=str(tmp_path / "archive"),
+        dashboard_dir=str(tmp_path / "dashboard"),
+    )
+    empty_rule = next(
+        rule
+        for rule in catalog_rules(config)
+        if rule.id == "builtin.empty"
+    )
+
+    assert rule_matches(record, empty_rule) is expected
+
+
+def test_codex_v1_raw_messages_prevent_false_empty_tag(tmp_path: Path):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    _config(tmp_path)
+    raw = layout.raw_dir("codex", "legacy-exec")
+    raw.mkdir(parents=True)
+    records = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "originator": "codex_exec",
+                "source": "exec",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Fix the parser"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Implemented"}],
+            },
+        },
+    ]
+    (raw / "rollout.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    _write_normalized(
+        layout,
+        "codex",
+        "legacy-exec",
+        [
+            _event(
+                "codex",
+                "legacy-exec",
+                1,
+                actor="system",
+                event_type="session_start",
+            ),
+            _event(
+                "codex",
+                "legacy-exec",
+                2,
+                actor="system",
+                event_type="session_end",
+            ),
+        ],
+    )
+
+    update_catalog(layout)
+    record = load_catalog(layout)["codex/legacy-exec"]
+
+    assert record.first_prompt == "Fix the parser"
+    assert record.counts["user_messages"] == 1
+    assert record.counts["assistant_messages"] == 1
+    assert "empty" not in record.tags
+
+
 def test_git_resolution_worktrees_symlinks_and_remote_forms(tmp_path: Path):
     main = tmp_path / "actual" / "retro"
     git_dir = main / ".git"
@@ -724,6 +878,7 @@ def test_incremental_fingerprinting_noop_change_and_removal(tmp_path: Path):
     _write_normalized(layout, "codex", "incremental")
 
     first = update_catalog(layout)
+    first_fingerprint = load_catalog(layout)["codex/incremental"].fingerprint
     catalog_file = layout.root / "catalog" / "sessions.jsonl"
     first_stat = catalog_file.stat().st_mtime_ns
     second = update_catalog(layout)
@@ -740,6 +895,7 @@ def test_incremental_fingerprinting_noop_change_and_removal(tmp_path: Path):
     )
     third = update_catalog(layout)
     assert third.changed_keys == ["codex/incremental"]
+    assert load_catalog(layout)["codex/incremental"].fingerprint != first_fingerprint
 
     layout.normalized_path("codex", "incremental").unlink()
     fourth = update_catalog(layout)
@@ -747,7 +903,82 @@ def test_incremental_fingerprinting_noop_change_and_removal(tmp_path: Path):
     assert len(load_catalog(layout)) == 0
 
 
-def test_incremental_fingerprint_tracks_git_config_input(tmp_path: Path):
+def test_rule_edit_reevaluates_without_scanning_events(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    config = _config(tmp_path)
+    _write_normalized(layout, "codex", "policy")
+    update_catalog(layout)
+    before = load_catalog(layout)["codex/policy"]
+
+    def fail_scan(path: Path):
+        raise AssertionError(f"unexpected event scan: {path}")
+
+    monkeypatch.setattr(catalog_store, "_scan_events", fail_scan)
+    save_config(
+        RetroConfig(
+            archive_root=config.archive_root,
+            dashboard_dir=config.dashboard_dir,
+            rules=[
+                {
+                    "id": "ignore-codex",
+                    "description": "test",
+                    "enabled": True,
+                    "match": {"host": ["codex"]},
+                    "tags": ["ignore"],
+                }
+            ],
+        )
+    )
+
+    result = update_catalog(layout)
+    after = load_catalog(layout)["codex/policy"]
+
+    assert result.changed_keys == ["codex/policy"]
+    assert after.fingerprint == before.fingerprint
+    assert after.excluded is True
+    assert after.tag_sources["ignore"] == ["rule:ignore-codex"]
+    assert catalog_store.catalog_state_path(layout).is_file()
+
+
+def test_annotation_changes_exclusion_without_changing_fingerprint(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    _config(tmp_path)
+    _write_normalized(layout, "codex", "annotation-policy")
+    update_catalog(layout)
+    before = load_catalog(layout)["codex/annotation-policy"]
+    append_annotation(
+        layout.root,
+        key=before.key,
+        op="tag",
+        value="ignore",
+    )
+
+    def fail_scan(path: Path):
+        raise AssertionError(f"unexpected event scan: {path}")
+
+    monkeypatch.setattr(catalog_store, "_scan_events", fail_scan)
+    result = update_catalog(layout, keys=[before.key])
+    after = load_catalog(layout)[before.key]
+
+    assert result.changed_keys == [before.key]
+    assert after.fingerprint == before.fingerprint
+    assert after.excluded is True
+    assert after.tag_sources["ignore"] == ["manual"]
+
+
+def test_incremental_fingerprint_tracks_git_config_input(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("TMPDIR", "/not-this-test-workspace")
     repo = tmp_path / "repo"
     (repo / ".git").mkdir(parents=True)
     config_path = repo / ".git" / "config"
@@ -767,7 +998,8 @@ def test_incremental_fingerprint_tracks_git_config_input(tmp_path: Path):
     _write_normalized(layout, "codex", "git-change")
 
     update_catalog(layout)
-    assert load_catalog(layout)["codex/git-change"].project["id"] == (
+    before = load_catalog(layout)["codex/git-change"]
+    assert before.project["id"] == (
         "github.com/example/old"
     )
     config_path.write_text(
@@ -777,9 +1009,11 @@ def test_incremental_fingerprint_tracks_git_config_input(tmp_path: Path):
     result = update_catalog(layout)
 
     assert result.changed_keys == ["codex/git-change"]
-    assert load_catalog(layout)["codex/git-change"].project["id"] == (
+    after = load_catalog(layout)["codex/git-change"]
+    assert after.project["id"] == (
         "github.com/example/new"
     )
+    assert after.fingerprint == before.fingerprint
 
 
 def test_simple_yaml_block_scalars_and_scalars(tmp_path: Path):

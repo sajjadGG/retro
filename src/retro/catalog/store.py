@@ -13,22 +13,26 @@ from typing import Any
 from ..config import RetroConfig, load_config
 from ..schema import read_events
 from ..storage import Layout
-from ..utils import atomic_write_text, event_text, truncate
+from ..utils import atomic_write_text, event_text, iter_jsonl, truncate
 from .annotations import AnnotationState, load_annotations
-from .ignore import read_retroignore
+from .ignore import IgnoreResult, read_retroignore
 from .markers import parse_markers
-from .metadata import extract_host_metadata
+from .metadata import HostMetadata, extract_host_metadata
 from .models import Catalog, CatalogUpdate, SessionRecord
 from .projects import (
     decode_claude_slug,
     git_input_signature,
+    normalize_remote,
     resolve_cwd,
     resolve_git_and_project,
 )
 from .rules import evaluate_rules, is_temp_path
 
 CATALOG_SCHEMA = 1
-EXTRACTOR_VERSION = "catalog-v1-normalization-v2-compatible-13"
+EXTRACTOR_VERSION = "catalog-v1-normalization-v2-compatible-14"
+EVALUATION_STATE_SCHEMA = 1
+TAG_EVALUATOR_VERSION = "catalog-tags-v3"
+PROJECT_EVALUATOR_VERSION = "catalog-projects-v2"
 _NORMALIZED_SUFFIX = ".events.jsonl"
 _TOOL_CALL_TYPES = {"tool_call", "command", "file_edit", "file_read", "subagent_start"}
 
@@ -54,8 +58,29 @@ class EventSummary:
     )
 
 
+@dataclass(frozen=True)
+class EvaluationContext:
+    cwd_resolved: str | None
+    ignore: IgnoreResult
+    ephemeral: bool
+    git_signature: str
+
+
+@dataclass
+class CodexRawFallback:
+    first_prompt: str | None = None
+    user_messages: int = 0
+    assistant_messages: int = 0
+    tool_calls: int = 0
+    assistant_activity: bool = False
+
+
 def catalog_path(layout: Layout) -> Path:
     return layout.root / "catalog" / "sessions.jsonl"
+
+
+def catalog_state_path(layout: Layout) -> Path:
+    return layout.root / "catalog" / "state.json"
 
 
 def load_catalog(layout: Layout) -> Catalog:
@@ -80,6 +105,30 @@ def load_catalog(layout: Layout) -> Catalog:
     return Catalog(records)
 
 
+def _load_evaluation_state(layout: Layout) -> dict[str, dict[str, str]]:
+    path = catalog_state_path(layout)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict) or value.get("schema") != EVALUATION_STATE_SCHEMA:
+        return {}
+    raw_records = value.get("records")
+    if not isinstance(raw_records, dict):
+        return {}
+    records: dict[str, dict[str, str]] = {}
+    for key, raw in raw_records.items():
+        if not isinstance(key, str) or not isinstance(raw, dict):
+            continue
+        tag = raw.get("tag")
+        project = raw.get("project")
+        if isinstance(tag, str) and isinstance(project, str):
+            records[key] = {"tag": tag, "project": project}
+    return records
+
+
 def update_catalog(
     layout: Layout,
     keys: Iterable[str] | None = None,
@@ -87,6 +136,13 @@ def update_catalog(
 ) -> CatalogUpdate:
     config = load_config()
     existing = dict(load_catalog(layout))
+    state_path = catalog_state_path(layout)
+    legacy_state_missing = not state_path.is_file()
+    evaluation_state = _load_evaluation_state(layout)
+    initial_state = {
+        key: dict(value)
+        for key, value in evaluation_state.items()
+    }
     if keys is None:
         available = _available_keys(layout)
         selected = set(available)
@@ -98,7 +154,8 @@ def update_catalog(
             if _key_is_available(layout, key)
         }
     annotations = load_annotations(layout.root)
-    policy_digest = _policy_digest(config)
+    tag_policy_digest = _tag_policy_digest(config)
+    project_policy_digest = _project_policy_digest(config)
     changed: list[str] = []
     added: list[str] = []
     removed: list[str] = []
@@ -106,11 +163,13 @@ def update_catalog(
     if keys is None:
         for stale in sorted(set(existing) - available):
             del existing[stale]
+            evaluation_state.pop(stale, None)
             removed.append(stale)
     else:
         for stale in sorted(selected - available):
             if stale in existing:
                 del existing[stale]
+                evaluation_state.pop(stale, None)
                 removed.append(stale)
 
     for key in sorted(selected & available):
@@ -118,52 +177,127 @@ def update_catalog(
         prior = existing.get(key)
         source_digest = _source_digest(layout, host, session_id)
         annotation = annotations.get(key, AnnotationState())
-        current_resolved = None
-        if prior:
-            current_resolved = (
-                resolve_cwd(prior.cwd)
-                if prior.cwd and prior.cwd != prior.cwd_resolved
-                else prior.cwd_resolved
+        context = _evaluation_context(prior, prior=prior) if prior else None
+        project_evaluation = (
+            _project_evaluation_digest(
+                project_policy_digest,
+                annotation.project_digest,
+                context,
             )
-        ephemeral = bool(
-            prior
-            and prior.cwd_resolved
-            and is_temp_path(prior.cwd_resolved)
+            if context is not None
+            else ""
         )
-        prior_ignore = read_retroignore(
-            None if ephemeral else current_resolved,
-            prior=prior,
+        tag_evaluation = (
+            _tag_evaluation_digest(
+                tag_policy_digest,
+                annotation.tag_digest,
+                context,
+                project_evaluation,
+            )
+            if context is not None
+            else ""
         )
-        context_digest = _context_digest(
-            current_resolved,
-            prior_ignore.signature,
-            ephemeral=ephemeral,
+        stored_evaluation = evaluation_state.get(key, {})
+        content_unchanged = bool(
+            prior is not None and prior.fingerprint == source_digest
         )
-        expected = _fingerprint(
-            source_digest,
-            policy_digest,
-            annotation.digest,
-            context_digest,
-        )
-        if prior is not None and not force and prior.fingerprint == expected:
+        legacy_migration = False
+        if (
+            prior is not None
+            and not force
+            and not content_unchanged
+            and legacy_state_missing
+            and context is not None
+            and prior.fingerprint
+            == _legacy_fingerprint(
+                source_digest,
+                _legacy_policy_digest(config),
+                annotation.digest,
+                _legacy_context_digest(context),
+            )
+        ):
+            content_unchanged = True
+            legacy_migration = True
+        if prior is not None and not force and content_unchanged:
+            assert context is not None
+            needs_project = stored_evaluation.get("project") != project_evaluation
+            needs_tag = (
+                needs_project
+                or stored_evaluation.get("tag") != tag_evaluation
+            )
+            if not needs_project and not needs_tag and not legacy_migration:
+                continue
+            record = SessionRecord.from_dict(prior.to_dict())
+            record.fingerprint = source_digest
+            if needs_project:
+                _reevaluate_project(
+                    record,
+                    config=config,
+                    annotation=annotation,
+                    context=context,
+                )
+            if needs_tag:
+                _reevaluate_tags(
+                    record,
+                    config=config,
+                    annotation=annotation,
+                    context=context,
+                )
+            evaluation_state[key] = {
+                "tag": tag_evaluation,
+                "project": project_evaluation,
+            }
+            if record.to_dict() != prior.to_dict():
+                existing[key] = record
+                changed.append(key)
             continue
-        record = _build_record(
+
+        record = _build_content_record(
             layout,
             host,
             session_id,
+            source_digest=source_digest,
+        )
+        context = _evaluation_context(record, prior=prior)
+        _reevaluate_project(
+            record,
             config=config,
             annotation=annotation,
-            prior=prior,
-            source_digest=source_digest,
-            policy_digest=policy_digest,
+            context=context,
         )
+        _reevaluate_tags(
+            record,
+            config=config,
+            annotation=annotation,
+            context=context,
+        )
+        project_evaluation = _project_evaluation_digest(
+            project_policy_digest,
+            annotation.project_digest,
+            context,
+        )
+        tag_evaluation = _tag_evaluation_digest(
+            tag_policy_digest,
+            annotation.tag_digest,
+            context,
+            project_evaluation,
+        )
+        evaluation_state[key] = {
+            "tag": tag_evaluation,
+            "project": project_evaluation,
+        }
         existing[key] = record
         changed.append(key)
         if prior is None:
             added.append(key)
 
+    if keys is None:
+        for stale in set(evaluation_state) - set(existing):
+            del evaluation_state[stale]
     if changed or removed or not catalog_path(layout).is_file():
         _write_catalog(layout, existing)
+    if evaluation_state != initial_state or not state_path.is_file():
+        _write_evaluation_state(layout, evaluation_state)
     excluded_total = sum(1 for record in existing.values() if record.excluded)
     return CatalogUpdate(
         changed_keys=changed,
@@ -174,21 +308,22 @@ def update_catalog(
     )
 
 
-def _build_record(
+def _build_content_record(
     layout: Layout,
     host: str,
     session_id: str,
     *,
-    config: RetroConfig,
-    annotation: AnnotationState,
-    prior: SessionRecord | None,
     source_digest: str,
-    policy_digest: str,
 ) -> SessionRecord:
     key = f"{host}/{session_id}"
     raw_dir = layout.raw_dir(host, session_id)
     metadata = extract_host_metadata(host, session_id, raw_dir)
     summary = _scan_events(layout.normalized_path(host, session_id))
+    if host == "codex" and (
+        summary.first_prompt is None
+        or not _has_assistant_or_tool_activity(summary.counts)
+    ):
+        _apply_codex_raw_fallback(summary, raw_dir / "rollout.jsonl")
     cwd = metadata.cwd or summary.cwd
     cwd_resolved = resolve_cwd(cwd)
     if cwd_resolved is None and metadata.project_slug:
@@ -200,22 +335,6 @@ def _build_record(
     if metadata.title:
         markers.extend(parse_markers(metadata.title, event_id=None))
     markers.extend(summary.markers)
-    marker_project = next(
-        (
-            marker["value"]
-            for marker in reversed(markers)
-            if marker["directive"] == "project"
-        ),
-        None,
-    )
-    annotation_project = annotation.project if annotation.project_is_set else None
-    git, project = resolve_git_and_project(
-        metadata,
-        cwd_resolved=cwd_resolved,
-        config=config,
-        marker_project=marker_project,
-        annotation_project=annotation_project,
-    )
     started_at = summary.started_at or _normalize_timestamp(metadata.started_at)
     ended_at = summary.ended_at or _normalize_timestamp(metadata.ended_at)
     duration_s = summary.duration_s
@@ -225,7 +344,6 @@ def _build_record(
         if started is not None and ended is not None:
             duration_s = round(max(0.0, (ended - started).total_seconds()), 6)
     models = list(dict.fromkeys([*metadata.models, *summary.models]))
-    ignore = read_retroignore(cwd_resolved, prior=prior)
     record = SessionRecord(
         schema=CATALOG_SCHEMA,
         key=key,
@@ -244,22 +362,117 @@ def _build_record(
         active_s=summary.active_s,
         cwd=cwd,
         cwd_resolved=cwd_resolved,
-        git=git,
-        project=project,
+        git={
+            "remote": normalize_remote(metadata.remote_url),
+            "remote_url": metadata.remote_url,
+            "branch": metadata.branch,
+            "commit": metadata.commit,
+            "root": None,
+            "worktree": None,
+        },
+        project={
+            "id": "unknown",
+            "name": "Unknown",
+            "source": "unknown",
+            "evidence": None,
+        },
         models=models,
         counts=summary.counts,
         markers=markers,
         tags=[],
         tag_sources={},
         excluded=False,
-        fingerprint="",
+        fingerprint=source_digest,
     )
+    return record
+
+
+def _evaluation_context(
+    record: SessionRecord | None,
+    *,
+    prior: SessionRecord | None,
+) -> EvaluationContext:
+    if record is None:
+        return EvaluationContext(None, IgnoreResult([], None, "none"), False, "none")
+    cwd_resolved = (
+        resolve_cwd(record.cwd)
+        if record.cwd and record.cwd != record.cwd_resolved
+        else record.cwd_resolved
+    )
+    ephemeral = bool(cwd_resolved and is_temp_path(cwd_resolved))
+    ignore = read_retroignore(
+        None if ephemeral else cwd_resolved,
+        prior=prior,
+    )
+    git_signature = (
+        "ephemeral"
+        if ephemeral
+        else git_input_signature(cwd_resolved)
+    )
+    return EvaluationContext(
+        cwd_resolved=cwd_resolved,
+        ignore=ignore,
+        ephemeral=ephemeral,
+        git_signature=git_signature,
+    )
+
+
+def _reevaluate_project(
+    record: SessionRecord,
+    *,
+    config: RetroConfig,
+    annotation: AnnotationState,
+    context: EvaluationContext,
+) -> None:
+    record.cwd_resolved = context.cwd_resolved
+    metadata = HostMetadata(
+        agent=record.agent,
+        client=record.client,
+        interactive=record.interactive,
+        is_subagent=record.is_subagent,
+        parent_key=record.parent_key,
+        title=record.title,
+        cwd=record.cwd,
+        remote_url=record.git.get("remote_url") or record.git.get("remote"),
+        branch=record.git.get("branch"),
+        commit=record.git.get("commit"),
+        models=list(record.models),
+        started_at=record.started_at,
+        ended_at=record.ended_at,
+    )
+    marker_project = next(
+        (
+            marker["value"]
+            for marker in reversed(record.markers)
+            if marker["directive"] == "project"
+        ),
+        None,
+    )
+    annotation_project = annotation.project if annotation.project_is_set else None
+    record.git, record.project = resolve_git_and_project(
+        metadata,
+        cwd_resolved=context.cwd_resolved,
+        config=config,
+        marker_project=marker_project,
+        annotation_project=annotation_project,
+    )
+
+
+def _reevaluate_tags(
+    record: SessionRecord,
+    *,
+    config: RetroConfig,
+    annotation: AnnotationState,
+    context: EvaluationContext,
+) -> None:
     sources = evaluate_rules(record, config)
-    if ignore.path:
-        for tag in ignore.tags:
-            sources.setdefault(tag, []).append(f"dotfile:{ignore.path}")
+    if context.ignore.path:
+        for tag in context.ignore.tags:
+            sources.setdefault(tag, []).append(
+                f"dotfile:{context.ignore.path}"
+            )
     marker_keep = False
-    for marker in markers:
+    for marker in record.markers:
         directive = marker["directive"]
         if directive == "ignore":
             sources.setdefault("ignore", []).append("marker")
@@ -286,17 +499,131 @@ def _build_record(
     }
     record.tags = sorted(record.tag_sources)
     record.excluded = bool(set(record.tags) & set(config.exclude_tags))
-    record.fingerprint = _fingerprint(
-        source_digest,
-        policy_digest,
-        annotation.digest,
-        _context_digest(
-            cwd_resolved,
-            ignore.signature,
-            ephemeral=is_temp_path(cwd_resolved) if cwd_resolved else False,
-        ),
+
+
+def _has_assistant_or_tool_activity(counts: dict[str, int]) -> bool:
+    return bool(
+        counts.get("assistant_messages", 0)
+        or counts.get("tool_calls", 0)
     )
-    return record
+
+
+def _apply_codex_raw_fallback(summary: EventSummary, path: Path) -> None:
+    fallback = _scan_codex_raw_fallback(path)
+    if summary.first_prompt is None and fallback.first_prompt:
+        summary.first_prompt = truncate(
+            _collapse_whitespace(fallback.first_prompt),
+            2000,
+        )
+        summary.counts["user_messages"] = max(
+            summary.counts["user_messages"],
+            1,
+        )
+        summary.markers.extend(
+            parse_markers(fallback.first_prompt, event_id=None)
+        )
+    if not _has_assistant_or_tool_activity(summary.counts):
+        summary.counts["assistant_messages"] = fallback.assistant_messages
+        summary.counts["tool_calls"] = fallback.tool_calls
+        if (
+            fallback.assistant_activity
+            and not _has_assistant_or_tool_activity(summary.counts)
+        ):
+            summary.counts["assistant_messages"] = 1
+
+
+def _scan_codex_raw_fallback(path: Path) -> CodexRawFallback:
+    fallback = CodexRawFallback()
+    if not path.is_file():
+        return fallback
+    for _, raw in iter_jsonl(path):
+        payload = raw.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        outer_type = raw.get("type")
+        payload_type = payload.get("type")
+        if outer_type == "event_msg":
+            if payload_type == "user_message":
+                text = payload.get("message")
+                if isinstance(text, str) and text.strip():
+                    fallback.user_messages += 1
+                    if fallback.first_prompt is None:
+                        fallback.first_prompt = text
+            elif payload_type == "agent_message":
+                fallback.assistant_activity = True
+                fallback.assistant_messages += 1
+            elif payload_type in {
+                "agent_reasoning",
+                "patch_apply_end",
+                "web_search_end",
+                "tool_search_output",
+            }:
+                fallback.assistant_activity = True
+                if payload_type != "agent_reasoning":
+                    fallback.tool_calls += 1
+            elif payload_type == "item_completed":
+                item = payload.get("item")
+                if isinstance(item, dict):
+                    _consume_codex_response_item(fallback, item)
+        elif outer_type == "response_item":
+            _consume_codex_response_item(fallback, payload)
+    return fallback
+
+
+def _consume_codex_response_item(
+    fallback: CodexRawFallback,
+    payload: dict[str, Any],
+) -> None:
+    payload_type = payload.get("type")
+    if payload_type == "message":
+        role = payload.get("role")
+        text = _flatten_raw_content(payload.get("content"))
+        if role == "user" and text.strip():
+            fallback.user_messages += 1
+            if fallback.first_prompt is None:
+                fallback.first_prompt = text
+        elif role == "assistant":
+            fallback.assistant_activity = True
+            if text.strip():
+                fallback.assistant_messages += 1
+        return
+    if payload_type in {
+        "function_call",
+        "custom_tool_call",
+        "web_search_call",
+        "tool_search_call",
+    }:
+        fallback.assistant_activity = True
+        fallback.tool_calls += 1
+    elif payload_type in {
+        "function_call_output",
+        "custom_tool_call_output",
+        "tool_search_output",
+    }:
+        fallback.assistant_activity = True
+        fallback.tool_calls = max(1, fallback.tool_calls)
+    elif payload_type == "reasoning":
+        fallback.assistant_activity = True
+
+
+def _flatten_raw_content(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, list):
+        return ""
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            parts.append(item)
+        elif isinstance(item, dict):
+            text = (
+                item.get("text")
+                or item.get("input_text")
+                or item.get("output_text")
+            )
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
 
 
 def _scan_events(path: Path) -> EventSummary:
@@ -460,24 +787,73 @@ def _source_digest(layout: Layout, host: str, session_id: str) -> str:
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
-def _policy_digest(config: RetroConfig) -> str:
+def _tag_policy_digest(config: RetroConfig) -> str:
     payload = {
+        "version": TAG_EVALUATOR_VERSION,
         "exclude_tags": config.exclude_tags,
         "disabled_rules": config.disabled_rules,
         "rules": config.rules,
-        "projects": config.projects,
     }
+    return _json_digest(payload)
+
+
+def _project_policy_digest(config: RetroConfig) -> str:
+    return _json_digest(
+        {
+            "version": PROJECT_EVALUATOR_VERSION,
+            "projects": config.projects,
+        }
+    )
+
+
+def _project_evaluation_digest(
+    policy_digest: str,
+    annotation_digest: str,
+    context: EvaluationContext,
+) -> str:
     return hashlib.sha256(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
+        "\0".join(
+            (
+                policy_digest,
+                annotation_digest,
+                context.cwd_resolved or "",
+                context.git_signature,
+            )
         ).encode()
     ).hexdigest()
 
 
-def _fingerprint(
+def _tag_evaluation_digest(
+    policy_digest: str,
+    annotation_digest: str,
+    context: EvaluationContext,
+    project_evaluation_digest: str,
+) -> str:
+    return hashlib.sha256(
+        "\0".join(
+            (
+                policy_digest,
+                annotation_digest,
+                context.cwd_resolved or "",
+                context.ignore.signature,
+                project_evaluation_digest,
+            )
+        ).encode()
+    ).hexdigest()
+
+
+def _legacy_policy_digest(config: RetroConfig) -> str:
+    return _json_digest(
+        {
+            "exclude_tags": config.exclude_tags,
+            "disabled_rules": config.disabled_rules,
+            "rules": config.rules,
+            "projects": config.projects,
+        }
+    )
+
+
+def _legacy_fingerprint(
     source_digest: str,
     policy_digest: str,
     annotation_digest: str,
@@ -490,19 +866,21 @@ def _fingerprint(
     ).hexdigest()
 
 
-def _context_digest(
-    cwd_resolved: str | None,
-    ignore_digest: str,
-    *,
-    ephemeral: bool,
-) -> str:
-    git_digest = (
-        "ephemeral"
-        if ephemeral
-        else git_input_signature(cwd_resolved)
-    )
+def _legacy_context_digest(context: EvaluationContext) -> str:
     return hashlib.sha256(
-        f"{cwd_resolved or ''}\0{ignore_digest}\0{git_digest}".encode()
+        f"{context.cwd_resolved or ''}\0"
+        f"{context.ignore.signature}\0{context.git_signature}".encode()
+    ).hexdigest()
+
+
+def _json_digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
     ).hexdigest()
 
 
@@ -518,6 +896,28 @@ def _write_catalog(layout: Layout, records: dict[str, SessionRecord]) -> None:
         for key in sorted(records)
     )
     atomic_write_text(catalog_path(layout), content)
+
+
+def _write_evaluation_state(
+    layout: Layout,
+    records: dict[str, dict[str, str]],
+) -> None:
+    atomic_write_text(
+        catalog_state_path(layout),
+        json.dumps(
+            {
+                "schema": EVALUATION_STATE_SCHEMA,
+                "records": {
+                    key: records[key]
+                    for key in sorted(records)
+                },
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+    )
 
 
 def _parse_timestamp(value: Any) -> datetime | None:

@@ -16,9 +16,11 @@ dashboard aggregation, memory reindexing, and task-scorer source selection.
 Those stages no longer decide independently whether a rollout is real,
 interactive, a subagent, or part of the same repository.
 
-Two files have different durability:
+Catalog files have different durability:
 
 - `catalog/sessions.jsonl` is derived and can be deleted and rebuilt.
+- `catalog/state.json` is derived policy/project invalidation state and can be
+  deleted and rebuilt without rescanning session content.
 - `catalog/annotations.jsonl` is canonical user state and is append-only.
 
 Raw capture and normalized events remain evidence. A catalog record stores the
@@ -144,8 +146,8 @@ Built-ins are always listed and can be disabled:
 
 | id | condition | tags |
 | --- | --- | --- |
-| `builtin.temp-dir` | cwd under an OS temporary directory | `scratch`, `ignore` |
-| `builtin.empty` | zero normalized user messages | `empty`, `ignore` |
+| `builtin.temp-dir` | cwd under `/tmp`, `/private/tmp`, `/var/tmp`, `/private/var/tmp`, macOS `/var/folders/*/*/T` (with optional `/private`), or `$TMPDIR` | `scratch`, `ignore` |
+| `builtin.empty` | no user-authored prompt, or no assistant message/tool activity | `empty`, `ignore` |
 | `builtin.automated` | `interactive == false` | `automated` |
 | `builtin.subagent` | `is_subagent == true` | `subagent` |
 
@@ -229,31 +231,43 @@ candidates as equally authoritative.
 
 ## Incremental algorithm
 
-The record fingerprint hashes:
+The record fingerprint is content-only. It hashes:
 
 - extractor version;
 - normalized-file `(mtime_ns,size)`;
-- host metadata file `(mtime_ns,size)` tuples;
-- relevant rule/project/exclusion config;
-- annotations for that key;
-- nearest `.retroignore` stat evidence;
-- resolved cwd plus stable `.git` linkage and remote-config stat evidence (not
-  moving `HEAD`/ref state).
+- host metadata file `(mtime_ns,size)` tuples.
 
 Unknown provider hosts fingerprint every archived raw file. Known hosts stat
 only files their extractor reads. A no-op update stats sources and compares
-fingerprints without opening normalized streams. Changed sessions are
-re-extracted; deleted keys are removed; the complete sorted catalog is
-atomically replaced only when output changed. Stat-preserving out-of-band
-content modification is outside this explicitly stat-based invalidation
-contract; `force=True` rebuilds regardless.
+fingerprints without opening normalized streams.
+
+`catalog/state.json` separately stores per-session tag and project evaluation
+digests. Those digests cover rules, `exclude_tags`, project config, relevant
+annotation operations, nearest `.retroignore` stat evidence, resolved cwd, and
+stable `.git` linkage/remote-config evidence (not moving `HEAD`/ref state).
+A policy or annotation change re-evaluates tags/project from the stored record;
+it never re-reads raw metadata or normalized events. Such an update reports a
+key in `changed_keys` only when its tags, project, exclusion, cwd resolution,
+or other catalog output actually changes. Its content fingerprint remains
+unchanged, so content-keyed signal records remain valid.
+
+Changed content is re-extracted; deleted keys are removed; sessions and state
+are atomically replaced only when their output changes. Stat-preserving
+out-of-band content modification is outside this explicitly stat-based
+invalidation contract; `force=True` rebuilds regardless.
+
+Normalization-v1 Codex exec streams can omit duplicated `role=user` and
+`role=assistant` response items. When normalized prompt/activity evidence is
+missing, extraction reads the already-fingerprinted raw rollout and recovers
+those fields. This fallback is not used during policy-only updates.
 
 Failure behavior:
 
 - malformed config or annotations fails before publication;
 - malformed catalog JSON fails load rather than silently dropping a record;
 - missing optional raw metadata degrades to normalized/path/unknown evidence;
-- missing normalized events yields zero counts and triggers `builtin.empty`;
+- missing normalized events falls back to archived Codex prompt/activity
+  evidence where available; otherwise `builtin.empty` applies;
 - unreadable Git config or disappeared cwd falls back without mutating source;
 - an interrupted write leaves the previous catalog because publication uses
   same-directory temporary files and `os.replace`.

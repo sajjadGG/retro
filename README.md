@@ -268,6 +268,7 @@ rollout-memory/
 
   catalog/
     sessions.jsonl                             # derived identity, context, project, tags, exclusion
+    state.json                                # derived policy/project invalidation digests
     annotations.jsonl                          # canonical append-only user edits
 
   rendered/<host>/<session-id>.md             # human-readable markdown view
@@ -435,8 +436,11 @@ retro sessions set-project codex/<session-id> --clear
 ```
 
 Built-in rules tag temporary-directory, empty, automated, and subagent
-sessions. Only tags listed in `exclude_tags` exclude; the default is
-`["ignore"]`, so `automated` alone remains reviewable. Add or dry-run a rule:
+sessions. Temporary roots include standard Unix/macOS temp locations and
+`$TMPDIR`; a session is empty when it lacks either a user prompt or all
+assistant/tool activity. Only tags listed in `exclude_tags` exclude; the
+default is `["ignore"]`, so `automated` alone remains reviewable. Add or
+dry-run a rule:
 
 ```bash
 retro rules add '{"id":"eval","match":{"prompt":"(?i)^below is a math problem"},"tags":["ignore"]}'
