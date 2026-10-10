@@ -14,6 +14,7 @@ from collections.abc import Iterable, Sequence
 from typing import Any
 
 from ..schema import NormalizedEvent
+from ..utils import event_tool_input
 
 TEST = "test"
 TYPECHECK = "typecheck"
@@ -426,7 +427,12 @@ def command_text(event: NormalizedEvent) -> str:
     payload = event.payload or {}
     if not isinstance(payload, dict):
         return ""
-    for container in (payload, payload.get("arguments"), payload.get("input")):
+    for container in (
+        payload,
+        payload.get("arguments"),
+        payload.get("input"),
+        event_tool_input(event),
+    ):
         text = _command_from_container(container)
         if text:
             return text

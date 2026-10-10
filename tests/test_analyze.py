@@ -49,6 +49,17 @@ def test_command_text_across_hosts():
     )
     assert command_text(_event(3, "assistant", "command", {"arguments": '{"cmd": "ls -la"}'})) == "ls -la"
     assert command_text(_event(4, "assistant", "command", {"input": "git push"})) == ""
+    assert (
+        command_text(
+            _event(
+                5,
+                "assistant",
+                "command",
+                {"part": {"input": {"command": "ruff check src"}}},
+            )
+        )
+        == "ruff check src"
+    )
 
 
 def test_result_failure_detection():

@@ -348,6 +348,139 @@ def test_event_summary_accepts_normalization_v1_and_v2_types(tmp_path: Path):
     assert record.models == ["gpt-5.4", "gpt-5.4-mini"]
 
 
+def test_catalog_uses_v3_native_payload_accessors(tmp_path: Path):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    _config(tmp_path)
+    session_id = "native-v3"
+    _write_normalized(
+        layout,
+        "codex",
+        session_id,
+        [
+            _event(
+                "codex",
+                session_id,
+                1,
+                text="",
+                payload={
+                    "content": (
+                        "# AGENTS.md instructions for /workspace\n"
+                        "#retro:ignore"
+                    ),
+                    "role": "user",
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                2,
+                text="",
+                payload={
+                    "part": {
+                        "type": "input_text",
+                        "text": "Implement v3 parsing #retro:tag=v3",
+                    }
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                3,
+                actor="assistant",
+                text="",
+                payload={
+                    "part": {
+                        "type": "output_text",
+                        "text": "Implemented",
+                    }
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                4,
+                actor="assistant",
+                event_type="tool_call",
+                payload={
+                    "part": {
+                        "toolSpecificData": {
+                            "path": "src/app.py",
+                            "modelId": "tool-model",
+                        }
+                    }
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                5,
+                actor="tool",
+                event_type="tool_result",
+                payload={
+                    "part": {
+                        "resultDetails": {
+                            "content": "ok",
+                            "model": "result-model",
+                        }
+                    }
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                6,
+                actor="system",
+                event_type="usage",
+                payload={
+                    "currentModel": "gpt-5.4",
+                    "modelMetrics": {"gpt-5.4": {"requests": 1}},
+                },
+            ),
+            _event(
+                "codex",
+                session_id,
+                7,
+                actor="system",
+                event_type="lifecycle",
+                payload={"lifecycle": "turn_end"},
+            ),
+            _event(
+                "codex",
+                session_id,
+                8,
+                actor="system",
+                event_type="metadata",
+                payload={"metadata_kind": "settings"},
+            ),
+        ],
+    )
+
+    update_catalog(layout)
+    record = load_catalog(layout)[f"codex/{session_id}"]
+
+    assert record.first_prompt == "Implement v3 parsing #retro:tag=v3"
+    assert record.title == "Implement v3 parsing #retro:tag=v3"
+    assert record.counts == {
+        "events": 8,
+        "user_messages": 1,
+        "assistant_messages": 1,
+        "tool_calls": 1,
+        "unknown_events": 0,
+    }
+    assert set(record.models) == {
+        "gpt-5.4",
+        "result-model",
+        "tool-model",
+    }
+    assert record.started_at == "2026-10-01T10:00:01Z"
+    assert record.ended_at == "2026-10-01T10:00:08Z"
+    assert record.duration_s == 7.0
+    assert record.active_s == 7.0
+    assert record.tags == ["v3"]
+    assert record.excluded is False
+
+
 def test_metadata_timestamps_supply_duration_without_event_timestamps(tmp_path: Path):
     layout = Layout(tmp_path / "archive")
     layout.ensure()
@@ -455,7 +588,7 @@ def test_retroignore_keep_and_annotation_precedence(
     (workspace / ".retroignore").write_text("evaluation\nignore\n# comment\n", encoding="utf-8")
     layout = Layout(tmp_path / "archive")
     layout.ensure()
-    _config(tmp_path)
+    _config(tmp_path, disabled_rules=["builtin.temp-dir"])
     raw = layout.raw_dir("codex", "ignored")
     raw.mkdir(parents=True)
     (raw / "rollout.jsonl").write_text(
@@ -506,12 +639,13 @@ def test_retroignore_keep_and_annotation_precedence(
 
 def test_empty_retroignore_means_ignore(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("TMPDIR", "/not-this-test-workspace")
+    monkeypatch.setattr(catalog_store, "is_temp_path", lambda value: True)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / ".retroignore").write_text("", encoding="utf-8")
     layout = Layout(tmp_path / "archive")
     layout.ensure()
-    _config(tmp_path)
+    _config(tmp_path, disabled_rules=["builtin.temp-dir"])
     raw = layout.raw_dir("codex", "empty-dotfile")
     raw.mkdir(parents=True)
     (raw / "rollout.jsonl").write_text(
@@ -988,7 +1122,7 @@ def test_incremental_fingerprint_tracks_git_config_input(
     )
     layout = Layout(tmp_path / "archive")
     layout.ensure()
-    _config(tmp_path)
+    _config(tmp_path, disabled_rules=["builtin.temp-dir"])
     raw = layout.raw_dir("codex", "git-change")
     raw.mkdir(parents=True)
     (raw / "rollout.jsonl").write_text(
