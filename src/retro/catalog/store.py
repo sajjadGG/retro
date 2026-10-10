@@ -13,7 +13,14 @@ from typing import Any
 from ..config import RetroConfig, load_config
 from ..schema import read_events
 from ..storage import Layout
-from ..utils import atomic_write_text, event_text, iter_jsonl, truncate
+from ..utils import (
+    atomic_write_text,
+    event_text,
+    event_tool_input,
+    event_tool_output,
+    iter_jsonl,
+    truncate,
+)
 from .annotations import AnnotationState, load_annotations
 from .ignore import IgnoreResult, read_retroignore
 from .markers import parse_markers
@@ -29,12 +36,24 @@ from .projects import (
 from .rules import evaluate_rules, is_temp_path
 
 CATALOG_SCHEMA = 1
-EXTRACTOR_VERSION = "catalog-v1-normalization-v2-compatible-14"
+EXTRACTOR_VERSION = "catalog-v1-v3-compatible-16"
 EVALUATION_STATE_SCHEMA = 1
 TAG_EVALUATOR_VERSION = "catalog-tags-v3"
 PROJECT_EVALUATOR_VERSION = "catalog-projects-v2"
 _NORMALIZED_SUFFIX = ".events.jsonl"
 _TOOL_CALL_TYPES = {"tool_call", "command", "file_edit", "file_read", "subagent_start"}
+_SYNTHETIC_USER_PREFIXES = (
+    "# agents.md instructions",
+    "<environment_context>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "<recommended_plugins>",
+    "<relay ",
+    "<subagent_notification>",
+    "<task-notification>",
+    "<turn_aborted>",
+    "<wake ",
+)
 
 
 @dataclass
@@ -400,13 +419,18 @@ def _evaluation_context(
         else record.cwd_resolved
     )
     ephemeral = bool(cwd_resolved and is_temp_path(cwd_resolved))
+    cwd_exists = bool(
+        cwd_resolved
+        and "://" not in cwd_resolved
+        and Path(cwd_resolved).exists()
+    )
     ignore = read_retroignore(
-        None if ephemeral else cwd_resolved,
+        cwd_resolved if cwd_exists else None,
         prior=prior,
     )
     git_signature = (
         "ephemeral"
-        if ephemeral
+        if ephemeral and not cwd_exists
         else git_input_signature(cwd_resolved)
     )
     return EvaluationContext(
@@ -501,6 +525,16 @@ def _reevaluate_tags(
     record.excluded = bool(set(record.tags) & set(config.exclude_tags))
 
 
+def _is_user_authored_text(text: str) -> bool:
+    stripped = (text or "").lstrip()
+    if not stripped:
+        return False
+    lowered = stripped.casefold()
+    if lowered.startswith(_SYNTHETIC_USER_PREFIXES):
+        return False
+    return not lowered.startswith("<bash-stdout>")
+
+
 def _has_assistant_or_tool_activity(counts: dict[str, int]) -> bool:
     return bool(
         counts.get("assistant_messages", 0)
@@ -545,7 +579,7 @@ def _scan_codex_raw_fallback(path: Path) -> CodexRawFallback:
         if outer_type == "event_msg":
             if payload_type == "user_message":
                 text = payload.get("message")
-                if isinstance(text, str) and text.strip():
+                if isinstance(text, str) and _is_user_authored_text(text):
                     fallback.user_messages += 1
                     if fallback.first_prompt is None:
                         fallback.first_prompt = text
@@ -578,7 +612,7 @@ def _consume_codex_response_item(
     if payload_type == "message":
         role = payload.get("role")
         text = _flatten_raw_content(payload.get("content"))
-        if role == "user" and text.strip():
+        if role == "user" and _is_user_authored_text(text):
             fallback.user_messages += 1
             if fallback.first_prompt is None:
                 fallback.first_prompt = text
@@ -637,15 +671,29 @@ def _scan_events(path: Path) -> EventSummary:
     for event in read_events(path):
         summary.counts["events"] += 1
         if event.event_type == "message" and event.actor == "user":
-            summary.counts["user_messages"] += 1
             text = event_text(event)
-            if summary.first_prompt is None and text.strip():
-                summary.first_prompt = truncate(_collapse_whitespace(text), 2000)
-            summary.markers.extend(parse_markers(text, event_id=event.event_id))
+            if _is_user_authored_text(text):
+                summary.counts["user_messages"] += 1
+                if summary.first_prompt is None:
+                    summary.first_prompt = truncate(
+                        _collapse_whitespace(text),
+                        2000,
+                    )
+                summary.markers.extend(
+                    parse_markers(text, event_id=event.event_id)
+                )
         elif event.event_type == "message" and event.actor == "assistant":
             summary.counts["assistant_messages"] += 1
         if event.event_type in _TOOL_CALL_TYPES and event.actor in {"assistant", "subagent"}:
             summary.counts["tool_calls"] += 1
+            models.extend(_payload_models(event_tool_input(event)))
+        elif event.event_type in {
+            "tool_result",
+            "file_edit",
+            "file_read",
+            "command",
+        } and event.actor == "tool":
+            models.extend(_payload_models(event_tool_output(event)))
         if event.event_type == "unknown":
             summary.counts["unknown_events"] += 1
         payload = event.payload or {}
@@ -670,7 +718,7 @@ def _scan_events(path: Path) -> EventSummary:
     return summary
 
 
-def _payload_models(payload: dict[str, Any]) -> list[str]:
+def _payload_models(payload: Any) -> list[str]:
     out: list[str] = []
     stack: list[tuple[Any, int]] = [(payload, 0)]
     visited = 0
@@ -681,6 +729,7 @@ def _payload_models(payload: dict[str, Any]) -> list[str]:
             for key, item in value.items():
                 folded = str(key).replace("_", "").casefold()
                 if folded in {
+                    "currentmodel",
                     "model",
                     "modelid",
                     "modelname",
@@ -688,7 +737,7 @@ def _payload_models(payload: dict[str, Any]) -> list[str]:
                     "usagemodel",
                 } and isinstance(item, str) and item.strip():
                     out.append(item.strip())
-                elif folded == "modelusage" and isinstance(item, dict):
+                elif folded in {"modelmetrics", "modelusage"} and isinstance(item, dict):
                     out.extend(str(name) for name in item if str(name).strip())
                 if depth < 4 and isinstance(item, (dict, list)):
                     stack.append((item, depth + 1))

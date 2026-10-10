@@ -94,15 +94,22 @@ YAML dependency.
 ## Normalized-event summary
 
 Only `actor=user,event_type=message` contributes user messages, first prompt,
-or inline markers. Only `actor=assistant,event_type=message` contributes
+or inline markers. Known host-injected envelopes (`AGENTS.md`,
+`environment_context`, plugin recommendations, local-command output,
+task/subagent notifications, wake/relay messages) are not user-authored and
+are skipped. Only `actor=assistant,event_type=message` contributes
 assistant-message counts. Tool calls are assistant/subagent events typed
 `tool_call`, `command`, `file_read`, `file_edit`, or `subagent_start`; tool
 results do not count.
 
-Catalog extraction accepts normalization v1 and v2. `usage`, `lifecycle`, and
-`metadata` events are non-conversational. Model and usage envelopes are
-recognized from payload keys independently of `event_type`, so old
-`attachment`-typed token snapshots and new `usage` events behave identically.
+Catalog extraction accepts normalization v1 through v3. It uses the shared
+`event_text`, `event_tool_input`, and `event_tool_output` accessors so v1 alias
+keys and v3 host-native/multipart `part` payloads produce the same prompts,
+markers, title fallback, model discovery, and empty-session decision.
+`usage`, `lifecycle`, and `metadata` events are non-conversational. Model and
+usage envelopes are recognized from payload content independently of
+`event_type`, so old `attachment`-typed token snapshots and new `usage` events
+behave identically.
 
 `started_at` and `ended_at` are the minimum and maximum valid event timestamps.
 `duration_s` is their non-negative difference. `active_s` walks timestamped
@@ -138,7 +145,10 @@ Extraction checks `cwd_resolved/.retroignore`, then each ancestor, stopping at
 the nearest file. Blank and comment-only files mean `ignore`. Otherwise each
 valid non-comment line is a tag. The record persists tags and the absolute
 `dotfile:<path>` source. If the cwd later disappears, the persisted result is
-retained until source evidence supplies a new cwd.
+retained until source evidence supplies a new cwd. Temporary-directory
+classification does not bypass this lookup while the cwd still exists; a
+`.retroignore` in a live temp workspace is honored in addition to
+`builtin.temp-dir`.
 
 ## Rules
 
