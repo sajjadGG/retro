@@ -22,10 +22,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from ..schema import EventType, Host, NormalizedEvent, RawRef, write_events
+from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, iter_jsonl, truncate_summary
-from .base import ImportResult, has_only_repo_state_capture, is_ghostlab_originator
+from .base import (
+    ImportResult,
+    has_only_repo_state_capture,
+    is_ghostlab_originator,
+    normalized_payload,
+    normalized_result_fields,
+    resolve_timestamp,
+)
 
 CODEX_HOME = Path.home() / ".codex"
 STATE_DB = CODEX_HOME / "state_5.sqlite"
@@ -44,6 +51,7 @@ _FUNCTION_TYPE_OVERRIDES: dict[str, EventType] = {
 _CUSTOM_TOOL_TYPE_OVERRIDES: dict[str, EventType] = {
     "apply_patch": "file_edit",
 }
+NORMALIZER_VERSION = 2
 
 
 @dataclass
@@ -311,7 +319,7 @@ class CodexImporter:
             json.dumps(thread_meta, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
-        events, unknown, gaps = self._normalize(raw_rollout, thread.thread_id)
+        events, unknown, gaps = self.normalize_raw_dir(raw_dir, thread.thread_id)
         normalized_path = self.layout.normalized_path(self.host, thread.thread_id)
         count = write_events(normalized_path, events)
 
@@ -325,6 +333,16 @@ class CodexImporter:
             gaps=gaps,
         )
 
+    def normalize_raw_dir(
+        self,
+        raw_dir: Path,
+        session_id: str,
+    ) -> tuple[list[NormalizedEvent], int, list[str]]:
+        rollout_path = raw_dir / "rollout.jsonl"
+        if not rollout_path.is_file():
+            raise FileNotFoundError(f"Archived Codex rollout is missing: {rollout_path}")
+        return self._normalize(rollout_path, session_id)
+
     # ---- normalization -------------------------------------------------------
 
     def _normalize(
@@ -333,17 +351,24 @@ class CodexImporter:
         events: list[NormalizedEvent] = []
         unknown = 0
         gaps: set[str] = set()
-        call_id_to_event_type: dict[str, EventType] = {}
         call_id_to_name: dict[str, str] = {}
+        call_id_to_event_id: dict[str, str] = {}
+        represented_messages: set[tuple[Actor, str]] = set()
         last_sequence = 0
         last_timestamp: str | None = None
         last_raw_ref: RawRef | None = None
         session_cwd = ""
+        assistant_actor: Actor = "assistant"
 
         for line_no, raw in iter_jsonl(rollout_path):
             seq = line_no
             etype = raw.get("type")
-            ts = raw.get("timestamp")
+            raw_timestamp = raw.get("timestamp")
+            explicit_timestamp = raw_timestamp if isinstance(raw_timestamp, str) else None
+            timestamp, last_timestamp, timestamp_inferred = resolve_timestamp(
+                explicit_timestamp,
+                last_timestamp,
+            )
             raw_payload = raw.get("payload")
             payload: dict[str, Any] = raw_payload if isinstance(raw_payload, dict) else {}
             ptype = payload.get("type")
@@ -353,14 +378,13 @@ class CodexImporter:
                 line=line_no,
             )
             last_sequence = seq
-            last_timestamp = ts if isinstance(ts, str) else last_timestamp
             last_raw_ref = raw_ref
             common: dict[str, Any] = dict(
                 event_id=event_id,
                 session_id=thread_id,
                 host="codex",
                 sequence=seq,
-                timestamp=ts,
+                timestamp=timestamp,
                 parent_event_id=None,
                 raw_ref=raw_ref,
             )
@@ -369,12 +393,18 @@ class CodexImporter:
                 cwd = payload.get("cwd")
                 if isinstance(cwd, str):
                     session_cwd = cwd
+                if _is_subagent_session(payload):
+                    assistant_actor = "subagent"
                 events.append(
                     NormalizedEvent(
                         actor="system",
                         event_type="session_start",
                         summary=f"codex session start cwd={payload.get('cwd')}",
-                        payload=payload,
+                        payload=normalized_payload(
+                            payload,
+                            timestamp_inferred=timestamp_inferred,
+                            subagent=assistant_actor == "subagent",
+                        ),
                         **common,
                     )
                 )
@@ -382,14 +412,27 @@ class CodexImporter:
                 events.append(
                     NormalizedEvent(
                         actor="system",
-                        event_type="attachment",
+                        event_type="metadata",
                         summary=f"turn_context turn_id={payload.get('turn_id') or raw.get('turn_id')}",
-                        payload=payload or raw,
+                        payload=normalized_payload(
+                            payload or raw,
+                            timestamp_inferred=timestamp_inferred,
+                            metadata_kind="turn_context",
+                        ),
                         **common,
                     )
                 )
             elif etype == "event_msg":
-                ev = self._event_msg(ptype, payload, common)
+                ev = self._event_msg(
+                    ptype,
+                    payload,
+                    common,
+                    timestamp_inferred=timestamp_inferred,
+                    assistant_actor=assistant_actor,
+                    represented_messages=represented_messages,
+                    call_id_to_name=call_id_to_name,
+                    call_id_to_event_id=call_id_to_event_id,
+                )
                 if ev is None:
                     unknown += 1
                     gaps.add(f"event_msg/{ptype}")
@@ -398,7 +441,10 @@ class CodexImporter:
                             actor="system",
                             event_type="unknown",
                             summary=f"event_msg unknown payload.type={ptype}",
-                            payload=payload,
+                            payload=normalized_payload(
+                                payload,
+                                timestamp_inferred=timestamp_inferred,
+                            ),
                             **common,
                         )
                     )
@@ -406,14 +452,61 @@ class CodexImporter:
                     events.append(ev)
             elif etype == "response_item":
                 ev = self._response_item(
-                    ptype, payload, common, call_id_to_event_type, call_id_to_name
+                    ptype,
+                    payload,
+                    common,
+                    timestamp_inferred=timestamp_inferred,
+                    assistant_actor=assistant_actor,
+                    represented_messages=represented_messages,
+                    call_id_to_name=call_id_to_name,
+                    call_id_to_event_id=call_id_to_event_id,
                 )
-                if ev is None:
-                    continue  # intentional skips (duplicates of event_msg)
                 if ev.event_type == "unknown":
                     unknown += 1
                     gaps.add(f"response_item/{ptype}")
                 events.append(ev)
+            elif etype == "world_state":
+                events.append(
+                    NormalizedEvent(
+                        actor="system",
+                        event_type="metadata",
+                        summary="world state",
+                        payload=normalized_payload(
+                            payload,
+                            timestamp_inferred=timestamp_inferred,
+                            metadata_kind="world_state",
+                        ),
+                        **common,
+                    )
+                )
+            elif etype == "compacted":
+                events.append(
+                    NormalizedEvent(
+                        actor="system",
+                        event_type="compaction",
+                        summary="context compacted",
+                        payload=normalized_payload(
+                            payload,
+                            timestamp_inferred=timestamp_inferred,
+                            lifecycle="compaction_complete",
+                        ),
+                        **common,
+                    )
+                )
+            elif etype == "inter_agent_communication_metadata":
+                events.append(
+                    NormalizedEvent(
+                        actor="subagent",
+                        event_type="metadata",
+                        summary="inter-agent communication metadata",
+                        payload=normalized_payload(
+                            payload,
+                            timestamp_inferred=timestamp_inferred,
+                            metadata_kind="inter_agent_communication",
+                        ),
+                        **common,
+                    )
+                )
             else:
                 unknown += 1
                 gaps.add(etype or "<missing>")
@@ -422,10 +515,20 @@ class CodexImporter:
                         actor="system",
                         event_type="unknown",
                         summary=f"unknown type={etype}",
-                        payload=raw,
+                        payload=normalized_payload(
+                            raw,
+                            timestamp_inferred=timestamp_inferred,
+                        ),
                         **common,
                     )
                 )
+
+        for event in events:
+            if event.event_type != "tool_result" or event.parent_event_id is not None:
+                continue
+            call_id = event.payload.get("call_id")
+            if call_id:
+                event.parent_event_id = call_id_to_event_id.get(str(call_id))
 
         if events and last_raw_ref is not None:
             events.append(
@@ -447,66 +550,205 @@ class CodexImporter:
         return events, unknown, sorted(gaps)
 
     def _event_msg(
-        self, ptype: str | None, payload: dict[str, Any], common: dict[str, Any]
+        self,
+        ptype: str | None,
+        payload: dict[str, Any],
+        common: dict[str, Any],
+        *,
+        timestamp_inferred: bool,
+        assistant_actor: Actor,
+        represented_messages: set[tuple[Actor, str]],
+        call_id_to_name: dict[str, str],
+        call_id_to_event_id: dict[str, str],
     ) -> NormalizedEvent | None:
         if ptype == "user_message":
-            text = payload.get("message", "")
+            text = str(payload.get("message") or "")
+            actor: Actor = "subagent" if assistant_actor == "subagent" else "user"
+            duplicate = (actor, text) in represented_messages
+            represented_messages.add((actor, text))
             return NormalizedEvent(
-                actor="user",
-                event_type="message",
+                actor=actor,
+                event_type="metadata" if duplicate else "message",
                 summary=truncate_summary(text),
-                payload={"text": text, "images": payload.get("images") or []},
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    text=text,
+                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                ),
                 **common,
             )
         if ptype == "agent_message":
-            text = payload.get("message", "")
+            text = str(payload.get("message") or "")
+            duplicate = (assistant_actor, text) in represented_messages
+            represented_messages.add((assistant_actor, text))
             return NormalizedEvent(
-                actor="assistant",
-                event_type="message",
+                actor=assistant_actor,
+                event_type="metadata" if duplicate else "message",
                 summary=truncate_summary(text),
-                payload={"text": text, "phase": payload.get("phase")},
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    text=text,
+                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                ),
+                **common,
+            )
+        if ptype == "agent_reasoning":
+            text = str(payload.get("text") or "")
+            return NormalizedEvent(
+                actor=assistant_actor,
+                event_type="reasoning",
+                summary=truncate_summary(text),
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    thinking=text,
+                ),
                 **common,
             )
         if ptype == "task_started":
             return NormalizedEvent(
                 actor="system",
-                event_type="attachment",
+                event_type="lifecycle",
                 summary=f"task_started turn={payload.get('turn_id')}",
-                payload=payload,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle="task_started",
+                ),
                 **common,
             )
         if ptype == "task_complete":
             return NormalizedEvent(
                 actor="system",
-                event_type="attachment",
+                event_type="lifecycle",
                 summary=f"task_complete duration_ms={payload.get('duration_ms')}",
-                payload=payload,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle="task_complete",
+                    **normalized_result_fields(payload),
+                ),
                 **common,
             )
         if ptype == "token_count":
             return NormalizedEvent(
                 actor="system",
-                event_type="attachment",
+                event_type="usage",
                 summary="token_count",
-                payload=payload,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                ),
                 **common,
             )
-        if ptype == "patch_apply_end":
-            ok = payload.get("success")
-            files = list((payload.get("changes") or {}).keys())
-            return NormalizedEvent(
-                actor="tool",
-                event_type="file_edit",
-                summary=f"patch_apply success={ok} files={len(files)}",
-                payload=payload,
-                **common,
+        if ptype in {
+            "patch_apply_end",
+            "exec_command_end",
+            "mcp_tool_call_end",
+            "web_search_end",
+        }:
+            call_id_value = payload.get("call_id")
+            call_id = str(call_id_value) if call_id_value else None
+            name = call_id_to_name.get(call_id or "", ptype.removesuffix("_end"))
+            result_common = dict(common)
+            result_common["parent_event_id"] = call_id_to_event_id.get(call_id or "")
+            output = (
+                payload.get("aggregated_output")
+                if ptype == "exec_command_end"
+                else payload.get("result")
+                if ptype == "mcp_tool_call_end"
+                else payload.get("results")
+                if ptype == "web_search_end"
+                else payload.get("stdout") or payload.get("changes")
             )
-        if ptype == "web_search_end":
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
-                summary=f"web_search query={truncate_summary(payload.get('query',''))}",
-                payload=payload,
+                summary=f"tool_result: {name}",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name=name,
+                    call_id=call_id,
+                    output=output,
+                    **normalized_result_fields(payload),
+                ),
+                **result_common,
+            )
+        if ptype == "item_completed":
+            return NormalizedEvent(
+                actor="system",
+                event_type="lifecycle",
+                summary="item completed",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle="item_completed",
+                ),
+                **common,
+            )
+        if ptype == "thread_settings_applied":
+            return NormalizedEvent(
+                actor="system",
+                event_type="metadata",
+                summary="thread settings applied",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    metadata_kind="thread_settings",
+                ),
+                **common,
+            )
+        if ptype == "context_compacted":
+            return NormalizedEvent(
+                actor="system",
+                event_type="compaction",
+                summary="context compacted",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle="compaction_complete",
+                ),
+                **common,
+            )
+        if ptype == "sub_agent_activity":
+            kind = str(payload.get("kind") or "activity")
+            event_type: EventType
+            if kind == "started":
+                event_type = "subagent_start"
+            elif kind in {"completed", "failed"}:
+                event_type = "subagent_end"
+            else:
+                event_type = "lifecycle"
+            call_id = payload.get("event_id")
+            activity_common = dict(common)
+            activity_common["parent_event_id"] = call_id_to_event_id.get(str(call_id or ""))
+            return NormalizedEvent(
+                actor="subagent",
+                event_type=event_type,
+                summary=f"subagent {kind}: {payload.get('agent_path') or ''}".strip(),
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle=f"subagent_{kind}",
+                    call_id=call_id,
+                    **normalized_result_fields(payload),
+                ),
+                **activity_common,
+            )
+        if ptype in {"turn_aborted", "thread_rolled_back"}:
+            lifecycle = "turn_aborted" if ptype == "turn_aborted" else "thread_rolled_back"
+            return NormalizedEvent(
+                actor="system",
+                event_type="lifecycle",
+                summary=lifecycle.replace("_", " "),
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    lifecycle=lifecycle,
+                ),
                 **common,
             )
         return None
@@ -516,103 +758,226 @@ class CodexImporter:
         ptype: str | None,
         payload: dict[str, Any],
         common: dict[str, Any],
-        call_id_to_event_type: dict[str, EventType],
+        *,
+        timestamp_inferred: bool,
+        assistant_actor: Actor,
+        represented_messages: set[tuple[Actor, str]],
         call_id_to_name: dict[str, str],
-    ) -> NormalizedEvent | None:
+        call_id_to_event_id: dict[str, str],
+    ) -> NormalizedEvent:
         if ptype == "message":
-            role = payload.get("role")
+            role = str(payload.get("role") or "")
+            text = _flatten_content(payload.get("content"))
             if role == "developer":
-                # developer-role message is the system/permissions prompt
-                text = _flatten_content(payload.get("content"))
                 return NormalizedEvent(
                     actor="system",
-                    event_type="message",
+                    event_type="attachment",
                     summary=truncate_summary(text),
-                    payload={"role": role, "content": payload.get("content")},
+                    payload=normalized_payload(
+                        payload,
+                        timestamp_inferred=timestamp_inferred,
+                        text=text,
+                    ),
                     **common,
                 )
-            # user/assistant text already surfaced via event_msg.{user_message,agent_message}
-            return None
-        if ptype == "reasoning":
-            # Reasoning content is typically encrypted; keep the envelope for completeness.
+            actor: Actor = (
+                "subagent"
+                if assistant_actor == "subagent"
+                else "user"
+                if role == "user"
+                else "assistant"
+            )
+            duplicate = (actor, text) in represented_messages
+            represented_messages.add((actor, text))
             return NormalizedEvent(
-                actor="assistant",
+                actor=actor,
+                event_type="metadata" if duplicate else "message",
+                summary=truncate_summary(text),
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    text=text,
+                    **({"metadata_kind": "duplicate_message"} if duplicate else {}),
+                ),
+                **common,
+            )
+        if ptype == "reasoning":
+            text = _flatten_reasoning(payload)
+            return NormalizedEvent(
+                actor=assistant_actor,
                 event_type="reasoning",
-                summary="reasoning (encrypted)",
-                payload=payload,
+                summary=truncate_summary(text) or "reasoning (encrypted)",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    **({"thinking": text} if text else {}),
+                ),
                 **common,
             )
         if ptype == "function_call":
-            name = payload.get("name", "?")
+            name = str(payload.get("name") or "?")
             args_raw = payload.get("arguments", "")
             args = _maybe_json(args_raw)
             event_type = _FUNCTION_TYPE_OVERRIDES.get(name, "tool_call")
-            call_id = payload.get("call_id")
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else None
             if call_id:
-                call_id_to_event_type[call_id] = event_type
                 call_id_to_name[call_id] = name
+                call_id_to_event_id[call_id] = str(common["event_id"])
             return NormalizedEvent(
-                actor="assistant",
+                actor=assistant_actor,
                 event_type=event_type,
                 summary=f"{name}({_summarize_args(args)})",
-                payload={"name": name, "arguments": args, "call_id": call_id},
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name=name,
+                    arguments=args,
+                    input=args,
+                    call_id=call_id,
+                ),
                 **common,
             )
         if ptype == "function_call_output":
-            call_id = payload.get("call_id")
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else None
             name = call_id_to_name.get(call_id or "", "?")
+            result_common = dict(common)
+            result_common["parent_event_id"] = call_id_to_event_id.get(call_id or "")
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
                 summary=f"tool_result: {name}",
-                payload={
-                    "name": name,
-                    "call_id": call_id,
-                    "output": payload.get("output"),
-                },
-                **common,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name=name,
+                    call_id=call_id,
+                    output=payload.get("output"),
+                    **normalized_result_fields(payload),
+                ),
+                **result_common,
             )
         if ptype == "custom_tool_call":
-            name = payload.get("name", "?")
+            name = str(payload.get("name") or "?")
             event_type = _CUSTOM_TOOL_TYPE_OVERRIDES.get(name, "tool_call")
-            call_id = payload.get("call_id")
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else None
             if call_id:
-                call_id_to_event_type[call_id] = event_type
                 call_id_to_name[call_id] = name
+                call_id_to_event_id[call_id] = str(common["event_id"])
             return NormalizedEvent(
-                actor="assistant",
+                actor=assistant_actor,
                 event_type=event_type,
                 summary=f"{name} (custom_tool)",
-                payload={"name": name, "input": payload.get("input"), "call_id": call_id},
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name=name,
+                    input=payload.get("input"),
+                    call_id=call_id,
+                ),
                 **common,
             )
         if ptype == "custom_tool_call_output":
-            call_id = payload.get("call_id")
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else None
             name = call_id_to_name.get(call_id or "", "?")
+            result_common = dict(common)
+            result_common["parent_event_id"] = call_id_to_event_id.get(call_id or "")
             return NormalizedEvent(
                 actor="tool",
                 event_type="tool_result",
                 summary=f"tool_result: {name}",
-                payload={
-                    "name": name,
-                    "call_id": call_id,
-                    "output": payload.get("output"),
-                },
-                **common,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name=name,
+                    call_id=call_id,
+                    output=payload.get("output"),
+                    **normalized_result_fields(payload),
+                ),
+                **result_common,
             )
         if ptype == "web_search_call":
+            call_id = str(payload.get("call_id") or payload.get("id") or common["event_id"])
+            call_id_to_name[call_id] = "web_search"
+            call_id_to_event_id[call_id] = str(common["event_id"])
             return NormalizedEvent(
-                actor="assistant",
+                actor=assistant_actor,
                 event_type="tool_call",
                 summary="web_search",
-                payload=payload,
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name="web_search",
+                    call_id=call_id,
+                    input=payload.get("action"),
+                ),
+                **common,
+            )
+        if ptype == "tool_search_call":
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else str(common["event_id"])
+            call_id_to_name[call_id] = "tool_search"
+            call_id_to_event_id[call_id] = str(common["event_id"])
+            return NormalizedEvent(
+                actor=assistant_actor,
+                event_type="tool_call",
+                summary=f"tool_search({_summarize_args(payload.get('arguments'))})",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name="tool_search",
+                    call_id=call_id,
+                    input=payload.get("arguments"),
+                ),
+                **common,
+            )
+        if ptype == "tool_search_output":
+            raw_call_id = payload.get("call_id")
+            call_id = str(raw_call_id) if raw_call_id else None
+            result_common = dict(common)
+            result_common["parent_event_id"] = call_id_to_event_id.get(call_id or "")
+            return NormalizedEvent(
+                actor="tool",
+                event_type="tool_result",
+                summary="tool_result: tool_search",
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    name="tool_search",
+                    call_id=call_id,
+                    output=payload.get("tools"),
+                    **normalized_result_fields(payload),
+                ),
+                **result_common,
+            )
+        if ptype == "agent_message":
+            text = _flatten_content(payload.get("content"))
+            author = str(payload.get("author") or "")
+            message_actor: Actor = (
+                "subagent" if author and author != "/root" else assistant_actor
+            )
+            return NormalizedEvent(
+                actor=message_actor,
+                event_type="message",
+                summary=truncate_summary(text),
+                payload=normalized_payload(
+                    payload,
+                    timestamp_inferred=timestamp_inferred,
+                    text=text,
+                ),
                 **common,
             )
         return NormalizedEvent(
             actor="system",
             event_type="unknown",
             summary=f"response_item unknown payload.type={ptype}",
-            payload=payload,
+            payload=normalized_payload(
+                payload,
+                timestamp_inferred=timestamp_inferred,
+            ),
             **common,
         )
 
@@ -660,6 +1025,27 @@ def _flatten_content(content: Any) -> str:
                 parts.append(c)
         return "\n".join(parts)
     return str(content)
+
+
+def _flatten_reasoning(payload: dict[str, Any]) -> str:
+    for key in ("content", "summary"):
+        text = _flatten_content(payload.get(key))
+        if text:
+            return text
+    return ""
+
+
+def _is_subagent_session(payload: dict[str, Any]) -> bool:
+    if payload.get("parent_thread_id") or payload.get("agent_path"):
+        return True
+    source = payload.get("source")
+    thread_source = payload.get("thread_source")
+    return (
+        isinstance(source, dict)
+        and "subagent" in source
+        or isinstance(thread_source, dict)
+        and "subagent" in thread_source
+    )
 
 
 def _maybe_json(value: Any) -> Any:

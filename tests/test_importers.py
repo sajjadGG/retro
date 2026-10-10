@@ -439,7 +439,7 @@ class TestVscodeCopilotImporter:
             "reasoning",
             "file_read",
             "command",
-            "attachment",
+            "lifecycle",
         }
         read_call = next(
             event
@@ -470,7 +470,7 @@ class TestVscodeCopilotImporter:
             event
             for event in events
             if event.actor == "tool"
-            and event.event_type == "command"
+            and event.event_type == "tool_result"
             and event.payload.get("call_id") == "call-command"
         )
         assert command_result.payload["success"] is False
@@ -500,7 +500,7 @@ class TestVscodeCopilotImporter:
         assert any(event.event_type == "file_edit" for event in events)
         assert any(event.event_type == "permission" for event in events)
         assert any(
-            event.event_type == "command"
+            event.event_type == "tool_result"
             and event.actor == "tool"
             and event.payload["is_error"] is True
             for event in events
@@ -697,7 +697,7 @@ class TestCopilotCliImporter:
             event
             for event in events
             if event.actor == "tool"
-            and event.event_type == "file_read"
+            and event.event_type == "tool_result"
             and event.payload.get("call_id") == "call-read"
         )
         assert read_result.parent_event_id == read_call.event_id

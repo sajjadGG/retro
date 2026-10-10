@@ -20,9 +20,16 @@ from urllib.parse import unquote, urlparse
 from ..schema import Actor, EventType, Host, NormalizedEvent, RawRef, write_events
 from ..storage import Layout
 from ..utils import artifact_ref, truncate_summary
-from .base import ImportResult, has_only_repo_state_capture
+from .base import (
+    ImportResult,
+    has_only_repo_state_capture,
+    normalized_payload,
+    normalized_result_fields,
+    resolve_timestamp,
+)
 
 VSCODE_COPILOT_USER_DIRS_ENV = "VSCODE_COPILOT_USER_DIRS"
+NORMALIZER_VERSION = 2
 
 CoreFormat = Literal["json", "jsonl"]
 ObjectPath = tuple[Union[str, int], ...]
@@ -33,6 +40,7 @@ class _TranscriptCommon(TypedDict):
     parent_id: str | None
     line_no: int
     timestamp: str | None
+    timestamp_inferred: bool
 
 _FILE_READ_TOOLS = {
     "copilot_findFiles",
@@ -388,19 +396,7 @@ class VscodeCopilotImporter:
             encoding="utf-8",
         )
 
-        if raw_transcript is not None:
-            events, unknown, gaps = self._normalize_transcript(
-                raw_transcript,
-                session.session_id,
-                core,
-                raw_session,
-            )
-        else:
-            events, unknown, gaps = self._normalize_core(
-                core,
-                raw_session,
-                session.session_id,
-            )
+        events, unknown, gaps = self.normalize_raw_dir(raw_dir, session.session_id)
 
         normalized_path = self.layout.normalized_path(self.host, session.session_id)
         count = write_events(normalized_path, events)
@@ -413,6 +409,34 @@ class VscodeCopilotImporter:
             unknown_event_count=unknown,
             gaps=gaps,
         )
+
+    def normalize_raw_dir(
+        self,
+        raw_dir: Path,
+        session_id: str,
+    ) -> tuple[list[NormalizedEvent], int, list[str]]:
+        source_path = next(
+            (
+                raw_dir / name
+                for name in ("session.jsonl", "session.json", "session.snapshot.json")
+                if (raw_dir / name).is_file()
+            ),
+            None,
+        )
+        if source_path is None:
+            raise FileNotFoundError(
+                f"Archived VS Code Copilot session is missing under {raw_dir}"
+            )
+        core = _load_core_session(source_path)
+        transcript_path = raw_dir / "transcript.jsonl"
+        if transcript_path.is_file():
+            return self._normalize_transcript(
+                transcript_path,
+                session_id,
+                core,
+                source_path,
+            )
+        return self._normalize_core(core, source_path, session_id)
 
     def _snapshot_sidecars(self, session: CopilotSession, raw_dir: Path) -> None:
         sidecars = raw_dir / "sidecars"
@@ -461,12 +485,14 @@ class VscodeCopilotImporter:
             candidate_data = raw.get("data")
             if isinstance(candidate_data, dict) and candidate_data.get("toolCallId"):
                 executed_tool_ids.add(str(candidate_data["toolCallId"]))
-        core_tools = _core_tool_parts(core, core_path)
+        core_tools = _core_tool_parts(core, core_path, self.layout.root)
         events: list[NormalizedEvent] = []
         unknown = 0
         gaps: set[str] = set()
         tool_types: dict[str, EventType] = {}
         tool_names: dict[str, str] = {}
+        tool_event_ids: dict[str, str] = {}
+        last_timestamp: str | None = None
 
         def emit(
             *,
@@ -475,10 +501,12 @@ class VscodeCopilotImporter:
             parent_id: str | None,
             line_no: int,
             timestamp: str | None,
+            timestamp_inferred: bool,
             actor: Actor,
             event_type: EventType,
             summary: str,
             payload: dict[str, Any],
+            normalized_parent_event_id: str | None = None,
         ) -> str:
             event_id = _transcript_event_id(session_id, raw_id, suffix)
             events.append(
@@ -496,11 +524,18 @@ class VscodeCopilotImporter:
                     ),
                     timestamp=timestamp,
                     parent_event_id=(
-                        _transcript_event_id(session_id, parent_id)
-                        if parent_id
-                        else None
+                        normalized_parent_event_id
+                        if normalized_parent_event_id is not None
+                        else (
+                            _transcript_event_id(session_id, parent_id)
+                            if parent_id
+                            else None
+                        )
                     ),
-                    payload=payload,
+                    payload=normalized_payload(
+                        payload,
+                        timestamp_inferred=timestamp_inferred,
+                    ),
                 )
             )
             return event_id
@@ -511,12 +546,17 @@ class VscodeCopilotImporter:
             event_data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
             raw_id = str(raw.get("id") or f"line-{line_no}")
             parent_id = str(raw["parentId"]) if raw.get("parentId") else None
-            timestamp = _iso_timestamp(raw.get("timestamp"))
+            explicit_timestamp = _iso_timestamp(raw.get("timestamp"))
+            timestamp, last_timestamp, timestamp_inferred = resolve_timestamp(
+                explicit_timestamp,
+                last_timestamp,
+            )
             common: _TranscriptCommon = {
                 "raw_id": raw_id,
                 "parent_id": parent_id,
                 "line_no": line_no,
                 "timestamp": timestamp,
+                "timestamp_inferred": timestamp_inferred,
             }
 
             if raw_type == "session.start":
@@ -547,9 +587,16 @@ class VscodeCopilotImporter:
                     **common,
                     suffix="",
                     actor="assistant",
-                    event_type="attachment",
+                    event_type="lifecycle",
                     summary=str(raw_type),
-                    payload=event_data,
+                    payload={
+                        **event_data,
+                        "lifecycle": (
+                            "turn_start"
+                            if raw_type == "assistant.turn_start"
+                            else "turn_end"
+                        ),
+                    },
                 )
             elif raw_type == "assistant.message":
                 reasoning = event_data.get("reasoningText")
@@ -557,6 +604,31 @@ class VscodeCopilotImporter:
                 assistant_text = assistant_content if isinstance(assistant_content, str) else ""
                 has_content = bool(assistant_text)
                 emitted = False
+                source_payload_available = True
+
+                def assistant_payload(
+                    *,
+                    source_data: dict[str, Any] = event_data,
+                    **fields: Any,
+                ) -> dict[str, Any]:
+                    nonlocal source_payload_available
+                    metadata = {
+                        key: source_data[key]
+                        for key in (
+                            "messageId",
+                            "turnId",
+                            "interactionId",
+                            "model",
+                            "parentToolCallId",
+                            "requestId",
+                        )
+                        if key in source_data
+                    }
+                    if source_payload_available:
+                        source_payload_available = False
+                        return {**source_data, **fields}
+                    return {**metadata, **fields}
+
                 if isinstance(reasoning, str) and reasoning:
                     emit(
                         **common,
@@ -564,10 +636,7 @@ class VscodeCopilotImporter:
                         actor="assistant",
                         event_type="reasoning",
                         summary=truncate_summary(reasoning),
-                        payload={
-                            "thinking": reasoning,
-                            "message_id": event_data.get("messageId"),
-                        },
+                        payload=assistant_payload(thinking=reasoning),
                     )
                     emitted = True
                 if has_content:
@@ -577,10 +646,7 @@ class VscodeCopilotImporter:
                         actor="assistant",
                         event_type="message",
                         summary=truncate_summary(assistant_text),
-                        payload={
-                            "text": assistant_text,
-                            "message_id": event_data.get("messageId"),
-                        },
+                        payload=assistant_payload(text=assistant_text),
                     )
                     emitted = True
                 for index, request in enumerate(event_data.get("toolRequests") or []):
@@ -595,31 +661,35 @@ class VscodeCopilotImporter:
                     if call_id:
                         tool_types[call_id] = event_type
                         tool_names[call_id] = name
-                    emit(
+                    call_event_id = emit(
                         **common,
                         suffix=f"#tool-request-{index}",
                         actor="assistant",
                         event_type=event_type,
                         summary=_tool_summary(name, arguments),
-                        payload={
-                            "name": name,
-                            "tool_name": name,
-                            "tool_id": call_id or None,
-                            "call_id": call_id or None,
-                            "input": arguments,
-                            "requested_only": True,
-                            "request": request,
-                        },
+                        payload=assistant_payload(
+                            name=name,
+                            tool_name=name,
+                            tool_id=call_id or None,
+                            call_id=call_id or None,
+                            input=arguments,
+                            requested_only=True,
+                            request=request,
+                        ),
                     )
+                    if call_id:
+                        tool_event_ids[call_id] = call_event_id
                     emitted = True
                 if not emitted:
                     emit(
                         **common,
                         suffix="",
                         actor="assistant",
-                        event_type="attachment",
+                        event_type="metadata",
                         summary="assistant.message",
-                        payload=event_data,
+                        payload=assistant_payload(
+                            metadata_kind="empty_assistant_message",
+                        ),
                     )
             elif raw_type == "tool.execution_start":
                 call_id = str(event_data.get("toolCallId") or raw_id)
@@ -637,7 +707,7 @@ class VscodeCopilotImporter:
                     "arguments": arguments,
                 }
                 _add_core_enrichment(start_payload, core_tools.get(call_id))
-                emit(
+                call_event_id = emit(
                     **common,
                     suffix="",
                     actor="assistant",
@@ -645,6 +715,7 @@ class VscodeCopilotImporter:
                     summary=_tool_summary(name, arguments),
                     payload=start_payload,
                 )
+                tool_event_ids[call_id] = call_event_id
             elif raw_type == "tool.execution_complete":
                 call_id = str(event_data.get("toolCallId") or raw_id)
                 core_tool = core_tools.get(call_id)
@@ -653,12 +724,13 @@ class VscodeCopilotImporter:
                 success = event_data.get("success")
                 result_type = _completion_event_type(call_type)
                 completion_payload: dict[str, Any] = {
+                    **event_data,
                     "name": name,
                     "tool_name": name,
                     "tool_id": call_id,
                     "call_id": call_id,
-                    "success": success,
-                    "is_error": success is False,
+                    "output": event_data.get("result"),
+                    **normalized_result_fields(event_data),
                 }
                 _add_core_enrichment(completion_payload, core_tool)
                 emit(
@@ -668,6 +740,7 @@ class VscodeCopilotImporter:
                     event_type=result_type,
                     summary=f"{name}: {'completed' if success is not False else 'failed'}",
                     payload=completion_payload,
+                    normalized_parent_event_id=tool_event_ids.get(call_id),
                 )
             else:
                 unknown += 1
@@ -703,6 +776,7 @@ class VscodeCopilotImporter:
             timestamp: str | None,
             parent_event_id: str | None,
             line_no: int,
+            timestamp_inferred: bool = False,
         ) -> str:
             events.append(
                 NormalizedEvent(
@@ -719,7 +793,10 @@ class VscodeCopilotImporter:
                     ),
                     timestamp=timestamp,
                     parent_event_id=parent_event_id,
-                    payload=payload,
+                    payload=normalized_payload(
+                        payload,
+                        timestamp_inferred=timestamp_inferred,
+                    ),
                 )
             )
             return event_id
@@ -760,7 +837,9 @@ class VscodeCopilotImporter:
                 continue
 
             request_id = str(request.get("requestId") or f"request-{request_index}")
-            timestamp = _iso_timestamp(request.get("timestamp")) or session_timestamp
+            explicit_timestamp = _iso_timestamp(request.get("timestamp"))
+            timestamp = explicit_timestamp or session_timestamp
+            timestamp_inferred = explicit_timestamp is None and timestamp is not None
             user_event_id = f"{session_id}:core:{request_id}:user"
             text = _request_text(request)
             request_meta = {
@@ -781,6 +860,7 @@ class VscodeCopilotImporter:
                 timestamp=timestamp,
                 parent_event_id=None,
                 line_no=core.line_for(("requests", request_index, "message")),
+                timestamp_inferred=timestamp_inferred,
             )
 
             response = request.get("response")
@@ -801,6 +881,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                     continue
 
@@ -816,6 +897,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind == "thinking":
                     thinking = str(part.get("value") or "")
@@ -828,6 +910,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind == "toolInvocationSerialized":
                     name = str(part.get("toolId") or part.get("toolName") or "unknown")
@@ -850,6 +933,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                     if part.get("isComplete") is True:
                         is_error = _core_tool_failed(part)
@@ -868,10 +952,15 @@ class VscodeCopilotImporter:
                                 "is_error": is_error,
                                 "result": part.get("resultDetails"),
                                 "invocation": part,
+                                **normalized_result_fields(
+                                    part,
+                                    part.get("resultDetails"),
+                                ),
                             },
                             timestamp=timestamp,
                             parent_event_id=call_event_id,
                             line_no=line_no,
+                            timestamp_inferred=timestamp_inferred,
                         )
                 elif kind == "textEditGroup":
                     emit(
@@ -883,6 +972,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind in {"codeblockUri", "inlineReference"}:
                     emit(
@@ -894,6 +984,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind == "confirmation":
                     emit(
@@ -905,34 +996,56 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind == "prepareToolInvocation":
                     name = str(part.get("toolName") or "unknown")
                     emit(
                         event_id=base_id,
                         actor="assistant",
-                        event_type=_tool_event_type(name),
+                        event_type="metadata",
                         summary=f"prepare {name}",
-                        payload={"name": name, "tool_name": name, "part": part},
+                        payload={
+                            "name": name,
+                            "tool_name": name,
+                            "part": part,
+                            "metadata_kind": "prepare_tool_invocation",
+                        },
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind in {
                     "disabledClaudeHooks",
                     "mcpServersStarting",
                     "questionCarousel",
-                    "undoStop",
                 }:
                     emit(
                         event_id=base_id,
                         actor="system",
-                        event_type="attachment",
+                        event_type="metadata",
                         summary=str(kind),
-                        payload={"part": part},
+                        payload={
+                            "part": part,
+                            "metadata_kind": str(kind),
+                        },
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
+                    )
+                elif kind == "undoStop":
+                    emit(
+                        event_id=base_id,
+                        actor="system",
+                        event_type="lifecycle",
+                        summary="undo stop",
+                        payload={"part": part, "lifecycle": "undo_stop"},
+                        timestamp=timestamp,
+                        parent_event_id=user_event_id,
+                        line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 elif kind in {"progressMessage", "progressTaskSerialized"}:
                     text_part = str(part.get("content") or kind)
@@ -945,6 +1058,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
                 else:
                     unknown += 1
@@ -958,6 +1072,7 @@ class VscodeCopilotImporter:
                         timestamp=timestamp,
                         parent_event_id=user_event_id,
                         line_no=line_no,
+                        timestamp_inferred=timestamp_inferred,
                     )
 
         return events, unknown, sorted(gaps)
@@ -1236,9 +1351,7 @@ def _tool_event_type(name: str) -> EventType:
 def _completion_event_type(call_type: EventType) -> EventType:
     if call_type == "subagent_start":
         return "subagent_end"
-    if call_type == "tool_call":
-        return "tool_result"
-    return call_type
+    return "tool_result"
 
 
 def _tool_summary(name: str, arguments: Any) -> str:
@@ -1265,6 +1378,7 @@ def _transcript_event_id(session_id: str, raw_id: str, suffix: str = "") -> str:
 def _core_tool_parts(
     core: CoreSessionState,
     core_path: Path,
+    archive_root: Path,
 ) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     requests = core.data.get("requests")
@@ -1286,7 +1400,7 @@ def _core_tool_parts(
             out[str(call_id)] = {
                 "part": part,
                 "raw_ref": {
-                    "path": str(core_path),
+                    "path": artifact_ref(core_path, archive_root),
                     "line": core.line_for(path),
                 },
             }

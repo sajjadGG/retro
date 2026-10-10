@@ -1,0 +1,28 @@
+{"type":"mode","mode":"normal","sessionId":"claude-v2","timestamp":"2026-10-01T00:00:00Z"}
+{"type":"bridge-session","sessionId":"claude-v2","bridgeSessionId":"bridge-1","lastSequenceNum":0}
+{"type":"atis-latch","atis":"","sessionId":"claude-v2"}
+{"type":"agent-name","agentName":"reviewer","sessionId":"claude-v2"}
+{"type":"ai-title","aiTitle":"Normalization test","sessionId":"claude-v2"}
+{"type":"last-prompt","lastPrompt":"Build it","sessionId":"claude-v2"}
+{"type":"file-history-snapshot","messageId":"m1","snapshot":{"trackedFileBackups":{}}}
+{"type":"file-history-delta","messageId":"m2","trackingPath":"a.py","backup":{"version":1}}
+{"type":"worktree-state","worktreeSession":{"worktreePath":"/workspace/wt"},"sessionId":"claude-v2"}
+{"type":"pr-link","sessionId":"claude-v2","prNumber":1,"prUrl":"https://example.test/pr/1"}
+{"type":"frame-link","sessionId":"claude-v2","path":"report.html","frameUrl":"https://example.test/frame","title":"Report"}
+{"type":"cost-state","sessionId":"claude-v2","totalCostUSD":0.25,"modelUsage":{"claude":{"inputTokens":10}}}
+{"type":"queue-operation","operation":"enqueue","sessionId":"claude-v2","content":"background task"}
+{"type":"permission-mode","permissionMode":"default","sessionId":"claude-v2"}
+{"type":"attachment","uuid":"att-1","attachment":{"type":"task_reminder","content":"Remember task"},"isSidechain":false}
+{"type":"system","uuid":"sys-command","subtype":"local_command","content":"<command-name>/model</command-name>","isSidechain":false}
+{"type":"system","uuid":"sys-turn","subtype":"turn_duration","durationMs":10,"isSidechain":false}
+{"type":"system","uuid":"sys-hook","subtype":"stop_hook_summary","hookCount":1,"isSidechain":false}
+{"type":"system","uuid":"sys-away","subtype":"away_summary","content":"Resume context","isSidechain":false}
+{"type":"system","uuid":"sys-info","subtype":"informational","content":"Notice","isSidechain":false}
+{"type":"system","uuid":"sys-scheduled","subtype":"scheduled_task_fire","content":"Wake up","isSidechain":false}
+{"type":"system","uuid":"sys-error","subtype":"api_error","error":{"message":"connection failed"},"isSidechain":false}
+{"type":"user","uuid":"meta-user","isMeta":true,"isSidechain":false,"message":{"role":"user","content":"Injected caveat"}}
+{"type":"user","uuid":"user-1","isSidechain":false,"message":{"role":"user","content":[{"type":"text","text":"Build it"},{"type":"image","source":{"type":"base64","data":"AA=="}}]}}
+{"type":"assistant","uuid":"assistant-1","isSidechain":false,"message":{"role":"assistant","usage":{"input_tokens":10},"content":[{"type":"thinking","thinking":"Inspect first"},{"type":"text","text":"Working"},{"type":"tool_use","id":"tool-read","name":"Read","input":{"file_path":"a.py"}},{"type":"tool_use","id":"tool-bash","name":"Bash","input":{"command":"false"}}]}}
+{"type":"user","uuid":"result-1","parentUuid":"assistant-1","isSidechain":false,"toolUseResult":{"stdout":"","stderr":"failed","interrupted":false},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool-read","content":"contents","is_error":false},{"type":"tool_result","tool_use_id":"tool-bash","content":"failed","is_error":true}]}}
+{"type":"assistant","uuid":"sidechain-1","isSidechain":true,"message":{"role":"assistant","content":[{"type":"text","text":"Subagent answer"}]}}
+{"type":"future-claude-record","uuid":"future-1","preserve":true}

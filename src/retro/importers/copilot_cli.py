@@ -16,9 +16,11 @@ from .base import (
     ImportResult,
     has_only_repo_state_capture,
     is_ghostlab_copilot_session_id,
+    normalized_payload,
+    normalized_result_fields,
+    resolve_timestamp,
 )
 from .vscode_copilot import (
-    _completion_event_type,
     _copy_stable,
     _export_session_store,
     _iso_timestamp,
@@ -29,6 +31,7 @@ from .vscode_copilot import (
 
 COPILOT_HOME_ENV = "COPILOT_HOME"
 COPILOT_SESSION_STATE_DIRS_ENV = "COPILOT_SESSION_STATE_DIRS"
+NORMALIZER_VERSION = 2
 
 _SESSION_METADATA_FILES = (
     "workspace.yaml",
@@ -235,7 +238,7 @@ class CopilotCliImporter:
             encoding="utf-8",
         )
 
-        events, unknown, gaps = self._normalize(raw_events, session.session_id)
+        events, unknown, gaps = self.normalize_raw_dir(raw_dir, session.session_id)
         normalized_path = self.layout.normalized_path(self.host, session.session_id)
         count = write_events(normalized_path, events)
         return ImportResult(
@@ -247,6 +250,18 @@ class CopilotCliImporter:
             unknown_event_count=unknown,
             gaps=gaps,
         )
+
+    def normalize_raw_dir(
+        self,
+        raw_dir: Path,
+        session_id: str,
+    ) -> tuple[list[NormalizedEvent], int, list[str]]:
+        events_path = raw_dir / "events.jsonl"
+        if not events_path.is_file():
+            raise FileNotFoundError(
+                f"Archived Copilot Agent Host event log is missing: {events_path}"
+            )
+        return self._normalize(events_path, session_id)
 
     def _snapshot_sidecars(self, session: CopilotCliSession, raw_dir: Path) -> None:
         sidecars = raw_dir / "sidecars"
@@ -281,8 +296,15 @@ class CopilotCliImporter:
         tool_events: dict[str, NormalizedEvent] = {}
         tool_names: dict[str, str] = {}
         external_tool_event_ids: dict[str, str] = {}
+        external_tool_call_ids: dict[str, str] = {}
+        external_tool_names: dict[str, str] = {}
         subagent_event_ids: dict[str, str] = {}
+        subagent_by_agent_id: dict[str, str] = {}
+        hook_event_ids: dict[str, str] = {}
         chunk_buffers: dict[tuple[Any, ...], list[tuple[int, dict[str, Any]]]] = {}
+        resolved_timestamps: dict[int, str | None] = {}
+        inferred_timestamp_lines: set[int] = set()
+        last_source_timestamp: str | None = None
 
         def emit(
             *,
@@ -299,7 +321,10 @@ class CopilotCliImporter:
         ) -> str:
             raw_id = str(raw.get("id") or f"line-{line_no}")
             event_id = f"{session_id}:agent-host:{raw_id}{suffix}"
-            event_payload = dict(payload)
+            event_payload = normalized_payload(
+                payload,
+                timestamp_inferred=line_no in inferred_timestamp_lines,
+            )
             if raw.get("parentId"):
                 event_payload["raw_parent_event_id"] = raw["parentId"]
             if raw.get("agentId"):
@@ -321,7 +346,7 @@ class CopilotCliImporter:
                         path=artifact_ref(events_path, self.layout.root),
                         line=line_no,
                     ),
-                    timestamp=_iso_timestamp(raw.get("timestamp")),
+                    timestamp=resolved_timestamps.get(line_no),
                     parent_event_id=parent_event_id,
                     payload=event_payload,
                 )
@@ -356,18 +381,31 @@ class CopilotCliImporter:
             reasoning = data.get("reasoningText")
             thinking = reasoning if isinstance(reasoning, str) else ""
             turn_id = str(data.get("turnId") or "")
-            message_payload = {
-                key: value
-                for key, value in data.items()
-                if key
-                not in {
-                    "content",
-                    "encryptedContent",
-                    "reasoningText",
-                    "reasoningOpaque",
-                    "toolRequests",
+            source_payload_available = True
+
+            def assistant_payload(**fields: Any) -> dict[str, Any]:
+                nonlocal source_payload_available
+                metadata = {
+                    key: data[key]
+                    for key in (
+                        "messageId",
+                        "turnId",
+                        "interactionId",
+                        "model",
+                        "parentToolCallId",
+                        "requestId",
+                        "clientRequestId",
+                        "serviceRequestId",
+                        "apiCallId",
+                        "phase",
+                    )
+                    if key in data
                 }
-            }
+                if source_payload_available:
+                    source_payload_available = False
+                    return {**data, **fields}
+                return {**metadata, **fields}
+
             canonical_event_id: str | None = None
             if thinking:
                 canonical_event_id = emit(
@@ -377,7 +415,7 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type="reasoning",
                     summary=truncate_summary(thinking),
-                    payload={"thinking": thinking, **message_payload},
+                    payload=assistant_payload(thinking=thinking),
                     parent_event_id=parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -389,7 +427,7 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type="message",
                     summary=truncate_summary(text),
-                    payload={"text": text, **message_payload},
+                    payload=assistant_payload(text=text),
                     parent_event_id=parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -408,7 +446,7 @@ class CopilotCliImporter:
                     continue
                 name = str(request.get("name") or request.get("toolName") or "unknown")
                 arguments = request.get("arguments")
-                call_type = _tool_event_type(name)
+                call_type = _cli_tool_event_type(name)
                 call_event_id = emit(
                     raw=raw,
                     line_no=line_no,
@@ -416,15 +454,15 @@ class CopilotCliImporter:
                     actor="subagent" if actor == "subagent" else "assistant",
                     event_type=call_type,
                     summary=_tool_summary(name, arguments),
-                    payload={
-                        "name": name,
-                        "tool_name": name,
-                        "tool_id": call_id or None,
-                        "call_id": call_id or None,
-                        "input": arguments,
-                        "requested_only": True,
-                        "request": request,
-                    },
+                    payload=assistant_payload(
+                        name=name,
+                        tool_name=name,
+                        tool_id=call_id or None,
+                        call_id=call_id or None,
+                        input=arguments,
+                        requested_only=True,
+                        request=request,
+                    ),
                     parent_event_id=canonical_event_id or parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -446,10 +484,9 @@ class CopilotCliImporter:
                     actor=actor,
                     event_type="attachment",
                     summary="encrypted assistant message",
-                    payload={
-                        **message_payload,
-                        "encrypted_content_bytes": len(str(encrypted)),
-                    },
+                    payload=assistant_payload(
+                        encrypted_content_bytes=len(str(encrypted)),
+                    ),
                     parent_event_id=parent,
                     raw_event_ids=raw_event_ids,
                     raw_lines=raw_lines,
@@ -495,6 +532,10 @@ class CopilotCliImporter:
                     requests.append(request)
             first_data["toolRequests"] = requests
             first_data["persisted_chunk_count"] = len(ordered)
+            first_data["source_chunks"] = [
+                _event_data(raw)
+                for _, raw in ordered
+            ]
             first_data.pop("chunkIndex", None)
             first_data.pop("chunkCount", None)
             merged = dict(first_raw)
@@ -527,9 +568,9 @@ class CopilotCliImporter:
                     raw=raw,
                     line_no=line_no,
                     actor="system",
-                    event_type="attachment",
+                    event_type="lifecycle",
                     summary="Copilot Agent Host session resume",
-                    payload=data,
+                    payload={**data, "lifecycle": "session_resume"},
                     parent_event_id=session_start_event_id,
                 )
             elif event_type == "session.shutdown":
@@ -545,40 +586,48 @@ class CopilotCliImporter:
             elif event_type == "user.message":
                 content = data.get("content")
                 text = content if isinstance(content, str) else ""
+                message_actor, message_type, normalized_fields = _user_message_type(data)
                 current_user_event_id = emit(
                     raw=raw,
                     line_no=line_no,
-                    actor="user",
-                    event_type="message",
+                    actor=message_actor,
+                    event_type=message_type,
                     summary=truncate_summary(text or "empty user message"),
-                    payload={"text": text, **data},
+                    payload={"text": text, **data, **normalized_fields},
                     parent_event_id=session_start_event_id,
                 )
             elif event_type == "assistant.message":
                 process_assistant_message(raw, line_no)
             elif event_type in {"assistant.turn_start", "assistant.turn_end"}:
-                actor: Actor = "subagent" if raw.get("agentId") else "assistant"
+                turn_actor: Actor = "subagent" if raw.get("agentId") else "assistant"
                 emit(
                     raw=raw,
                     line_no=line_no,
-                    actor=actor,
-                    event_type="attachment",
+                    actor=turn_actor,
+                    event_type="lifecycle",
                     summary=str(event_type),
-                    payload=data,
+                    payload={
+                        **data,
+                        "lifecycle": (
+                            "turn_start"
+                            if event_type == "assistant.turn_start"
+                            else "turn_end"
+                        ),
+                    },
                     parent_event_id=logical_parent(data),
                 )
             elif event_type == "tool.execution_start":
                 call_id = str(data.get("toolCallId") or raw.get("id") or line_no)
                 name = str(data.get("toolName") or "unknown")
                 arguments = data.get("arguments")
-                normalized_type = _tool_event_type(name)
+                call_type = _cli_tool_event_type(name)
                 parent = logical_parent(data)
                 existing_call = tool_events.get(call_id)
                 if existing_call is not None:
                     existing_call.actor = (
                         "subagent" if data.get("parentToolCallId") else "assistant"
                     )
-                    existing_call.event_type = normalized_type
+                    existing_call.event_type = call_type
                     existing_call.summary = _tool_summary(name, arguments)
                     existing_call.payload.update(
                         {
@@ -590,7 +639,7 @@ class CopilotCliImporter:
                             "input": arguments,
                             "requested_only": False,
                             "execution_raw_ref": {
-                                "path": str(events_path),
+                                "path": artifact_ref(events_path, self.layout.root),
                                 "line": line_no,
                             },
                             "execution_raw_event_id": raw.get("id"),
@@ -602,7 +651,7 @@ class CopilotCliImporter:
                         raw=raw,
                         line_no=line_no,
                         actor="subagent" if data.get("parentToolCallId") else "assistant",
-                        event_type=normalized_type,
+                        event_type=call_type,
                         summary=_tool_summary(name, arguments),
                         payload={
                             **data,
@@ -622,19 +671,12 @@ class CopilotCliImporter:
                 call_id = str(data.get("toolCallId") or raw.get("id") or line_no)
                 start_id = tool_event_ids.get(call_id)
                 name = tool_names.get(call_id, "unknown")
-                call_type = _tool_event_type(name)
-                normalized_type = _completion_event_type(call_type)
                 success = data.get("success")
                 emit(
                     raw=raw,
                     line_no=line_no,
-                    actor=(
-                        "subagent"
-                        if normalized_type == "subagent_end"
-                        or data.get("parentToolCallId")
-                        else "tool"
-                    ),
-                    event_type=normalized_type,
+                    actor="tool",
+                    event_type="tool_result",
                     summary=f"{name}: {'completed' if success is not False else 'failed'}",
                     payload={
                         **data,
@@ -642,8 +684,8 @@ class CopilotCliImporter:
                         "tool_name": name,
                         "tool_id": call_id,
                         "call_id": call_id,
-                        "is_error": success is False,
                         "output": data.get("result"),
+                        **normalized_result_fields(data),
                     },
                     parent_event_id=start_id,
                 )
@@ -654,7 +696,7 @@ class CopilotCliImporter:
                     raw=raw,
                     line_no=line_no,
                     actor="assistant",
-                    event_type=_tool_event_type(name),
+                    event_type=_cli_tool_event_type(name),
                     summary=_tool_summary(name, data.get("arguments")),
                     payload={
                         **data,
@@ -666,15 +708,28 @@ class CopilotCliImporter:
                     parent_event_id=current_user_event_id,
                 )
                 external_tool_event_ids[request_id] = event_id
+                external_tool_call_ids[request_id] = str(
+                    data.get("toolCallId") or request_id
+                )
+                external_tool_names[request_id] = name
             elif event_type == "external_tool.completed":
                 request_id = str(data.get("requestId") or raw.get("id") or line_no)
+                call_id = external_tool_call_ids.get(request_id, request_id)
+                name = external_tool_names.get(request_id, "external_tool")
                 emit(
                     raw=raw,
                     line_no=line_no,
                     actor="tool",
                     event_type="tool_result",
-                    summary="external tool completed",
-                    payload=data,
+                    summary=f"tool_result: {name}",
+                    payload={
+                        **data,
+                        "name": name,
+                        "tool_name": name,
+                        "call_id": call_id,
+                        "output": data.get("result"),
+                        **normalized_result_fields(data),
+                    },
                     parent_event_id=external_tool_event_ids.get(request_id),
                 )
             elif event_type == "permission.requested":
@@ -699,16 +754,30 @@ class CopilotCliImporter:
                     parent_event_id=tool_event_ids.get(call_id) or current_user_event_id,
                 )
             elif event_type in {"hook.start", "hook.end"}:
-                emit(
+                invocation_id = str(data.get("hookInvocationId") or raw.get("id") or line_no)
+                parent = (
+                    hook_event_ids.get(invocation_id)
+                    if event_type == "hook.end"
+                    else tool_event_ids.get(str(data.get("parentToolCallId") or ""))
+                    or current_user_event_id
+                )
+                event_id = emit(
                     raw=raw,
                     line_no=line_no,
                     actor="hook",
-                    event_type="attachment",
+                    event_type="lifecycle",
                     summary=f"{event_type}: {data.get('hookType') or 'unknown'}",
-                    payload=data,
-                    parent_event_id=current_user_event_id,
+                    payload={
+                        **data,
+                        "lifecycle": (
+                            "hook_start" if event_type == "hook.start" else "hook_end"
+                        ),
+                    },
+                    parent_event_id=parent,
                 )
-            elif event_type in {"system.message", "system.notification"}:
+                if event_type == "hook.start":
+                    hook_event_ids[invocation_id] = event_id
+            elif event_type == "system.message":
                 content = data.get("content")
                 text = content if isinstance(content, str) else str(event_type)
                 emit(
@@ -720,6 +789,21 @@ class CopilotCliImporter:
                     payload={"text": text, **data},
                     parent_event_id=current_user_event_id or session_start_event_id,
                 )
+            elif event_type == "system.notification":
+                content = data.get("content")
+                text = content if isinstance(content, str) else str(event_type)
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor="system",
+                    event_type="metadata",
+                    summary=truncate_summary(text),
+                    payload={
+                        **data,
+                        "metadata_kind": "system_notification",
+                    },
+                    parent_event_id=current_user_event_id or session_start_event_id,
+                )
             elif event_type == "subagent.started":
                 call_id = str(data.get("toolCallId") or raw.get("id") or line_no)
                 event_id = emit(
@@ -728,10 +812,16 @@ class CopilotCliImporter:
                     actor="subagent",
                     event_type="subagent_start",
                     summary=f"subagent started: {data.get('agentDisplayName') or data.get('agentName')}",
-                    payload=data,
+                    payload={
+                        **data,
+                        "call_id": call_id,
+                        "lifecycle": "subagent_start",
+                    },
                     parent_event_id=tool_event_ids.get(call_id) or current_user_event_id,
                 )
                 subagent_event_ids[call_id] = event_id
+                if raw.get("agentId"):
+                    subagent_by_agent_id[str(raw["agentId"])] = event_id
             elif event_type in {"subagent.completed", "subagent.failed"}:
                 call_id = str(data.get("toolCallId") or "")
                 emit(
@@ -745,6 +835,12 @@ class CopilotCliImporter:
                     ),
                     payload={
                         **data,
+                        "call_id": call_id,
+                        "lifecycle": (
+                            "subagent_failed"
+                            if event_type == "subagent.failed"
+                            else "subagent_complete"
+                        ),
                         "success": event_type != "subagent.failed",
                         "is_error": event_type == "subagent.failed",
                     },
@@ -786,52 +882,116 @@ class CopilotCliImporter:
                     parent_event_id=current_user_event_id or session_start_event_id,
                 )
             elif event_type == "session.binary_asset":
-                compact = {
-                    key: value
-                    for key, value in data.items()
-                    if key != "data"
-                }
-                compact["data_omitted_from_normalized"] = "data" in data
                 emit(
                     raw=raw,
                     line_no=line_no,
                     actor="system",
                     event_type="attachment",
                     summary=f"binary asset: {data.get('mimeType') or 'unknown'}",
-                    payload=compact,
+                    payload=data,
                     parent_event_id=current_user_event_id,
                 )
             elif event_type == "skill.invoked":
-                compact = {
-                    key: value
-                    for key, value in data.items()
-                    if key != "content"
-                }
-                if isinstance(data.get("content"), str):
-                    compact["content_length"] = len(data["content"])
                 emit(
                     raw=raw,
                     line_no=line_no,
                     actor="system",
                     event_type="attachment",
                     summary=f"skill invoked: {data.get('name') or 'unknown'}",
-                    payload=compact,
+                    payload=data,
                     parent_event_id=current_user_event_id,
                 )
+            elif event_type == "session.mode_changed":
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor="system",
+                    event_type="lifecycle",
+                    summary=str(event_type),
+                    payload={**data, "lifecycle": "mode_change"},
+                    parent_event_id=current_user_event_id or session_start_event_id,
+                )
+            elif event_type == "session.task_complete":
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor="system",
+                    event_type="lifecycle",
+                    summary=str(event_type),
+                    payload={
+                        **data,
+                        "lifecycle": "task_complete",
+                        **normalized_result_fields(data),
+                    },
+                    parent_event_id=current_user_event_id or session_start_event_id,
+                )
+            elif event_type == "session.usage_checkpoint":
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor="system",
+                    event_type="usage",
+                    summary=str(event_type),
+                    payload=data,
+                    parent_event_id=current_user_event_id or session_start_event_id,
+                )
             elif event_type in {
-                "session.mode_changed",
                 "session.model_change",
-                "session.task_complete",
-                "session.usage_checkpoint",
+                "session.auto_mode_resolved",
+                "session.mode_notice_delivered",
+                "subagent.configured",
+                "subagent.selected",
                 "subagent.deselected",
+                "skill.invoked_ref",
             }:
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor=(
+                        "subagent"
+                        if str(event_type).startswith("subagent.")
+                        else "system"
+                    ),
+                    event_type="metadata",
+                    summary=str(event_type),
+                    payload={
+                        **data,
+                        "metadata_kind": str(event_type).replace(".", "_"),
+                    },
+                    parent_event_id=(
+                        subagent_by_agent_id.get(str(raw.get("agentId") or ""))
+                        or current_user_event_id
+                        or session_start_event_id
+                    ),
+                )
+            elif event_type == "skill.context_delivered_ref":
                 emit(
                     raw=raw,
                     line_no=line_no,
                     actor="system",
                     event_type="attachment",
-                    summary=str(event_type),
+                    summary="skill context delivered",
                     payload=data,
+                    parent_event_id=current_user_event_id or session_start_event_id,
+                )
+            elif event_type in {
+                "session.compaction_start",
+                "session.compaction_complete",
+            }:
+                emit(
+                    raw=raw,
+                    line_no=line_no,
+                    actor="system",
+                    event_type="compaction",
+                    summary=str(event_type),
+                    payload={
+                        **data,
+                        "lifecycle": (
+                            "compaction_start"
+                            if event_type == "session.compaction_start"
+                            else "compaction_complete"
+                        ),
+                    },
                     parent_event_id=current_user_event_id or session_start_event_id,
                 )
             else:
@@ -848,6 +1008,14 @@ class CopilotCliImporter:
                 )
 
         for line_no, raw in _iter_jsonl_strict(events_path):
+            explicit_timestamp = _iso_timestamp(raw.get("timestamp"))
+            timestamp, last_source_timestamp, timestamp_inferred = resolve_timestamp(
+                explicit_timestamp,
+                last_source_timestamp,
+            )
+            resolved_timestamps[line_no] = timestamp
+            if timestamp_inferred:
+                inferred_timestamp_lines.add(line_no)
             if raw.get("type") == "assistant.message":
                 data = _event_data(raw)
                 count = data.get("chunkCount")
@@ -869,6 +1037,28 @@ class CopilotCliImporter:
         for candidate_key in list(chunk_buffers):
             flush_chunks(candidate_key)
         return events, unknown, sorted(gaps)
+
+
+def _cli_tool_event_type(name: str) -> EventType:
+    event_type = _tool_event_type(name)
+    return "tool_call" if event_type == "subagent_start" else event_type
+
+
+def _user_message_type(
+    data: dict[str, Any],
+) -> tuple[Actor, EventType, dict[str, Any]]:
+    source = data.get("source")
+    if data.get("isAutopilotContinuation") is True:
+        return "system", "attachment", {"injected_context": True}
+    if isinstance(source, str) and source.startswith("skill-"):
+        return "system", "attachment", {"injected_context": True}
+    if source == "system":
+        if data.get("content"):
+            return "system", "attachment", {"injected_context": True}
+        return "system", "lifecycle", {"lifecycle": "system_steering"}
+    if isinstance(source, str) and source.startswith("agent-"):
+        return "subagent", "message", {"source_agent_id": source[6:]}
+    return "user", "message", {}
 
 
 def _read_session_index(db_path: Path) -> dict[str, dict[str, Any]]:

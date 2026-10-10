@@ -9,9 +9,28 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .schema import NormalizedEvent, read_events
+from .utils import atomic_write_text
 
 _COMMAND_OUT_LIMIT = 4000  # per-event content truncation in rendered md
 _TEXT_LIMIT = 8000
+_NOISE_TYPES = {"lifecycle", "metadata", "usage"}
+_LEGACY_NOISE_PREFIXES = (
+    "assistant.turn_",
+    "hook.start",
+    "hook.end",
+    "session resume",
+    "session.mode_changed",
+    "session.model_change",
+    "session.task_complete",
+    "session.usage_checkpoint",
+    "subagent.deselected",
+    "task_started",
+    "task_complete",
+    "token_count",
+    "turn_context",
+)
+_CALL_TYPES = {"tool_call", "command", "file_edit", "file_read", "subagent_start"}
+_RESULT_TYPES = {"tool_result", "subagent_end"}
 
 _ACTOR_HEADINGS = {
     "user": "User",
@@ -23,17 +42,28 @@ _ACTOR_HEADINGS = {
 }
 
 
-def render_markdown(events: Iterable[NormalizedEvent]) -> str:
+def render_markdown(
+    events: Iterable[NormalizedEvent],
+    *,
+    include_noise: bool = False,
+) -> str:
     events = list(events)
     if not events:
         return "# (empty rollout)\n"
 
+    visible = [
+        event
+        for event in events
+        if include_noise or not _is_noise(event)
+    ]
     first = events[0]
     lines: list[str] = []
     lines.append(f"# Rollout: {first.session_id}")
     lines.append("")
     lines.append(f"- **Host:** `{first.host}`")
     lines.append(f"- **Events:** {len(events)}")
+    if len(visible) != len(events):
+        lines.append(f"- **Transcript events:** {len(visible)}")
     if first.timestamp:
         lines.append(f"- **First event:** {first.timestamp}")
     last_ts = next((e.timestamp for e in reversed(events) if e.timestamp), None)
@@ -47,17 +77,75 @@ def render_markdown(events: Iterable[NormalizedEvent]) -> str:
     lines.append("---")
     lines.append("")
 
-    for ev in events:
+    inline_results = _inline_results(visible)
+    consumed_results = {
+        result.event_id
+        for results in inline_results.values()
+        for result in results
+    }
+    for ev in visible:
+        if ev.event_id in consumed_results:
+            continue
         lines.extend(_render_event(ev))
+        for result in inline_results.get(ev.event_id, []):
+            lines.extend(_render_result_inline(result))
 
     return "\n".join(lines) + "\n"
 
 
-def render_file(normalized_path: Path, dest: Path) -> int:
-    md = render_markdown(read_events(normalized_path))
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(md, encoding="utf-8")
+def render_file(
+    normalized_path: Path,
+    dest: Path,
+    *,
+    include_noise: bool = False,
+) -> int:
+    md = render_markdown(read_events(normalized_path), include_noise=include_noise)
+    atomic_write_text(dest, md)
     return len(md)
+
+
+def _is_noise(ev: NormalizedEvent) -> bool:
+    if ev.event_type in _NOISE_TYPES:
+        return True
+    if ev.event_type != "attachment":
+        return False
+    summary = ev.summary.casefold()
+    return any(summary.startswith(prefix) for prefix in _LEGACY_NOISE_PREFIXES)
+
+
+def _is_call(ev: NormalizedEvent) -> bool:
+    return ev.actor in {"assistant", "subagent"} and ev.event_type in _CALL_TYPES
+
+
+def _is_result(ev: NormalizedEvent) -> bool:
+    return ev.event_type in _RESULT_TYPES or (
+        ev.actor == "tool" and ev.event_type in {"command", "file_edit", "file_read"}
+    )
+
+
+def _inline_results(
+    events: list[NormalizedEvent],
+) -> dict[str, list[NormalizedEvent]]:
+    calls = [event for event in events if _is_call(event)]
+    call_ids: dict[str, list[NormalizedEvent]] = {}
+    calls_by_event_id = {event.event_id: event for event in calls}
+    for call_event in calls:
+        call_id = call_event.payload.get("call_id")
+        if call_id:
+            call_ids.setdefault(str(call_id), []).append(call_event)
+
+    paired: dict[str, list[NormalizedEvent]] = {}
+    for result in (event for event in events if _is_result(event)):
+        call: NormalizedEvent | None = None
+        if result.parent_event_id:
+            call = calls_by_event_id.get(result.parent_event_id)
+        if call is None and result.payload.get("call_id"):
+            candidates = call_ids.get(str(result.payload["call_id"]), [])
+            if candidates:
+                call = candidates[-1]
+        if call is not None:
+            paired.setdefault(call.event_id, []).append(result)
+    return paired
 
 
 def _render_event(ev: NormalizedEvent) -> list[str]:
@@ -88,7 +176,7 @@ def _render_event(ev: NormalizedEvent) -> list[str]:
         out.append(_block_quote(_truncate_keep_lines(text, _TEXT_LIMIT)))
         out.append("")
         out.append("</details>")
-    elif et in {"tool_call", "command", "file_edit", "file_read"}:
+    elif et in {"tool_call", "command", "file_edit", "file_read", "subagent_start"}:
         out.append(f"## · {et} · {heading_actor}{ts}")
         out.append(f"**{ev.summary}**")
         body = _tool_call_body(ev)
@@ -104,6 +192,15 @@ def _render_event(ev: NormalizedEvent) -> list[str]:
             out.append("```")
             out.append(_truncate_keep_lines(text, _COMMAND_OUT_LIMIT))
             out.append("```")
+    elif et in _NOISE_TYPES:
+        out.append(f"## · {et} · {ev.summary}{ts}")
+        out.append("<details><summary>payload</summary>")
+        out.append("")
+        out.append("```json")
+        out.append(_short_json(ev.payload, indent=2, limit=2000))
+        out.append("```")
+        out.append("")
+        out.append("</details>")
     elif et == "attachment":
         out.append(f"## · attachment · {ev.summary}{ts}")
         out.append("<details><summary>payload</summary>")
@@ -135,6 +232,39 @@ def _render_event(ev: NormalizedEvent) -> list[str]:
     return out
 
 
+def _render_result_inline(ev: NormalizedEvent) -> list[str]:
+    status: list[str] = []
+    if isinstance(ev.payload.get("success"), bool):
+        status.append("success" if ev.payload["success"] else "failed")
+    if ev.payload.get("exit_code") is not None:
+        status.append(f"exit {ev.payload['exit_code']}")
+    label = f" — {', '.join(status)}" if status else ""
+    out = [f"### Result{label}"]
+    text = _extract_tool_result_text(ev)
+    if text:
+        out.extend(
+            [
+                "```",
+                _truncate_keep_lines(text, _COMMAND_OUT_LIMIT),
+                "```",
+            ]
+        )
+    else:
+        out.extend(
+            [
+                "<details><summary>payload</summary>",
+                "",
+                "```json",
+                _short_json(ev.payload, indent=2, limit=2000),
+                "```",
+                "",
+                "</details>",
+            ]
+        )
+    out.append("")
+    return out
+
+
 def _extract_text(ev: NormalizedEvent) -> str:
     p = ev.payload or {}
     for k in ("text", "thinking", "message"):
@@ -149,27 +279,37 @@ def _extract_text(ev: NormalizedEvent) -> str:
 
 def _extract_tool_result_text(ev: NormalizedEvent) -> str:
     p = ev.payload or {}
-    out = p.get("output")
-    if isinstance(out, str):
-        return out
-    if isinstance(out, (dict, list)):
-        return json.dumps(out, ensure_ascii=False, indent=2)
+    for key in ("output", "result", "tool_use_result"):
+        out = p.get(key)
+        if isinstance(out, str):
+            return out
+        if isinstance(out, (dict, list)):
+            return json.dumps(out, ensure_ascii=False, indent=2)
+    stdout = p.get("stdout")
+    stderr = p.get("stderr")
+    if isinstance(stdout, str) or isinstance(stderr, str):
+        chunks = [
+            value
+            for value in (stdout, stderr)
+            if isinstance(value, str) and value
+        ]
+        return "\n".join(chunks)
     content = p.get("content")
     if isinstance(content, str):
         return content
     if isinstance(content, list):
         # Anthropic-style tool_result content blocks: [{type: "text", text: ...}, ...]
-        chunks: list[str] = []
+        content_chunks: list[str] = []
         for c in content:
             if isinstance(c, dict):
                 t = c.get("text")
                 if isinstance(t, str):
-                    chunks.append(t)
+                    content_chunks.append(t)
                 else:
-                    chunks.append(json.dumps(c, ensure_ascii=False))
+                    content_chunks.append(json.dumps(c, ensure_ascii=False))
             else:
-                chunks.append(str(c))
-        return "\n".join(chunks)
+                content_chunks.append(str(c))
+        return "\n".join(content_chunks)
     return ""
 
 

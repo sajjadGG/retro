@@ -74,6 +74,36 @@ def test_import_copilot_no_args():
     assert result.exit_code != 0
 
 
+def test_import_renormalize_command(tmp_path: Path):
+    root = tmp_path / "rollout-memory"
+    raw_dir = root / "raw" / "codex" / "cli-renormalize"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "rollout.jsonl").write_text(
+        '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z",'
+        '"payload":{"id":"cli-renormalize","cwd":"/workspace"}}\n',
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "import",
+            "renormalize",
+            "--root",
+            str(root),
+            "--host",
+            "codex",
+            "--session",
+            "cli-renormalize",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "would rebuild 1/1" in result.output
+    assert not (root / "normalized" / "codex" / "cli-renormalize.events.jsonl").exists()
+
+
 def test_show_unknown_host():
     result = runner.invoke(app, ["show", "foobar", "some-id"])
     assert result.exit_code != 0
