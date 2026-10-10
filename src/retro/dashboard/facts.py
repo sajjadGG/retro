@@ -48,6 +48,7 @@ COLUMNS = (
     "models",
     "corrections",
     "errors",
+    "basis",
     "bucket",
     "parent",
 )
@@ -72,12 +73,17 @@ FLAGS = {
 COST_SCALE = 1_000_000
 RATIO_SCALE = 1000
 TITLE_LIMIT = 110
+EXCLUDED_TITLE_LIMIT = 80
 PROMPT_LIMIT = 180
 DETAIL_PROMPT_LIMIT = 2000
 EXCLUDED_PROMPT_LIMIT = 400
 PROJECT_NAME_LIMIT = 80
 DETAIL_BUCKET_TARGET = 64
+EXCLUDED_DETAIL_BUCKET_TARGET = 320
 MAX_DETAIL_BUCKETS = 4096
+SPLIT_DICTIONARIES = ("agents", "clients", "projects", "models", "tags")
+COST_BASIS_ORDER = ("exact", "family", "mixed", "embedded", "unpriced", "none")
+COST_BASIS_SIGNAL = "quality.cost_basis"
 EXAMPLE_LIMIT = 6
 
 HEADLINE_SIGNALS = (
@@ -166,16 +172,32 @@ class DashboardModel:
     bucket_count: int
     fingerprints: dict[str, str]
     children: dict[str, list[str]]
+    included_count: int = 0
+    excluded_bucket_count: int = 1
+    dictionary_split: dict[str, int] = field(default_factory=dict)
+    cost_basis: list[str] = field(default_factory=list)
 
     def row(self, key: str) -> list[Any] | None:
         position = self.index.get(key)
         return self.rows[position] if position is not None else None
 
+    @property
+    def included_rows(self) -> list[list[Any]]:
+        return self.rows[: self.included_count]
+
+    @property
+    def excluded_rows(self) -> list[list[Any]]:
+        return self.rows[self.included_count :]
+
 
 class _Interner:
     def __init__(self) -> None:
         self.values: list[str] = []
+        self.split = 0
         self._positions: dict[str, int] = {}
+
+    def mark_split(self) -> None:
+        self.split = len(self.values)
 
     def index(self, value: str) -> int:
         position = self._positions.get(value)
@@ -192,10 +214,15 @@ def build_model(
     signals: SignalStoreView,
     sync: SyncView,
 ) -> DashboardModel:
-    records = sorted(
+    ordered = sorted(
         catalog.records,
         key=lambda record: (-(parse_iso(record.started_at) or -math.inf), record.key),
     )
+    # Included sessions come first so their dictionary entries, fact rows and
+    # signal-matrix positions all live in the prefix the browser loads at boot.
+    records = [record for record in ordered if not record.excluded]
+    included_count = len(records)
+    records = records + [record for record in ordered if record.excluded]
     by_key = {record.key: record for record in records}
     transcripts = _rendered_session_ids(layout, {record.host for record in records})
 
@@ -218,12 +245,21 @@ def build_model(
     for value in WORK_ORDER:
         work_kinds.index(value)
 
-    bucket_count = _bucket_count(len(records))
+    cost_basis = _Interner()
+    for value in COST_BASIS_ORDER:
+        cost_basis.index(value)
+    bucket_count = _bucket_count(included_count)
+    excluded_bucket_count = _bucket_count(
+        len(records) - included_count, target=EXCLUDED_DETAIL_BUCKET_TARGET
+    )
     rows: list[list[Any]] = []
     index: dict[str, int] = {}
     fingerprints: dict[str, str] = {}
 
     for position, record in enumerate(records):
+        if position == included_count:
+            for interner in (agents, clients, projects, models, tags):
+                interner.mark_split()
         values = signals.values(record.key)
         project_index = projects.index(record.project.id)
         meta = project_meta.setdefault(
@@ -268,10 +304,11 @@ def build_model(
         if isinstance(record.git, dict) and record.git.get("worktree") is True:
             flags |= FLAGS["worktree"]
 
+        title_limit = EXCLUDED_TITLE_LIMIT if record.excluded else TITLE_LIMIT
         row = [
             record.key,
-            truncate(record.title or record.first_prompt or "", TITLE_LIMIT),
-            truncate(record.first_prompt or "", PROMPT_LIMIT),
+            truncate(record.title or record.first_prompt or "", title_limit),
+            "" if record.excluded else truncate(record.first_prompt or "", PROMPT_LIMIT),
             project_index,
             agents.index(record.agent),
             clients.index(record.client),
@@ -292,7 +329,11 @@ def build_model(
             [models.index(model) for model in record.models],
             _integer(values.get("friction.user_corrections")),
             _scaled(values.get("friction.tool_error_rate"), RATIO_SCALE),
-            _bucket_index(record.key, bucket_count),
+            _category_index(cost_basis, values.get(COST_BASIS_SIGNAL)),
+            _bucket_index(
+                record.key,
+                excluded_bucket_count if record.excluded else bucket_count,
+            ),
             record.parent_key if record.parent_key in by_key else None,
         ]
         hosts.index(record.host)
@@ -300,6 +341,16 @@ def build_model(
         index[record.key] = position
         fingerprints[record.key] = record.fingerprint
 
+    if included_count == len(records):
+        for interner in (agents, clients, projects, models, tags):
+            interner.mark_split()
+    dictionary_split = {
+        "agents": agents.split,
+        "clients": clients.split,
+        "projects": projects.split,
+        "models": models.split,
+        "tags": tags.split,
+    }
     encodings, matrix = _signal_matrix(records, index, signals)
     summaries = _signal_summaries(signals, encodings, matrix)
     dictionaries = Dictionaries(
@@ -312,7 +363,7 @@ def build_model(
         outcomes=outcomes.values,
         work=work_kinds.values,
     )
-    quality = _quality(records, signals, catalog, transcripts, tags.values)
+    quality = _quality(records, signals, catalog, transcripts, tags.values, cost_basis.values)
     return DashboardModel(
         rows=rows,
         index=index,
@@ -328,6 +379,10 @@ def build_model(
         bucket_count=bucket_count,
         fingerprints=fingerprints,
         children=children,
+        included_count=included_count,
+        excluded_bucket_count=excluded_bucket_count,
+        dictionary_split=dictionary_split,
+        cost_basis=cost_basis.values,
     )
 
 
@@ -436,6 +491,7 @@ def _quality(
     catalog: CatalogView,
     transcripts: dict[str, frozenset],
     tag_names: list[str],
+    cost_basis_names: list[str],
 ) -> dict[str, Any]:
     included = [record for record in records if not record.excluded]
     excluded = [record for record in records if record.excluded]
@@ -481,6 +537,23 @@ def _quality(
             marker_counts[directive] = marker_counts.get(directive, 0) + 1
 
     known_keys = {record.key for record in records}
+    priced = 0
+    unpriced = 0
+    basis_counts: dict[str, int] = {}
+    basis_examples: dict[str, list[str]] = {}
+    for record in included:
+        values = signals.values(record.key)
+        basis = values.get(COST_BASIS_SIGNAL)
+        name = str(basis) if basis else ("none" if record.key in signals.records else "unscored")
+        if values.get("usage.cost_usd") is None:
+            unpriced += 1
+            basis_counts[name] = basis_counts.get(name, 0) + 1
+            examples = basis_examples.setdefault(name, [])
+            if len(examples) < EXAMPLE_LIMIT:
+                examples.append(record.key)
+        else:
+            priced += 1
+
     missing_signals = [record.key for record in included if record.key not in signals.records]
     orphan_signals = [key for key in signals.records if key not in known_keys]
     events_total = sum(int(record.counts.get("events", 0) or 0) for record in records)
@@ -532,46 +605,169 @@ def _quality(
             "count": len(signals.definitions),
         },
         "known_tags": tag_names,
+        "cost": {
+            "priced": priced,
+            "unpriced": unpriced,
+            "basis": [
+                {"basis": name, "count": count, "examples": basis_examples.get(name, [])}
+                for name, count in sorted(basis_counts.items(), key=lambda item: -item[1])
+            ],
+            "names": cost_basis_names,
+        },
     }
 
 
 def _sync_summary(sync: SyncView) -> dict[str, Any]:
-    def shrink(report: dict[str, Any]) -> dict[str, Any]:
-        failures = report.get("failures")
-        failure_list = failures if isinstance(failures, list) else []
-        return {
-            "started_at": report.get("started_at"),
-            "completed_at": report.get("completed_at"),
-            "status": report.get("status"),
-            "scheduled": bool(report.get("scheduled")),
-            "archive_root": report.get("archive_root"),
-            "dashboard_dir": report.get("dashboard_dir"),
-            "free_bytes": report.get("free_bytes"),
-            "imported": _count_of(report.get("imported")),
-            "unchanged": _count_of(report.get("unchanged")),
-            "rendered": _count_of(report.get("rendered")),
-            "revisions": _count_of(report.get("revisions")),
-            "pending": _count_of(report.get("pending_sessions")),
-            "failures": [
-                {
-                    "session": str(item.get("session") or item.get("key") or "?"),
-                    "error": truncate(str(item.get("error") or item.get("message") or ""), 240),
-                }
-                for item in failure_list[:20]
-                if isinstance(item, dict)
-            ],
-            "failure_count": len(failure_list),
-            "warning": report.get("warning"),
-            "signals_recomputed": bool(report.get("signals_recomputed")),
-            "dashboard_rebuilt": bool(report.get("dashboard_rebuilt")),
-            "report": report.get("report"),
-        }
-
+    reports = [_shrink_sync_report(report) for report in sync.history]
+    state = _sync_state_summary(sync.state)
+    latest = reports[0] if reports else None
+    if state is not None:
+        if latest is None or _newer(state.get("started_at"), latest.get("started_at")):
+            # The state file describes a newer run than any published report.
+            latest = state
+        elif state.get("started_at") == latest.get("started_at"):
+            merged = dict(latest)
+            merged["stages"] = dict(state.get("stages") or {}, **(latest.get("stages") or {}))
+            for key in ("completed_at", "status"):
+                if not merged.get(key) and state.get(key):
+                    merged[key] = state[key]
+            latest = merged
+    if latest is not None:
+        latest = dict(latest)
+        latest.update(_sync_health(latest))
     return {
-        "latest": shrink(sync.latest) if sync.latest else None,
-        "history": [shrink(report) for report in sync.history],
+        "latest": latest,
+        "history": reports,
         "directory": str(sync.directory),
+        "state_path": str(sync.state_path) if sync.state_path else None,
     }
+
+
+def _shrink_sync_report(report: dict[str, Any]) -> dict[str, Any]:
+    failures = report.get("failures")
+    failure_list = failures if isinstance(failures, list) else []
+    return {
+        "started_at": report.get("started_at"),
+        "completed_at": report.get("completed_at"),
+        "status": report.get("status"),
+        "scheduled": bool(report.get("scheduled")),
+        "archive_root": report.get("archive_root"),
+        "dashboard_dir": report.get("dashboard_dir"),
+        "free_bytes": report.get("free_bytes"),
+        "imported": _count_of(report.get("imported")),
+        "unchanged": _count_of(report.get("unchanged")),
+        "rendered": _count_of(report.get("rendered")),
+        "revisions": _count_of(report.get("revisions")),
+        "pending": _count_of(report.get("pending_sessions")),
+        "stages": _stage_summary(report.get("stages")),
+        "failures": [
+            {
+                "session": str(item.get("session") or item.get("key") or "?"),
+                "error": truncate(str(item.get("error") or item.get("message") or ""), 240),
+            }
+            for item in failure_list[:20]
+            if isinstance(item, dict)
+        ],
+        "failure_count": len(failure_list),
+        "warning": report.get("warning"),
+        "skip_reason": report.get("skip_reason"),
+        "signals_recomputed": bool(report.get("signals_recomputed")),
+        "dashboard_rebuilt": bool(report.get("dashboard_rebuilt")),
+        "report": report.get("report"),
+    }
+
+
+def _sync_state_summary(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(state, dict) or not state:
+        return None
+    raw_last_run = state.get("last_run")
+    last_run: dict[str, Any] = raw_last_run if isinstance(raw_last_run, dict) else {}
+    stages = _stage_summary(state.get("stages"))
+    if not stages and not last_run:
+        return None
+    return {
+        "started_at": last_run.get("started_at"),
+        "completed_at": last_run.get("completed_at"),
+        "status": last_run.get("status"),
+        "scheduled": bool(last_run.get("scheduled")),
+        "stages": stages,
+        "source": "state",
+        "updated_at": state.get("updated_at"),
+    }
+
+
+def _stage_summary(stages: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(stages, dict):
+        return {}
+    summary: dict[str, dict[str, Any]] = {}
+    for name, stage in stages.items():
+        if not isinstance(stage, dict):
+            continue
+        entry: dict[str, Any] = {
+            "status": str(stage.get("status") or "unknown"),
+            "started_at": stage.get("started_at"),
+            "completed_at": stage.get("completed_at"),
+            "duration_seconds": stage.get("duration_seconds"),
+            "last_success_at": stage.get("last_success_at"),
+        }
+        for key in ("changed_keys", "removed_keys", "total", "excluded", "rendered",
+                    "recomputed", "reused", "removed", "error", "reason"):
+            if stage.get(key) is not None:
+                entry[key] = stage[key]
+        summary[str(name)] = entry
+    return summary
+
+
+SYNC_BAD_STATUSES = {"failed", "error", "partial", "degraded"}
+SYNC_PENDING_STATUSES = {"running", "pending", "in_progress"}
+
+
+def _sync_health(report: dict[str, Any]) -> dict[str, Any]:
+    """Health of the run this dashboard was built from.
+
+    The dashboard stage runs inside the sync, so the run report is normally
+    still ``running`` when it is read — and this generation stays published
+    until the next rebuild. A run whose finished stages all succeeded is
+    therefore reported as healthy and *past*, never as "in progress"; callers
+    use ``built_during_sync`` to say so.
+    """
+    stages = report.get("stages") or {}
+    failed = sorted(
+        name for name, stage in stages.items() if str(stage.get("status")) in SYNC_BAD_STATUSES
+    )
+    unfinished = sorted(
+        name
+        for name, stage in stages.items()
+        if str(stage.get("status")) in {"running", "in_progress"}
+    )
+    succeeded = sorted(
+        name for name, stage in stages.items() if str(stage.get("status")) in {"success", "ok", "skipped"}
+    )
+    status = str(report.get("status") or "unknown")
+    if failed or status in {"failed", "error"}:
+        health = "failed"
+    elif status in SYNC_BAD_STATUSES or report.get("failure_count"):
+        health = "degraded"
+    else:
+        health = "ok"
+    return {
+        "health": health,
+        "built_during_sync": status in SYNC_PENDING_STATUSES or bool(unfinished),
+        "stages_failed": failed,
+        "stages_unfinished": unfinished,
+        "stages_ok": succeeded,
+        "observed_at": report.get("completed_at") or report.get("started_at"),
+    }
+
+
+def _newer(left: Any, right: Any) -> bool:
+    left_epoch = parse_iso(left if isinstance(left, str) else None)
+    right_epoch = parse_iso(right if isinstance(right, str) else None)
+    if left_epoch is None:
+        return False
+    if right_epoch is None:
+        return True
+    return left_epoch > right_epoch
 
 
 def _rendered_session_ids(layout: Layout, hosts: Iterable[str]) -> dict[str, frozenset]:
@@ -590,11 +786,10 @@ def _rendered_session_ids(layout: Layout, hosts: Iterable[str]) -> dict[str, fro
     return result
 
 
-def _bucket_count(session_count: int) -> int:
-    if session_count <= DETAIL_BUCKET_TARGET:
+def _bucket_count(session_count: int, *, target: int = DETAIL_BUCKET_TARGET) -> int:
+    if session_count <= target:
         return 1
-    target = session_count / DETAIL_BUCKET_TARGET
-    exponent = max(0, math.ceil(math.log(target, 2)))
+    exponent = max(0, math.ceil(math.log(session_count / target, 2)))
     return min(MAX_DETAIL_BUCKETS, 2 ** exponent)
 
 
@@ -671,7 +866,38 @@ def _percentile(sorted_values: list[float], fraction: float) -> float:
 
 
 def _count_of(value: Any) -> int:
-    return len(value) if isinstance(value, list) else 0
+    """Run reports store these as a list of keys or, since sync v2, a count."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, dict)):
+        return len(value)
+    return 0
+
+
+def excluded_detail_payload(model: DashboardModel, key: str) -> dict[str, Any]:
+    """Catalog-only payload for excluded sessions.
+
+    Everything the fact row already carries (title, agent, client, project,
+    timings, tags, artifact paths) is omitted; the browser merges the row in.
+    """
+    record = model.records[key]
+    payload: dict[str, Any] = {"minimal": True, "counts": record.counts}
+    cwd = record.cwd_resolved or record.cwd
+    project_path = record.project.id[5:] if record.project.id.startswith("path:") else None
+    if cwd and cwd != project_path:
+        payload["cwd"] = cwd
+    if record.ended_at:
+        payload["ended_at"] = record.ended_at
+    if record.tag_sources:
+        payload["tag_sources"] = record.tag_sources
+    if record.markers:
+        payload["markers"] = record.markers
+    evidence = record.project.evidence
+    if evidence and evidence != cwd:
+        payload["project_evidence"] = truncate(evidence, 160)
+    return payload
 
 
 def detail_payload(model: DashboardModel, key: str) -> dict[str, Any]:
@@ -713,11 +939,7 @@ def detail_payload(model: DashboardModel, key: str) -> dict[str, Any]:
         "tag_sources": record.tag_sources,
         "excluded": record.excluded,
         "fingerprint": record.fingerprint,
-        "paths": {
-            "transcript": f"rendered/{record.host}/{record.session_id}.md",
-            "normalized": f"normalized/{record.host}/{record.session_id}.events.jsonl",
-            "raw": f"raw/{record.host}/{record.session_id}",
-        },
+        "paths": _artifact_paths(record),
     }
     if signal_record is not None:
         payload["signals"] = {
@@ -729,3 +951,11 @@ def detail_payload(model: DashboardModel, key: str) -> dict[str, Any]:
             "confidence": signal_record.confidence,
         }
     return payload
+
+
+def _artifact_paths(record: SessionRecord) -> dict[str, str]:
+    return {
+        "transcript": f"rendered/{record.host}/{record.session_id}.md",
+        "normalized": f"normalized/{record.host}/{record.session_id}.events.jsonl",
+        "raw": f"raw/{record.host}/{record.session_id}",
+    }

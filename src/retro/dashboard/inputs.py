@@ -20,6 +20,7 @@ CATALOG_RELPATH = "catalog/sessions.jsonl"
 SIGNAL_DEFINITIONS_RELPATH = "signals/definitions.json"
 SIGNAL_SESSIONS_RELPATH = "signals/sessions.jsonl"
 SYNC_RUNS_RELDIR = "sync/runs"
+SYNC_STATE_RELPATH = "state/sync.json"
 
 
 def catalog_path(layout: Layout) -> Path:
@@ -36,6 +37,10 @@ def signal_sessions_path(layout: Layout) -> Path:
 
 def sync_runs_dir(layout: Layout) -> Path:
     return layout.root / "sync" / "runs"
+
+
+def sync_state_path(layout: Layout) -> Path:
+    return layout.root / "state" / "sync.json"
 
 
 @dataclass(frozen=True)
@@ -249,6 +254,8 @@ class SyncView:
     directory: Path
     latest: dict[str, Any] | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    state: dict[str, Any] | None = None
+    state_path: Path | None = None
 
 
 def read_catalog(layout: Layout, *, path: Path | None = None) -> CatalogView:
@@ -303,6 +310,10 @@ def read_signals(
 def read_sync_runs(layout: Layout, *, limit: int = 8) -> SyncView:
     directory = sync_runs_dir(layout)
     view = SyncView(directory=directory)
+    state_target = sync_state_path(layout)
+    if state_target.exists():
+        view.state_path = state_target
+        view.state = _read_json(state_target)
     if not directory.exists():
         return view
     paths = sorted(directory.glob("*.json"))

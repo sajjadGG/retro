@@ -56,7 +56,7 @@ def test_missing_inputs_are_reported(empty_archive: Layout):  # noqa: F811
 def test_read_signals_decodes_definitions_and_records(archive: Layout):  # noqa: F811
     signals = read_signals(archive)
     assert signals.version == "sig-v2-0001"
-    assert len(signals.definitions) == 14
+    assert len(signals.definitions) == 15
     definition = signals.definition("outcome.status")
     assert definition is not None
     assert definition.kind == "category"

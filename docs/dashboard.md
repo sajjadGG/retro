@@ -16,10 +16,24 @@ reused, the output size and the build time.
 | --- | --- |
 | Overview | What happened recently across all agents and projects, and how it compares with the previous period: sessions, active hours, estimated cost, outcome mix, work-kind mix, notable movers, streak |
 | Projects | Which projects cost time and money; one row per consolidated project, with the per-agent and per-client split, success rate, tool error rate and last activity |
-| Sessions | Everything captured, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable, virtualized, with a toggle for excluded sessions and for rolling subagents up under their parent |
+| Sessions | Everything captured, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable, virtualized, with a toggle for excluded sessions and for rolling subagents up under their parent. Facet lists show only values present in the current scope with their counts; project and model use a type-ahead so an archive with 30,000 scratch projects stays usable |
 | Session | One session: header, tags and why they were applied, inline markers, every signal grouped by category with evidence event ids, subagent tree, and links to the transcript, normalized events and raw capture in the archive |
 | Signals | Every signal in `signals/definitions.json` with its distribution, and comparisons by agent, client, project, model or work kind with a minimum-sample guard |
-| Data quality | Why sessions were excluded (by tag and rule, with examples), interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run with its failures |
+| Data quality | Why sessions were excluded (by tag and rule, with examples), cost coverage, interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run stage by stage |
+
+## Cost is an estimate, and sometimes there is none
+
+Cost comes from the `usage.cost_usd` signal. When a session has no captured usage, or uses models
+with no known rate, the dashboard shows `—` with a tooltip explaining why (from the
+`quality.cost_basis` signal) instead of `$0.00`. Totals say how many sessions are unpriced and
+averages only count priced ones.
+
+## First load stays small
+
+Most archives are dominated by excluded sessions. The fact rows for included sessions load at
+boot; excluded rows, their dictionary entries and their catalog-only detail load only when you
+turn on "include excluded" or open an excluded session. On the reference archive (31,901
+sessions, 732 included) the first load is about 465 KB and the whole directory is 28 MB.
 
 ## Where the data comes from
 
@@ -46,11 +60,20 @@ the catalog fingerprint.
 
 ## How publication works
 
-Each build stages into `<dashboard>/.retro-builds/.staging-*`, then renames the directory into
-place and swaps the `current` symlink, so a reader never sees a half-written dashboard. The
-top-level `index.html`, `assets` and `data` entries are symlinks into `current`. At most two
-generations are kept; staging directories are removed on failure, and stale ones left by a
-killed process are reaped on the next build.
+Each build stages into `<dashboard>/.retro-builds/.staging-*`. When the generation is complete it
+is renamed into place and the `current` symlink is replaced — a single atomic rename, and the
+only pointer that moves. `index.html`, `assets` and `data` are permanent symlinks that resolve
+through `current`, so a reader can never mix two generations and a failed build leaves the
+previous one serving untouched. At most two generations are kept; staging directories are removed
+on failure, and stale ones left by a killed process are reaped on the next build.
+
+## Sync status
+
+The dashboard is built by the dashboard stage of `retro sync`, so the run report it reads is still
+open and this generation stays published until the next rebuild. The banner reports that run in
+the past tense — "last sync Oct 9, 2026, 7:52 PM (22m ago): capture ✓ catalog ✓ render ✓ signals ✓
+memory ✓" — and notes that the dashboard was built during it. Only genuinely failed or partial
+stages raise a warning banner; the Data quality page shows every stage with its duration.
 
 Session-detail shards are cached in `<dashboard>/.retro-cache/detail` and hard-linked into each
 generation, so unchanged sessions cost no space and no time.

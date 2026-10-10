@@ -15,6 +15,7 @@
   /* ---------- shard loading ---------------------------------------------- */
 
   var listeners = [];
+  var pendingExcluded = [];
 
   function emit(event) {
     for (var i = 0; i < listeners.length; i++) { listeners[i](event); }
@@ -48,8 +49,12 @@
     childCount: Object.create(null),
     shardsLoaded: 0,
     shardsTotal: (manifest.shards && manifest.shards.sessions ? manifest.shards.sessions.length : 0),
+    included: (manifest.counts ? manifest.counts.included : 0),
+    excludedTotal: (manifest.counts ? manifest.counts.excluded : 0),
     total: (manifest.counts ? manifest.counts.sessions : 0),
     ready: false,
+    excludedReady: false,
+    excludedLoading: false,
     signalsLoaded: false,
     signals: Object.create(null)
   };
@@ -88,6 +93,70 @@
     next();
   }
 
+  function loadExcluded(done) {
+    if (store.excludedReady) { if (done) { done(); } return; }
+    var shards = (manifest.shards && manifest.shards.excluded) || [];
+    var tail = manifest.shards && manifest.shards.dict_tail;
+    if (!shards.length) {
+      store.excludedReady = true;
+      emit({type: "excluded", done: true});
+      if (done) { done(); }
+      return;
+    }
+    if (store.excludedLoading) {
+      if (done) { pendingExcluded.push(done); }
+      return;
+    }
+    store.excludedLoading = true;
+    if (done) { pendingExcluded.push(done); }
+
+    function finish() {
+      store.excludedReady = true;
+      store.excludedLoading = false;
+      emit({type: "excluded", done: true});
+      var queue = pendingExcluded.slice();
+      pendingExcluded.length = 0;
+      for (var i = 0; i < queue.length; i++) { queue[i](); }
+    }
+
+    function loadRows() {
+      var index = 0;
+      function next() {
+        if (index >= shards.length) { finish(); return; }
+        var shard = shards[index++];
+        loadShard("excluded:" + shard.shard, shard.file, function (payload) {
+          ingestSessions(payload);
+          emit({type: "excluded", done: false});
+          setTimeout(next, 0);
+        });
+      }
+      next();
+    }
+
+    if (tail && tail.file) {
+      loadShard("dict-tail", tail.file, function (payload) {
+        if (payload) { mergeDictionaryTail(payload); }
+        loadRows();
+      });
+    } else {
+      loadRows();
+    }
+  }
+
+  function mergeDictionaryTail(tail) {
+    for (var name in tail) {
+      if (!Object.prototype.hasOwnProperty.call(tail, name)) { continue; }
+      var entry = tail[name];
+      var target = DICT[name];
+      if (!target || !entry || !entry.items) { continue; }
+      for (var i = 0; i < entry.items.length; i++) {
+        var item = entry.items[i];
+        if (item && typeof item === "object" && item.id && !item.name) { item.name = item.id; }
+        target[entry.offset + i] = item;
+      }
+    }
+  }
+
   function loadSignalMatrix(done) {
     if (store.signalsLoaded) { done(store.signals); return; }
     var shards = (manifest.shards && manifest.shards.signals) || [];
@@ -124,16 +193,74 @@
     var bucket = row[COL.bucket] || 0;
     var padded = String(bucket);
     while (padded.length < 4) { padded = "0" + padded; }
-    loadShard("detail:" + bucket, "data/detail/d-" + padded + ".js", function (payload) {
+    var excluded = flag(row, "excluded");
+    var channel = (excluded ? "detailx:" : "detail:") + bucket;
+    var file = (excluded ? "data/detail-x/x-" : "data/detail/d-") + padded + ".js";
+    loadShard(channel, file, function (payload) {
       if (!payload || !payload.sessions) { done(null); return; }
-      done(payload.sessions[key] || null);
+      var detail = payload.sessions[key];
+      done(detail ? (detail.minimal ? mergeRowDetail(key, row, detail) : detail) : null);
     });
+  }
+
+  function mergeRowDetail(key, row, detail) {
+    var project = projectMeta(row);
+    var parts = key.split("/");
+    var host = parts[0];
+    var sessionId = parts.slice(1).join("/");
+    var merged = {
+      key: key,
+      host: host,
+      session_id: sessionId,
+      agent: agentName(row),
+      client: clientName(row),
+      interactive: flag(row, "interactive") ? true : (flag(row, "automated") ? false : null),
+      is_subagent: flag(row, "subagent"),
+      parent: row[COL.parent] || null,
+      children: [],
+      title: row[COL.title] || null,
+      prompt: row[COL.prompt] || null,
+      started_at: row[COL.started] ? new Date(row[COL.started] * 1000).toISOString() : null,
+      ended_at: detail.ended_at || null,
+      duration_s: row[COL.duration],
+      active_s: row[COL.active],
+      cwd: detail.cwd || (project.id.indexOf("path:") === 0 ? project.id.slice(5) : null),
+      git: {},
+      project: {
+        id: project.id, name: project.name, source: project.source,
+        evidence: detail.project_evidence || null
+      },
+      models: modelNames(row),
+      counts: detail.counts || {},
+      markers: detail.markers || [],
+      tags: tagNames(row),
+      tag_sources: detail.tag_sources || {},
+      excluded: flag(row, "excluded"),
+      minimal: true,
+      paths: {
+        transcript: "rendered/" + host + "/" + sessionId + ".md",
+        normalized: "normalized/" + host + "/" + sessionId + ".events.jsonl",
+        raw: "raw/" + host + "/" + sessionId
+      }
+    };
+    return merged;
   }
 
   /* ---------- row helpers ------------------------------------------------- */
 
   function flag(row, name) { return (row[COL.flags] & (FLAGS[name] || 0)) !== 0; }
-  function cost(row) { var raw = row[COL.cost]; return raw === null || raw === undefined ? 0 : raw / COST_SCALE; }
+  function cost(row) {
+    var raw = row[COL.cost];
+    return (raw === null || raw === undefined) ? null : raw / COST_SCALE;
+  }
+  function costBasis(row) {
+    var index = row[COL.basis];
+    var names = manifest.cost_basis || [];
+    if (index === null || index === undefined || index < 0 || index >= names.length) {
+      return flag(row, "signals") ? "none" : "unscored";
+    }
+    return names[index];
+  }
   function errorRate(row) { var raw = row[COL.errors]; return raw === null || raw === undefined ? null : raw / RATIO_SCALE; }
   function name(list, index) { return (index !== null && index !== undefined && index >= 0 && index < list.length) ? list[index] : "unknown"; }
   function agentName(row) { return name(DICT.agents, row[COL.agent]); }
@@ -228,7 +355,8 @@
   function aggregate(rows) {
     var stats = {
       sessions: 0, activeS: 0, durationS: 0, cost: 0, tokens: 0, turns: 0, tools: 0, edits: 0,
-      corrections: 0, withCost: 0, errorSum: 0, errorN: 0,
+      corrections: 0, withCost: 0, unpriced: 0, errorSum: 0, errorN: 0,
+      basis: Object.create(null),
       outcomes: Object.create(null), work: Object.create(null), agents: Object.create(null),
       clients: Object.create(null), projects: Object.create(null), days: Object.create(null),
       first: null, last: null, excluded: 0, subagents: 0
@@ -238,7 +366,13 @@
       stats.sessions += 1;
       stats.activeS += row[COL.active] || 0;
       stats.durationS += row[COL.duration] || 0;
-      if (row[COL.cost] !== null && row[COL.cost] !== undefined) { stats.cost += row[COL.cost] / COST_SCALE; stats.withCost += 1; }
+      if (row[COL.cost] !== null && row[COL.cost] !== undefined) {
+        stats.cost += row[COL.cost] / COST_SCALE;
+        stats.withCost += 1;
+      } else {
+        stats.unpriced += 1;
+        bump(stats.basis, costBasis(row));
+      }
       stats.tokens += row[COL.tokens] || 0;
       stats.turns += row[COL.turns] || 0;
       stats.tools += row[COL.tools] || 0;
@@ -264,6 +398,8 @@
     stats.projectCount = Object.keys(stats.projects).length;
     stats.successRate = successRate(stats.outcomes);
     stats.errorRate = stats.errorN ? stats.errorSum / stats.errorN : null;
+    stats.costPerSession = stats.withCost ? stats.cost / stats.withCost : null;
+    stats.costComplete = stats.unpriced === 0;
     return stats;
   }
 
@@ -286,6 +422,25 @@
       (groups[key] = groups[key] || []).push(rows[i]);
     }
     return groups;
+  }
+
+  function facetCounts(rows, accessor) {
+    var counts = Object.create(null);
+    for (var i = 0; i < rows.length; i++) {
+      var value = accessor(rows[i]);
+      if (value === null || value === undefined || value === "") { continue; }
+      if (Array.isArray(value)) {
+        for (var j = 0; j < value.length; j++) { bump(counts, value[j]); }
+      } else {
+        bump(counts, value);
+      }
+    }
+    var entries = [];
+    for (var key in counts) {
+      if (Object.prototype.hasOwnProperty.call(counts, key)) { entries.push({value: key, count: counts[key]}); }
+    }
+    entries.sort(function (a, b) { return b.count - a.count || (a.value < b.value ? -1 : 1); });
+    return entries;
   }
 
   function dailySeries(rows, days, until) {
@@ -352,11 +507,11 @@
 
   var fmt = {
     int: function (value) {
-      if (value === null || value === undefined || isNaN(value)) { return "–"; }
+      if (value === null || value === undefined || isNaN(value)) { return "—"; }
       return Math.round(value).toLocaleString();
     },
     compact: function (value) {
-      if (value === null || value === undefined || isNaN(value)) { return "–"; }
+      if (value === null || value === undefined || isNaN(value)) { return "—"; }
       var abs = Math.abs(value);
       if (abs >= 1e9) { return (value / 1e9).toFixed(1) + "B"; }
       if (abs >= 1e6) { return (value / 1e6).toFixed(1) + "M"; }
@@ -364,11 +519,12 @@
       return String(Math.round(value));
     },
     money: function (value) {
-      if (value === null || value === undefined || isNaN(value)) { return "–"; }
+      if (value === null || value === undefined || isNaN(value)) { return "—"; }
       if (value !== 0 && Math.abs(value) < 0.01) { return "<$0.01"; }
       return "$" + value.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
     },
     duration: function (seconds) {
+      if (seconds === null || seconds === undefined) { return "—"; }
       if (!seconds || seconds <= 0) { return "–"; }
       var total = Math.round(seconds);
       var hours = Math.floor(total / 3600);
@@ -379,7 +535,7 @@
       return total + "s";
     },
     pct: function (fraction, digits) {
-      if (fraction === null || fraction === undefined || isNaN(fraction)) { return "–"; }
+      if (fraction === null || fraction === undefined || isNaN(fraction)) { return "—"; }
       return (fraction * 100).toFixed(digits === undefined ? 0 : digits) + "%";
     },
     date: function (epochSeconds) {
@@ -399,7 +555,7 @@
       return fmt.date(epochSeconds);
     },
     signal: function (value, definition) {
-      if (value === null || value === undefined) { return "–"; }
+      if (value === null || value === undefined) { return "—"; }
       if (typeof value === "boolean") { return value ? "yes" : "no"; }
       var kind = definition ? definition.kind : null;
       if (kind === "money") { return fmt.money(value); }
@@ -459,31 +615,82 @@
 
   function pill(outcome) { return el("span", {class: "pill " + outcome, text: outcome}); }
 
+  var COST_BASIS_REASON = {
+    exact: "priced with an exact model rate",
+    family: "priced with a model-family rate",
+    mixed: "priced from several model rates",
+    embedded: "cost reported by the provider",
+    unpriced: "no rate for the models used",
+    none: "no token or cost usage was captured",
+    unscored: "this session has no signal record"
+  };
+
+  function costTotal(stats) {
+    if (!stats.withCost) { return "—"; }
+    return fmt.money(stats.cost);
+  }
+
+  function costTotalTitle(stats) {
+    if (!stats.withCost) {
+      return "No session in this group has a cost estimate" +
+        (stats.sessions ? " (" + stats.sessions + " sessions)" : "");
+    }
+    if (stats.unpriced) {
+      return stats.unpriced + " of " + stats.sessions + " sessions have no cost estimate";
+    }
+    return null;
+  }
+
+  function costCell(row) {
+    var value = cost(row);
+    if (value !== null) { return el("span", {text: fmt.money(value)}); }
+    var basis = costBasis(row);
+    return el("span", {
+      class: "muted",
+      text: "—",
+      title: "No cost estimate: " + (COST_BASIS_REASON[basis] || basis)
+    });
+  }
+
   function tableOf(headers, rows, options) {
     var opts = options || {};
+    var labels = headers.map(function (header) {
+      return typeof header === "string" ? header : header.label;
+    });
     var head = el("tr", null, headers.map(function (header, index) {
-      var attrs = {text: typeof header === "string" ? header : header.label};
+      var attrs = {text: labels[index]};
       if (typeof header !== "string" && header.num) { attrs.class = "num"; }
       if (opts.onSort) {
         attrs.class = (attrs.class || "") + " sortable";
         attrs.tabindex = "0";
         attrs.role = "columnheader";
-        if (opts.sortIndex === index) { attrs["aria-sort"] = opts.sortDescending ? "descending" : "ascending"; }
+        attrs["aria-sort"] = opts.sortIndex === index ? (opts.sortDescending ? "descending" : "ascending") : "none";
         attrs.onclick = function () { opts.onSort(index); };
-        attrs.onkeydown = function (event) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); opts.onSort(index); } };
+        attrs.onkeydown = function (event) {
+          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); opts.onSort(index); }
+        };
       }
       return el("th", attrs);
     }));
     var body = el("tbody", null, rows.map(function (cells) {
       var attrs = cells.attrs || null;
       var list = cells.cells || cells;
-      return el("tr", attrs, list.map(function (cell) {
-        if (cell && cell.nodeType) { return el("td", null, cell); }
-        if (cell && typeof cell === "object") { return el("td", {class: cell.num ? "num" : null}, cell.node || String(cell.text)); }
-        return el("td", {text: cell === null || cell === undefined ? "–" : String(cell)});
+      return el("tr", attrs, list.map(function (cell, index) {
+        // data-label drives the stacked card layout on narrow screens.
+        var cellAttrs = {"data-label": labels[index] || ""};
+        if (cell && cell.nodeType) { return el("td", cellAttrs, cell); }
+        if (cell && typeof cell === "object") {
+          if (cell.num) { cellAttrs.class = "num"; }
+          if (cell.cls) { cellAttrs.class = (cellAttrs.class ? cellAttrs.class + " " : "") + cell.cls; }
+          if (cell.title) { cellAttrs.title = cell.title; }
+          return el("td", cellAttrs, cell.node !== undefined ? cell.node : String(cell.text));
+        }
+        cellAttrs.text = (cell === null || cell === undefined) ? "—" : String(cell);
+        return el("td", cellAttrs);
       }));
     }));
-    return el("table", null, [el("thead", null, head), body]);
+    var table = el("table", {class: opts.stack === false ? null : "stack"}, [el("thead", null, head), body]);
+    return opts.wrap === false ? table : el("div", {class: "table-wrap"}, [table]);
   }
 
   /* ---------- charts ------------------------------------------------------- */
@@ -698,7 +905,10 @@
     manifest: manifest, COL: COL, FLAGS: FLAGS, DICT: DICT, ROW_HEIGHT: ROW_HEIGHT,
     store: store, onChange: onChange, emit: emit,
     loadSessions: loadSessions, loadSignalMatrix: loadSignalMatrix, loadDetail: loadDetail, loadShard: loadShard,
-    flag: flag, cost: cost, errorRate: errorRate, name: name,
+    flag: flag, cost: cost, costBasis: costBasis, costCell: costCell, errorRate: errorRate, name: name,
+    costTotal: costTotal, costTotalTitle: costTotalTitle,
+    COST_BASIS_REASON: COST_BASIS_REASON, facetCounts: facetCounts,
+    loadExcluded: loadExcluded,
     agentName: agentName, clientName: clientName, outcomeName: outcomeName, workName: workName,
     projectMeta: projectMeta, tagNames: tagNames, modelNames: modelNames,
     filterRows: filterRows, aggregate: aggregate, groupBy: groupBy, successRate: successRate,

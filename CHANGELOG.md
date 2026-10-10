@@ -9,7 +9,11 @@
   Session detail, Signals and Data-quality pages, URL-hash deep links, light/dark
   themes and keyboard navigation. Session rows ship as a compact fact table in
   `data/*.js` shards that the browser aggregates, per-session detail loads on demand
-  from fingerprint-keyed buckets, and `index.html` is a two-kilobyte shell.
+  from fingerprint-keyed buckets, and `index.html` is a two-kilobyte shell. Excluded
+  sessions — 98% of a real archive — ship as a separate shard set that loads only when
+  asked for, so the first load stays around 465 KB and the whole directory 28 MB.
+  Sessions without a `usage.cost_usd` signal render as "—" with the reason from
+  `quality.cost_basis` instead of "$0.00", and never count as zero in averages.
 - Versioned `retro.sources` extension API with lazy entry-point discovery,
   `retro extensions list/doctor`, managed staged imports, and atomic raw plus
   normalized publication.

@@ -16,6 +16,8 @@ from ..storage import Layout, default_layout
 from .build import DashboardInputs, input_warnings, load_inputs
 from .metrics import (
     Filters,
+    Kpis,
+    cost_basis,
     cost_usd,
     filter_rows,
     has_flag,
@@ -156,7 +158,7 @@ def show_overview(console: Console, inputs: DashboardInputs, state: ViewState) -
     kpi_table.add_row(
         _delta(current.sessions, deltas.get("sessions"), fmt=_int),
         _delta(current.active_s, deltas.get("active_s"), fmt=_duration),
-        _delta(current.cost_usd, deltas.get("cost_usd"), fmt=_money),
+        _delta(_total_cost(current), deltas.get("cost_usd"), fmt=_money),
         _delta(current.tokens, deltas.get("tokens"), fmt=_compact),
         _delta(current.user_turns, deltas.get("user_turns"), fmt=_int),
         _delta(current.tool_calls, deltas.get("tool_calls"), fmt=_int),
@@ -164,6 +166,11 @@ def show_overview(console: Console, inputs: DashboardInputs, state: ViewState) -
         _rate(success_rate(current)),
     )
     console.print(kpi_table)
+    if current.unpriced:
+        console.print(
+            f"[dim]cost covers {current.sessions_with_cost:,} of {current.sessions:,} sessions; "
+            f"{current.unpriced:,} unpriced (shown as —)[/dim]"
+        )
 
     mix = Table(title="outcome / work mix", box=None)
     mix.add_column("outcome")
@@ -222,7 +229,7 @@ def show_projects(console: Console, inputs: DashboardInputs, state: ViewState, *
             str(entry["name"]),
             _int(entry["sessions"]),
             _duration(entry["active_s"]),
-            _money(entry["cost_usd"]),
+            _money(entry["cost_usd"] if entry["sessions_with_cost"] else None),
             _rate(rate),
             agents,
             _date(entry["last"]),
@@ -298,6 +305,9 @@ def show_detail(
     header.add_row("models", ", ".join(record.models) or "-")
     header.add_row("branch", str((record.git or {}).get("branch") or "-"))
     header.add_row("started", str(record.started_at or "-"))
+    cost = cost_usd(row)
+    basis = cost_basis(row, inputs.model.cost_basis)
+    header.add_row("cost", _money(cost) + ("" if cost is not None else f" [dim]({basis})[/dim]"))
     header.add_row("duration", _duration(record.duration_s))
     header.add_row("active", _duration(record.active_s))
     header.add_row("tags", ", ".join(record.tags) or "-")
@@ -384,11 +394,18 @@ def _compact(number: Any) -> str:
     return f"{count:.0f}"
 
 
+def _total_cost(stats: Kpis) -> float | None:
+    """A group with nothing priced has no total; it is not zero."""
+    return stats.cost_usd if stats.sessions_with_cost else None
+
+
 def _money(number: Any) -> str:
+    if number is None:
+        return "—"
     try:
         return f"${float(number):,.2f}"
     except (TypeError, ValueError):
-        return "-"
+        return "—"
 
 
 def _duration(seconds: Any) -> str:

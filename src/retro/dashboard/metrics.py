@@ -22,9 +22,17 @@ def has_flag(row: Row, name: str) -> bool:
     return bool(int(row[COLUMN_INDEX["flags"]] or 0) & FLAGS[name])
 
 
-def cost_usd(row: Row) -> float:
+def cost_usd(row: Row) -> float | None:
+    """None when the session has no cost estimate; never silently zero."""
     raw = row[COLUMN_INDEX["cost"]]
-    return (raw / COST_SCALE) if raw is not None else 0.0
+    return (raw / COST_SCALE) if raw is not None else None
+
+
+def cost_basis(row: Row, names: list) -> str:
+    index = row[COLUMN_INDEX["basis"]]
+    if isinstance(index, int) and 0 <= index < len(names):
+        return str(names[index])
+    return "unscored" if not has_flag(row, "signals") else "none"
 
 
 def error_rate(row: Row) -> float | None:
@@ -103,6 +111,7 @@ class Kpis:
     edits: int = 0
     corrections: int = 0
     sessions_with_cost: int = 0
+    unpriced: int = 0
     outcomes: dict[str, int] = field(default_factory=dict)
     work: dict[str, int] = field(default_factory=dict)
     agents: dict[str, int] = field(default_factory=dict)
@@ -123,6 +132,10 @@ class Kpis:
             "edits": self.edits,
             "corrections": self.corrections,
             "sessions_with_cost": self.sessions_with_cost,
+            "unpriced": self.unpriced,
+            "cost_per_priced_session": (
+                round(self.cost_usd / self.sessions_with_cost, 6) if self.sessions_with_cost else None
+            ),
             "outcomes": self.outcomes,
             "work": self.work,
             "agents": self.agents,
@@ -143,6 +156,8 @@ def kpis(rows: Iterable[Row], dictionaries: Dictionaries) -> Kpis:
         if cost is not None:
             result.cost_usd += cost / COST_SCALE
             result.sessions_with_cost += 1
+        else:
+            result.unpriced += 1
         result.tokens += int(value(row, "tokens") or 0)
         result.user_turns += int(value(row, "turns") or 0)
         result.tool_calls += int(value(row, "tools") or 0)

@@ -50,26 +50,41 @@ a shareable deep link.
 
 ```text
 <dashboard_dir>/
-  index.html -> current/index.html      # < 300 KB shell, classic <script> tags only
-  assets     -> current/assets          # app.css, core.js, views.js, app.js
-  data       -> current/data            # shards
-  current    -> .retro-builds/<generation>
+  index.html -> current/index.html      # permanent symlink; < 300 KB shell
+  assets     -> current/assets          # permanent symlink; app.css, core.js, views.js, app.js
+  data       -> current/data            # permanent symlink; shards
+  current    -> .retro-builds/<generation>   # the only pointer a publish moves
   .retro-builds/<generation>/…          # at most 2 kept
-  .retro-cache/detail/…                 # per-bucket detail cache + index.json
+  .retro-cache/detail/…                 # per-bucket caches + index.json
+  .retro-cache/detail-x/…
 ```
+
+`index.html`, `assets` and `data` are created once and resolve through `current`, so publishing a
+generation is a single atomic rename of `current` after the generation is fully written: a reader
+can never observe a mix of two generations, and a failure before the swap leaves the previous
+generation serving untouched.
 
 Every shard is a JavaScript file that calls `RETRO_DATA("<name>", <json>)` on a global defined
 by an inline bootstrap in `index.html`. This works under `file://`, where `fetch` and ES modules
 are blocked, and under `http://` without changes. `<`, `>` and `&` are escaped so a shard can
 never terminate its own `<script>` element.
 
-| Shard | Name | Contents |
-| --- | --- | --- |
-| `data/manifest.js` | `manifest` | schema, dictionaries, column names, flag bits, shard index, signal definitions/encodings/summaries, quality block, sync block, warnings |
-| `data/sessions-NNN.js` | `sessions:N` | 2,000 fact rows each, newest first |
-| `data/signals-NNN.js` | `signals:N` | sparse `[rowIndex, value, …]` columns per signal, aligned with the session shards |
-| `data/detail/d-NNNN.js` | `detail:N` | full per-session payloads for one bucket |
-| `data/build.js` | `build` | the build report (timings, sizes, counts) |
+| Shard | Name | Loaded | Contents |
+| --- | --- | --- | --- |
+| `data/manifest.js` | `manifest` | boot | schema, dictionaries (included prefix), column names, flag bits, shard index, cost-basis names, signal definitions/encodings/summaries, quality block, sync block, warnings |
+| `data/sessions-NNN.js` | `sessions:N` | boot | fact rows for **included** sessions, 2,000 per shard, newest first |
+| `data/signals-NNN.js` | `signals:N` | signals page | sparse `[rowIndex, value, …]` columns per signal, aligned with the included rows |
+| `data/detail/d-NNNN.js` | `detail:N` | on demand | full per-session payloads for one bucket of included sessions |
+| `data/excluded-NNN.js` | `excluded:N` | on demand | fact rows for **excluded** sessions, 4,000 per shard |
+| `data/dict-tail.js` | `dict-tail` | on demand | dictionary entries only excluded rows reference |
+| `data/detail-x/x-NNNN.js` | `detailx:N` | on demand | catalog-only payloads for excluded sessions (the browser merges the fact row in) |
+| `data/build.js` | `build` | boot | the build report (timings, sizes, counts) |
+
+An archive is dominated by excluded sessions (31,169 of 31,901 on the reference
+archive), so the default first load carries only the included set: the shell,
+assets, manifest and included rows total ~465 KB. The excluded set — rows,
+dictionary tail and minimal detail — is fetched only when the user turns on
+"include excluded" or opens an excluded session.
 
 ### Fact table
 
@@ -78,11 +93,15 @@ One row per session: a positional array whose column order is published in `mani
 ```text
 key, title, prompt, project, agent, client, started, duration, active, cost, tokens,
 turns, tools, edits, events, unknown, outcome, work, flags, tags, models, corrections,
-errors, bucket, parent
+errors, basis, bucket, parent
 ```
 
-Strings are interned into `manifest.dict` (agents, clients, projects, models, tags, outcomes,
-work kinds); money is integer micro-USD; ratios are integer per-mille; `flags` is a bitfield
+Rows are emitted included-first, so every dictionary index, fact row and signal-matrix position
+an included session uses lives in the prefix the browser loads at boot. Strings are interned into
+`manifest.dict` (agents, clients, projects, models, tags, outcomes, work kinds, cost bases);
+money is integer micro-USD and **null when the session has no cost estimate** — never zero;
+`basis` points at `manifest.cost_basis` (the `quality.cost_basis` signal) and explains why;
+ratios are integer per-mille; `flags` is a bitfield
 documented in `manifest.flags` (`excluded`, `interactive`, `automated`, `subagent`, `child`,
 `parent`, `committed`, `validated`, `secrets`, `signals`, `transcript`, `worktree`).
 
@@ -93,8 +112,10 @@ arrive.
 
 ### Session detail buckets
 
-Sessions are assigned to `crc32(key) % bucket_count` buckets, where `bucket_count` is the power
-of two nearest `sessions / 64` (max 4096). The bucket index is stored in the row, so the client
+Included sessions are assigned to `crc32(key) % bucket_count` buckets, where `bucket_count` is
+the power of two nearest `sessions / 64` (max 4096); excluded sessions use their own bucket space
+sized for 320 sessions per bucket and carry only what the fact row lacks (cwd, counts, tag
+provenance, markers). The bucket index is stored in the row, so the client
 never recomputes the hash. A bucket is re-rendered only when its member set or any member
 fingerprint changes; otherwise it is hard-linked out of `.retro-cache/detail`. Power-of-two
 bucket counts keep assignments stable as sessions are added.
@@ -112,10 +133,30 @@ bucket counts keep assignments stable as sessions are added.
 | Budget | Target | Measured |
 | --- | --- | --- |
 | `index.html` | < 300 KB | 1.9 KB |
-| total output | < 100 MB | 5.5 MB (2,000 real-derived sessions), 73 MB (35,000 synthetic) |
-| build from catalog + signals | < 60 s | 0.2 s and 3.3 s cold; 0.1 s and 2.4 s incremental |
+| total output | < 30 MB | 27.8 MB on the real archive (31,901 sessions, 732 included) |
+| first load | small | 465 KB (shell + assets + manifest + included rows) |
+| build from catalog + signals | < 60 s | 1.9 s cold, 1.7 s incremental on the real archive |
 | generations kept | ≤ 2 | 2; older ones removed on publish |
 | transcripts copied | none | none |
+
+## Cost semantics
+
+`usage.cost_usd` is often absent: a session may have no captured usage at all, or use models with
+no rate. The dashboard never renders that as `$0.00`. A missing estimate shows `—` with a tooltip
+naming the reason from `quality.cost_basis` (`exact`, `family`, `mixed`, `embedded`, `unpriced`,
+`none`, or `unscored` when the session has no signal record), totals are qualified with the number
+of unpriced sessions, and averages divide by priced sessions only.
+
+## Sync health
+
+The dashboard stage runs *inside* the sync, so the run report it reads is normally still
+`status: "running"`, and the generation it produces stays published until the next rebuild. The
+banner therefore always reports a past run — "last sync `<absolute time>` (`<age>`): capture ✓
+catalog ✓ …" — plus a note that the dashboard was built during that sync. Stages that had not
+finished when the build read the report are listed as "pending at build" on the Data quality
+page, never as failures. Stage statuses come from the run report and from `state/sync.json`,
+whichever describes the newer run. Counts such as `unchanged` are accepted as a list of keys
+(old reports) or an integer (current reports).
 
 ## Accessibility and UX
 
