@@ -53,6 +53,18 @@ _COMPACTION_KINDS = frozenset(
 
 
 @dataclass
+class _Invocation:
+    """Everything one tool call contributed, so a later record can revise it."""
+
+    failed: bool
+    tool_name: str = ""
+    command: str = ""
+    categories: AbstractSet[str] = frozenset()
+    validation_indexes: tuple[int, ...] = ()
+    commit_index: int | None = None
+
+
+@dataclass
 class ValidationRun:
     category: str
     ok: bool
@@ -281,7 +293,7 @@ class _ScanState:
         self.index = 0
         self.awaiting_reply = False
         self.last_agent_ts: datetime | None = None
-        self.result_failed_by_call: dict[str, bool] = {}
+        self.invocations: dict[str, _Invocation] = {}
 
     # -- per event ----------------------------------------------------------
 
@@ -437,8 +449,8 @@ class _ScanState:
     def _handle_result(self, event: NormalizedEvent, payload: Mapping[str, Any]) -> None:
         p = self.p
         call_id = _call_id(payload)
-        if call_id and call_id in self.result_failed_by_call:
-            self._handle_result_continuation(event, payload, call_id)
+        if call_id and call_id in self.invocations:
+            self._handle_result_continuation(event, payload, self.invocations[call_id])
             return
         p.tool_results += 1
         matched = self._match_call(event, payload)
@@ -449,8 +461,6 @@ class _ScanState:
             call_meta = None
         text = _result_text(payload, event.summary)
         failed = _result_failed(event, payload, text)
-        if call_id:
-            self.result_failed_by_call[call_id] = failed
         if failed:
             self._record_failure(event)
         else:
@@ -462,37 +472,64 @@ class _ScanState:
             p.tool_failures[name] += 1
 
         command = call_meta[0] if call_meta else cmd.command_text(event)
-        if not command:
-            return
-        if failed:
-            p.command_errors += 1
-        if failed:
-            for base in cmd.segment_bases(command):
-                p.base_command_failures[base] += 1
-        categories = call_meta[2] if call_meta else cmd.classify_command(command)
-        for category in sorted(categories & cmd.VALIDATION_CATEGORIES):
-            p.validation_runs.append(
-                ValidationRun(category=category, ok=not failed, event_id=event.event_id, index=self.index)
-            )
-        if cmd.is_git_commit(command):
-            p.commit_events.append((event.event_id, not failed and not cmd.commit_was_noop(text)))
+        invocation = _Invocation(failed=failed, tool_name=name, command=command)
+        if command:
+            if failed:
+                self._record_command_failure(command)
+            categories = call_meta[2] if call_meta else cmd.classify_command(command)
+            invocation.categories = categories
+            indexes = []
+            for category in sorted(categories & cmd.VALIDATION_CATEGORIES):
+                indexes.append(len(p.validation_runs))
+                p.validation_runs.append(
+                    ValidationRun(
+                        category=category, ok=not failed, event_id=event.event_id, index=self.index
+                    )
+                )
+            invocation.validation_indexes = tuple(indexes)
+            if cmd.is_git_commit(command):
+                invocation.commit_index = len(p.commit_events)
+                p.commit_events.append(
+                    (event.event_id, not failed and not cmd.commit_was_noop(text))
+                )
+        if call_id:
+            self.invocations[call_id] = invocation
 
     def _handle_result_continuation(
-        self, event: NormalizedEvent, payload: Mapping[str, Any], call_id: str
+        self, event: NormalizedEvent, payload: Mapping[str, Any], invocation: _Invocation
     ) -> None:
         """A later record of a call already scored (begin/end, output deltas).
 
         v3 emits every host record of one tool invocation, so one `apply_patch`
         can produce a begin and an end event. They describe a single operation:
-        count it once, but let a late failure overturn an early success.
+        count it once, but let a late failure overturn an early success — and
+        when it does, every counter the early success fed has to move with it.
         """
-        if self.result_failed_by_call.get(call_id):
+        if invocation.failed:
             return
         text = _result_text(payload, event.summary)
         if not _result_failed(event, payload, text):
             return
-        self.result_failed_by_call[call_id] = True
+        p = self.p
+        invocation.failed = True
         self._record_failure(event)
+        if invocation.tool_name:
+            p.tool_failures[invocation.tool_name] += 1
+        if invocation.command:
+            self._record_command_failure(invocation.command)
+        for position in invocation.validation_indexes:
+            run = p.validation_runs[position]
+            p.validation_runs[position] = ValidationRun(
+                category=run.category, ok=False, event_id=event.event_id, index=run.index
+            )
+        if invocation.commit_index is not None:
+            p.commit_events[invocation.commit_index] = (event.event_id, False)
+
+    def _record_command_failure(self, command: str) -> None:
+        p = self.p
+        p.command_errors += 1
+        for base in cmd.segment_bases(command):
+            p.base_command_failures[base] += 1
 
     def _record_failure(self, event: NormalizedEvent) -> None:
         p = self.p

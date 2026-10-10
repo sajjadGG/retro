@@ -1,9 +1,11 @@
 """Signal registry: definitions carry their own metadata and version.
 
-The store is keyed on a digest of the registered set, so changing a signal's
-algorithm means bumping its `version` and every stored session is recomputed
-automatically. Only semantic fields feed the digest — editing a description
-must not trigger a full archive recompute.
+The store is keyed on a digest of the registered set *and of the inputs that set
+depends on*, so changing a signal's algorithm means bumping its `version` and
+every stored session is recomputed automatically. Only semantic fields feed the
+digest — editing a description must not trigger a full archive recompute — but
+the bundled pricing snapshot does, because every money signal is a function of
+it and stale costs would otherwise survive a rate update forever.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .pricing import snapshot_digest
 from .profile import SessionProfile
 
 Category = str  # usage|activity|outcome|friction|efficiency|collaboration|risk|quality|work
@@ -148,8 +151,12 @@ def definitions_payload() -> list[dict[str, Any]]:
 
 
 def definitions_version() -> str:
+    """Digest of the registered signal set and of the inputs it depends on."""
     blob = json.dumps(
-        [definition.semantic_key() for definition in definitions()],
+        {
+            "signals": [definition.semantic_key() for definition in definitions()],
+            "pricing": snapshot_digest(),
+        },
         sort_keys=True,
         separators=(",", ":"),
     )

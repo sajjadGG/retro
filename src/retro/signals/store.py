@@ -45,6 +45,7 @@ class SignalUpdate:
     changed_keys: list[str] = field(default_factory=list)
     removed_keys: list[str] = field(default_factory=list)
     reused: int = 0
+    rewritten: bool = True
     duration_s: float = 0.0
 
     @property
@@ -59,6 +60,7 @@ class SignalUpdate:
             "changed": len(self.changed_keys),
             "removed": len(self.removed_keys),
             "reused": self.reused,
+            "rewritten": self.rewritten,
             "duration_s": round(self.duration_s, 3),
         }
 
@@ -214,9 +216,33 @@ def update_signals(
             if previous is not None:
                 records[key] = previous
     update.total = len(records)
-    _write_store(layout, version, records)
+    if _store_is_fresh(layout, existing, version, update):
+        update.rewritten = False
+    else:
+        _write_store(layout, version, records)
+        update.rewritten = True
     update.duration_s = time.monotonic() - started
     return update
+
+
+def _store_is_fresh(
+    layout: Layout, existing: SignalStore, version: str, update: SignalUpdate
+) -> bool:
+    """True when the files on disk already say exactly what we would write.
+
+    A no-op sync must not touch them: the dashboard keys its caches on input
+    mtimes, so rewriting identical bytes invalidates work for nothing.
+    """
+    if update.added_keys or update.changed_keys or update.removed_keys:
+        return False
+    if existing.version != version:
+        return False
+    directory = signals_dir(layout)
+    if not (directory / DEFINITIONS_NAME).exists() or not (directory / SESSIONS_NAME).exists():
+        return False
+    if any((directory / name).exists() for name in LEGACY_NAMES):
+        return False
+    return existing.definitions == definitions_payload()
 
 
 def _compute(

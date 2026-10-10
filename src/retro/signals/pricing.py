@@ -9,6 +9,7 @@ callers can label an estimate as an estimate.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -192,11 +193,31 @@ def _rates_from_entry(entry: Mapping[str, Any], basis: RateBasis, matched: str) 
     )
 
 
-_DEFAULT_MAP: PricingMap | None = None
+def snapshot_digest(snapshot_path: Path | None = None) -> str:
+    """Digest of the bundled rates.
+
+    Money signals are a function of this file, so it has to key the signal store
+    the same way the signal set does: new rates must invalidate stored costs.
+    """
+    path = snapshot_path or PRICING_SNAPSHOT
+    try:
+        content = path.read_bytes()
+    except OSError:
+        return "none"
+    return hashlib.sha256(content).hexdigest()[:12]
+
+
+_DEFAULT_MAP: tuple[tuple[Any, ...], PricingMap] | None = None
 
 
 def default_pricing() -> PricingMap:
+    """Load the bundled snapshot once, reloading it if the file changes."""
     global _DEFAULT_MAP
-    if _DEFAULT_MAP is None:
-        _DEFAULT_MAP = PricingMap.load()
-    return _DEFAULT_MAP
+    try:
+        info = PRICING_SNAPSHOT.stat()
+        key: tuple[Any, ...] = (str(PRICING_SNAPSHOT), info.st_mtime_ns, info.st_size)
+    except OSError:
+        key = (str(PRICING_SNAPSHOT), None, None)
+    if _DEFAULT_MAP is None or _DEFAULT_MAP[0] != key:
+        _DEFAULT_MAP = (key, PricingMap.load())
+    return _DEFAULT_MAP[1]

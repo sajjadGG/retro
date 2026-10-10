@@ -101,6 +101,15 @@ On the real archive this reaches ~100% linkage for Claude and Copilot and ~94%
 for Codex (`web_search_end`, `patch_apply_end` carry no call id). The residual is
 published as `quality.unlinked_result_ratio` rather than hidden.
 
+**One invocation, one verdict.** v3 emits every host record of a single tool
+call, so a `make build` can report "building" and then "Process exited with code
+2". The profile keeps each call's derived state — tool name, command, validation
+runs, commit record — until the invocation is final; a later failure flips the
+verdict and moves every counter it fed (`tool_errors`, `command_errors`,
+per-tool and per-base failures, the recorded `ValidationRun`s, the commit
+record). A later success never clears an earlier failure, and a repeated failure
+is counted once.
+
 **Failure.** A result failed if any of: `is_error is True`, `success is False`,
 `status in {failed, error, timeout, cancelled, canceled}`, a non-empty `error`
 field, a nested non-zero `exit_code` / `exitCode` / `returncode` (depth ≤ 5), or
@@ -326,13 +335,21 @@ a prompt cue)`.
 
 Evidence lists are capped at 5 event ids; confidences equal to 1.0 are omitted.
 
-The digest covers only the *semantic* fields of the registered set (id, category,
-kind, unit, polarity, method, version, categories). Editing a description must
-not trigger a full archive recompute; changing an algorithm must, and the way to
-do that is to bump that signal's `version`.
+The digest covers the *semantic* fields of the registered set (id, category,
+kind, unit, polarity, method, version, categories) **and a digest of the bundled
+pricing snapshot**. Editing a description must not trigger a full archive
+recompute; changing an algorithm must, and the way to do that is to bump that
+signal's `version`. Rates are an input, not documentation: every money signal is
+a function of `retro/pricing/litellm-pricing.json`, so refreshing it changes the
+version and re-prices every stored session — and, because the dashboard keys its
+session-detail cache on catalog fingerprint plus signal version, re-renders them
+too.
 
 A session is recomputed when `force` is set, when its catalog fingerprint
-changed, or when the digest changed. Sessions the catalog no longer includes are
+changed, or when the digest changed. When nothing was added, changed or removed,
+the version still matches and both files already hold the current definitions,
+the store is left untouched: a no-op sync must not move the mtimes the dashboard
+keys its caches on. Sessions the catalog no longer includes are
 dropped; `prune=False` keeps them, which is what filtered runs such as
 `retro signal run --host codex` use. Both files are written atomically, and the
 v0 artifacts (`readings.jsonl`, `aggregates.json`, `summary.md` — 600 MB on this

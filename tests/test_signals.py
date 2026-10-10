@@ -95,6 +95,32 @@ class TestRegistry:
         assert definitions_version() == definitions_version()
         assert len(definitions_version()) == 12
 
+    def test_version_changes_when_the_pricing_snapshot_changes(self, tmp_path: Path, monkeypatch):
+        from retro.signals import pricing
+
+        before = definitions_version()
+        snapshot = tmp_path / "litellm-pricing.json"
+        snapshot.write_text(
+            json.dumps({"demo": {"input_cost_per_token": 1e-06, "output_cost_per_token": 2e-06}}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(pricing, "PRICING_SNAPSHOT", snapshot)
+        after = definitions_version()
+        assert after != before
+
+        snapshot.write_text(
+            json.dumps({"demo": {"input_cost_per_token": 9e-06, "output_cost_per_token": 2e-06}}),
+            encoding="utf-8",
+        )
+        assert definitions_version() != after
+
+    def test_missing_pricing_snapshot_still_yields_a_version(self, tmp_path: Path, monkeypatch):
+        from retro.signals import pricing
+
+        monkeypatch.setattr(pricing, "PRICING_SNAPSHOT", tmp_path / "absent.json")
+        assert pricing.snapshot_digest() == "none"
+        assert len(definitions_version()) == 12
+
     def test_broken_signal_does_not_lose_the_session(self):
         definition = REGISTRY["activity.user_turns"]
         broken = type(definition)(
@@ -1123,6 +1149,59 @@ class TestStore:
         second = update_signals(archive)
         assert second.reused == 1
         assert second.recomputed == 0
+
+    def test_a_noop_update_does_not_rewrite_the_files(self, archive: Layout):
+        seed_session(archive, "codex", "s1", sample_events())
+        update_signals(archive)
+        signals = archive.root / "signals"
+        before = {
+            name: (signals / name).stat().st_mtime_ns for name in ("definitions.json", "sessions.jsonl")
+        }
+        update = update_signals(archive)
+        assert update.rewritten is False
+        after = {name: (signals / name).stat().st_mtime_ns for name in ("definitions.json", "sessions.jsonl")}
+        assert after == before
+
+    def test_a_changed_session_rewrites_the_files(self, archive: Layout):
+        seed_session(archive, "codex", "s1", sample_events())
+        update_signals(archive)
+        signals = archive.root / "signals"
+        before = (signals / "sessions.jsonl").stat().st_mtime_ns
+        seed_session(
+            archive,
+            "codex",
+            "s1",
+            sample_events()
+            + [event(4, "user", "message", payload={"text": "thanks"}, timestamp="2026-01-01T00:01:00Z")],
+        )
+        update = update_signals(archive)
+        assert update.rewritten is True
+        assert (signals / "sessions.jsonl").stat().st_mtime_ns != before
+
+    def test_a_noop_update_still_removes_legacy_artifacts(self, archive: Layout):
+        seed_session(archive, "codex", "s1", sample_events())
+        update_signals(archive)
+        legacy = archive.root / "signals" / "readings.jsonl"
+        legacy.write_text("legacy", encoding="utf-8")
+        update = update_signals(archive)
+        assert update.rewritten is True
+        assert not legacy.exists()
+
+    def test_a_pricing_change_invalidates_stored_costs(self, archive: Layout, tmp_path: Path, monkeypatch):
+        from retro.signals import pricing
+
+        seed_session(archive, "codex", "s1", sample_events())
+        update_signals(archive)
+        first_version = load_signal_store(archive).version
+
+        snapshot = tmp_path / "litellm-pricing.json"
+        snapshot.write_text(json.dumps({"gpt-5.5": {"input_cost_per_token": 1e-05}}), encoding="utf-8")
+        monkeypatch.setattr(pricing, "PRICING_SNAPSHOT", snapshot)
+
+        update = update_signals(archive)
+        assert update.changed_keys == ["codex/s1"]
+        assert update.rewritten is True
+        assert load_signal_store(archive).version != first_version
 
     def test_changed_fingerprint_recomputes(self, archive: Layout):
         seed_session(archive, "codex", "s1", sample_events())
