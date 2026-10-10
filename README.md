@@ -140,6 +140,19 @@ scheduled run below 2 GiB. Scheduled capture runs every 15 minutes; expensive
 signal and dashboard work is coalesced and runs at most every 6 hours by
 default. Manual `retro sync` refreshes pending derived work immediately.
 
+Sync records `capture → catalog → render → signals → memory → dashboard` in
+`<archive>/state/sync.json`. Each stage has status and timing data, while the
+`pending` section retains only unfinished inputs, so a dashboard failure does
+not cause completed signal work to run again.
+
+After moving an older archive, preview and repair absolute archive-internal
+normalized references:
+
+```bash
+retro archive repair-refs --dry-run
+retro archive repair-refs
+```
+
 ### Archive migration
 
 Migrations are checksummed, resumable, and refuse conflicting overwrites:
