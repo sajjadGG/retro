@@ -61,13 +61,11 @@ class ShardWriter:
         model: DashboardModel,
         data_dir: Path,
         *,
-        archive_root: Path,
         cache_dir: Path | None = None,
         mode: str = "auto",
     ) -> None:
         self.model = model
         self.data_dir = data_dir
-        self.archive_root = archive_root
         self.cache_dir = cache_dir
         self.mode = mode
         self.report = ShardReport()

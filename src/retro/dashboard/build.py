@@ -1,7 +1,6 @@
 """Dashboard build: catalog + signals in, static site out."""
 from __future__ import annotations
 
-import json
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -110,13 +109,7 @@ def build(
 
     copy_assets(output_dir)
     data_dir = output_dir / "data"
-    writer = ShardWriter(
-        model,
-        data_dir,
-        archive_root=layout.root,
-        cache_dir=cache_dir,
-        mode=resolved_mode,
-    )
+    writer = ShardWriter(model, data_dir, cache_dir=cache_dir, mode=resolved_mode)
     shard_report = writer.write_all()
 
     warnings = input_warnings(catalog, signals)
@@ -206,8 +199,11 @@ def copy_assets(output_dir: Path) -> None:
 
 
 def directory_size(path: Path) -> int:
+    """Bytes published by a build, ignoring caches and other dot directories."""
     total = 0
     for item in path.rglob("*"):
+        if any(part.startswith(".") for part in item.relative_to(path).parts):
+            continue
         try:
             if item.is_file() and not item.is_symlink():
                 total += item.stat().st_size
@@ -243,4 +239,4 @@ def _file_url(path: Path) -> str:
     try:
         return path.resolve().as_uri()
     except ValueError:
-        return json.dumps(str(path))
+        return ""
