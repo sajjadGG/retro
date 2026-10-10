@@ -100,8 +100,8 @@ explicitly:
 
 ```bash
 retro setup \
-  --archive-root "$HOME/Library/Application Support/retro/rollout-memory" \
-  --dashboard-dir /Users/sajad/Dev/repos/Mem/dashboard \
+  --archive-root /Volumes/External/retro/rollout-memory \
+  --dashboard-dir /Volumes/External/retro/dashboard \
   --periodic 15m \
   --derived-every 6h
 ```
@@ -358,6 +358,11 @@ retro import claude --latest --force
 
 # Skip the markdown re-render step
 retro import codex --latest --no-render
+
+# Rebuild normalized events (and transcripts) from the archived raw copies after a
+# normalizer upgrade; only sessions whose normalizer version changed are rebuilt
+retro import renormalize --dry-run
+retro import renormalize [--host codex] [--since 2026-10-01] [--no-render]
 
 # Re-render markdown from an already-imported normalized stream
 retro render claude <session-id>

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "retro-ai"
-version = "0.4.0"
+version = "0.5.0"
 description = "Capture, analyze, and mine Codex, Claude Code, and VS Code Copilot rollouts."
 readme = "README.md"
 requires-python = ">=3.9"

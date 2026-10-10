@@ -15,7 +15,12 @@ retro import codex --all
 retro import copilot --latest
 retro import <extension-host> --latest
 retro import all [--limit-per-host 20]
+retro import renormalize [--host <host>] [--session <id>] [--since <iso>] [--dry-run] [--no-render]
 ```
+
+`retro import renormalize` rebuilds `normalized/` (and rendered transcripts)
+from the archived `raw/` copies when a host's normalizer version changes. It
+never reads the original agent folders and never modifies `raw/`.
 
 `retro import all` and `retro sync` include every healthy registered source
 provider. Extension host commands are added from installed `retro.sources`
