@@ -144,6 +144,7 @@ def resolve_git_and_project(
     config: RetroConfig,
     marker_project: str | None,
     annotation_project: str | None,
+    is_temp: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     slug_path = (
         decode_claude_slug(metadata.project_slug)
@@ -168,6 +169,7 @@ def resolve_git_and_project(
     source = "unknown"
     evidence: str | None = None
     project_id = "unknown"
+    synthetic_name: str | None = None
     if annotation_project:
         project_id = _canonical_project_value(annotation_project, config)
         source = "annotation"
@@ -199,6 +201,16 @@ def resolve_git_and_project(
             if heuristic is not None:
                 project_id, evidence = heuristic
                 source = "worktree-pattern"
+            elif is_temp:
+                project_id = "scratch:temp"
+                synthetic_name = "Scratch (temp dirs)"
+                source = "path"
+                evidence = "temp-dir"
+            elif is_copilot_session_state_path(project_path):
+                project_id = "scratch:copilot-session-state"
+                synthetic_name = "Scratch (Copilot session state)"
+                source = "path"
+                evidence = "copilot-session-state"
             elif cwd_resolved and "://" not in cwd_resolved:
                 project_id = f"path:{cwd_resolved}"
                 source = "path"
@@ -213,16 +225,31 @@ def resolve_git_and_project(
     if aliased != project_id:
         evidence = f"{evidence or project_id}; alias {project_id} -> {aliased}"
         project_id = aliased
+        synthetic_name = None
         source = "config"
     names = config.projects.get("names", {})
     configured_name = names.get(project_id) if isinstance(names, dict) else None
-    name = configured_name or _project_name(project_id)
+    name = configured_name or synthetic_name or _project_name(project_id)
     return git, {
         "id": project_id,
         "name": name,
         "source": source,
         "evidence": evidence,
     }
+
+
+def is_copilot_session_state_path(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = os.path.expandvars(
+        os.path.expanduser(value)
+    ).replace("\\", "/")
+    return bool(
+        re.search(
+            r"/\.copilot/session-state/[^/]+/files(?:/|$)",
+            normalized,
+        )
+    )
 
 
 def path_glob_matches(pattern: str, value: str) -> bool:
