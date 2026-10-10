@@ -225,15 +225,21 @@ Project decision precedence is:
 4. normalized Git remote;
 5. resolved main Git root;
 6. worktree or archived Claude scratch-path inference;
-7. resolved cwd path;
-8. decoded Claude project slug;
-9. `unknown`.
+7. `scratch:temp` for temporary-directory cwd;
+8. `scratch:copilot-session-state` for Copilot
+   `~/.copilot/session-state/<id>/files/...` sandboxes;
+9. resolved cwd path;
+10. decoded Claude project slug;
+11. `unknown`.
 
 Configured aliases are applied to the winner and change `source` to `config`.
 Display names do not change identity. `.worktrees/<branch>` maps to its main
 repository; linked worktree `commondir` provides the canonical main root.
 Archived Claude scratch paths recover the original `~/Dev/repos/<repo>` when
-that repository still exists.
+that repository still exists. A recorded or on-disk Git remote/root always
+wins over either synthetic scratch project, so temporary clones of real
+repositories retain their repository identity. Synthetic records use
+`source="path"` with evidence `temp-dir` or `copilot-session-state`.
 
 Every project decision stores one source enum and short evidence string.
 `retro sessions explain` shows that winner rather than presenting all
@@ -260,6 +266,8 @@ it never re-reads raw metadata or normalized events. Such an update reports a
 key in `changed_keys` only when its tags, project, exclusion, cwd resolution,
 or other catalog output actually changes. Its content fingerprint remains
 unchanged, so content-keyed signal records remain valid.
+Project-derivation version changes update this state and project fields only;
+they do not change the content fingerprint or invalidate signals.
 
 Changed content is re-extracted; deleted keys are removed; sessions and state
 are atomically replaced only when their output changes. Stat-preserving

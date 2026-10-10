@@ -39,7 +39,7 @@ CATALOG_SCHEMA = 1
 EXTRACTOR_VERSION = "catalog-v1-v3-compatible-16"
 EVALUATION_STATE_SCHEMA = 1
 TAG_EVALUATOR_VERSION = "catalog-tags-v3"
-PROJECT_EVALUATOR_VERSION = "catalog-projects-v2"
+PROJECT_EVALUATOR_VERSION = "catalog-projects-v3"
 _NORMALIZED_SUFFIX = ".events.jsonl"
 _TOOL_CALL_TYPES = {"tool_call", "command", "file_edit", "file_read", "subagent_start"}
 _SYNTHETIC_USER_PREFIXES = (
@@ -479,6 +479,7 @@ def _reevaluate_project(
         config=config,
         marker_project=marker_project,
         annotation_project=annotation_project,
+        is_temp=context.ephemeral,
     )
 
 

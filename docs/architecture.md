@@ -71,7 +71,9 @@ records are republished as one sorted atomic `catalog/sessions.jsonl`.
 Git resolution reads `.git` directories, linked-worktree `gitdir:` and
 `commondir` files, refs, and remote config directly. No Git process or network
 lookup is involved. Remotes are normalized to `host/owner/repo`; cwd symlinks
-and worktree paths converge on the same main repository.
+and worktree paths converge on the same main repository. Temp cwd values and
+Copilot session-state sandboxes without Git evidence collapse into stable
+synthetic scratch projects instead of one project per ephemeral directory.
 
 Tags retain exact sources (`rule:<id>`, `dotfile:<path>`, `marker`, `manual`).
 Rules apply first, then `.retroignore`, markers, and append-only user

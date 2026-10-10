@@ -1005,6 +1005,170 @@ def test_project_config_aliases_paths_and_missing_claude_cwd(tmp_path: Path):
     )
 
 
+def test_scratch_projects_collapse_without_overriding_git(
+    monkeypatch,
+    tmp_path: Path,
+):
+    monkeypatch.setenv("TMPDIR", str(tmp_path.parent))
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    _config(tmp_path)
+    for session_id, cwd in (
+        ("temp-a", "/private/tmp/catalog-a"),
+        ("temp-b", "/var/tmp/catalog-b"),
+        (
+            "copilot-sandbox",
+            "/Users/test/.copilot/session-state/session-1/files/work",
+        ),
+    ):
+        host = "vscode-copilot" if session_id == "copilot-sandbox" else "codex"
+        _write_normalized(
+            layout,
+            host,
+            session_id,
+            [
+                _event(
+                    host,
+                    session_id,
+                    1,
+                    text="prompt",
+                    payload={"cwd": cwd},
+                ),
+                _event(
+                    host,
+                    session_id,
+                    2,
+                    actor="assistant",
+                    text="done",
+                ),
+            ],
+        )
+
+    repo = tmp_path / "temp-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "config").write_text(
+        '[remote "origin"]\nurl = git@github.com:example/temp-repo.git\n',
+        encoding="utf-8",
+    )
+    raw_repo = layout.raw_dir("codex", "temp-repo")
+    raw_repo.mkdir(parents=True)
+    (raw_repo / "rollout.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"cwd": str(repo)},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _write_normalized(layout, "codex", "temp-repo")
+
+    raw_copilot = layout.raw_dir("vscode-copilot", "sandbox-repo")
+    raw_copilot.mkdir(parents=True)
+    (raw_copilot / "import_meta.json").write_text(
+        json.dumps(
+            {
+                "source_kind": "copilot-cli",
+                "cwd": (
+                    "/Users/test/.copilot/session-state/session-2/"
+                    "files/repository"
+                ),
+                "repository": "example/sandbox-repo",
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_normalized(layout, "vscode-copilot", "sandbox-repo")
+
+    update_catalog(layout)
+    catalog = load_catalog(layout)
+
+    expected_temp = {
+        "id": "scratch:temp",
+        "name": "Scratch (temp dirs)",
+        "source": "path",
+        "evidence": "temp-dir",
+    }
+    assert catalog["codex/temp-a"].project == expected_temp
+    assert catalog["codex/temp-b"].project == expected_temp
+    assert catalog["vscode-copilot/copilot-sandbox"].project == {
+        "id": "scratch:copilot-session-state",
+        "name": "Scratch (Copilot session state)",
+        "source": "path",
+        "evidence": "copilot-session-state",
+    }
+    assert catalog["codex/temp-repo"].project["id"] == (
+        "github.com/example/temp-repo"
+    )
+    assert catalog["vscode-copilot/sandbox-repo"].project["id"] == (
+        "github.com/example/sandbox-repo"
+    )
+
+
+def test_scratch_project_rederivation_preserves_content_fingerprint(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    layout.ensure()
+    configured = _config(
+        tmp_path,
+        projects={
+            "aliases": {},
+            "paths": [
+                {
+                    "glob": "/private/tmp/catalog-policy/**",
+                    "project": "path:/private/tmp/catalog-policy/session",
+                }
+            ],
+            "names": {},
+        },
+    )
+    _write_normalized(
+        layout,
+        "codex",
+        "temp-policy",
+        [
+            _event(
+                "codex",
+                "temp-policy",
+                1,
+                text="prompt",
+                payload={"cwd": "/private/tmp/catalog-policy/session"},
+            ),
+            _event(
+                "codex",
+                "temp-policy",
+                2,
+                actor="assistant",
+                text="done",
+            ),
+        ],
+    )
+    update_catalog(layout)
+    before = load_catalog(layout)["codex/temp-policy"]
+    assert before.project["id"] == "path:/private/tmp/catalog-policy/session"
+    save_config(
+        RetroConfig(
+            archive_root=configured.archive_root,
+            dashboard_dir=configured.dashboard_dir,
+        )
+    )
+    monkeypatch.setattr(
+        catalog_store,
+        "_scan_events",
+        lambda path: pytest.fail(f"unexpected event scan: {path}"),
+    )
+
+    result = update_catalog(layout)
+    after = load_catalog(layout)["codex/temp-policy"]
+
+    assert result.changed_keys == ["codex/temp-policy"]
+    assert after.project["id"] == "scratch:temp"
+    assert after.fingerprint == before.fingerprint
+
+
 def test_incremental_fingerprinting_noop_change_and_removal(tmp_path: Path):
     layout = Layout(tmp_path / "archive")
     layout.ensure()

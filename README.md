@@ -451,7 +451,10 @@ retro rules disable builtin.empty
 Project identity prefers the current repository remote, falls back to archived
 Git metadata, and normalizes HTTPS, SSH, and Copilot `owner/name` forms to one
 lowercase `host/owner/repo`. It follows Git worktree `commondir` files and
-resolves symlinked cwd prefixes. Persist exceptional merges and display names:
+resolves symlinked cwd prefixes. Temp directories without Git evidence collapse
+to `scratch:temp`; Copilot `session-state/<id>/files` sandboxes without Git
+evidence collapse to `scratch:copilot-session-state`. A Git remote/root wins
+over these synthetic projects. Persist exceptional merges and display names:
 
 ```bash
 retro projects list
