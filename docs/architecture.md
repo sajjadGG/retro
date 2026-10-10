@@ -32,6 +32,7 @@ Flat files are canonical:
 Derived artifacts can be rebuilt:
 
 - `catalog/sessions.jsonl`;
+- `catalog/state.json`;
 - `memories/index.sqlite`;
 - `dashboard/data/rollouts.json`;
 - `dashboard/index.html`.
@@ -59,10 +60,13 @@ never deletes raw or normalized evidence.
 
 ## Catalog Boundary
 
-`retro.catalog.update_catalog` fingerprints normalized files, archived host
-metadata, rule/project config, per-session annotations, and `.retroignore`.
-Unchanged sessions require stat checks only; changed records are republished as
-one sorted atomic `catalog/sessions.jsonl`.
+`retro.catalog.update_catalog` gives each record a content-only fingerprint of
+normalized files, archived host metadata, and the extractor version. Rules,
+project config, annotations, `.retroignore`, and local Git context use separate
+digests in `catalog/state.json`. A policy-only change re-evaluates the stored
+record without reading raw metadata or normalized events and does not invalidate
+content-keyed signals. Unchanged sessions require stat checks only; changed
+records are republished as one sorted atomic `catalog/sessions.jsonl`.
 
 Git resolution reads `.git` directories, linked-worktree `gitdir:` and
 `commondir` files, refs, and remote config directly. No Git process or network

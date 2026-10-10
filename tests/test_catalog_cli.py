@@ -25,7 +25,7 @@ def _archive(tmp_path: Path) -> Layout:
                 "payload": {
                     "originator": "codex_exec",
                     "source": "exec",
-                    "cwd": str(tmp_path / "repo"),
+                    "cwd": "/workspace/repo",
                     "git": {"repository_url": "github.com/example/old"},
                 },
             }
@@ -47,7 +47,19 @@ def _archive(tmp_path: Path) -> Layout:
                 raw_ref=RawRef(path="raw/codex/session-1/rollout.jsonl", line=1),
                 timestamp="2026-10-01T12:00:00Z",
                 payload={"text": "Implement catalog filtering"},
-            )
+            ),
+            NormalizedEvent(
+                event_id="session-1:2",
+                session_id="session-1",
+                host="codex",
+                sequence=2,
+                actor="assistant",
+                event_type="message",
+                summary="Implemented",
+                raw_ref=RawRef(path="raw/codex/session-1/rollout.jsonl", line=1),
+                timestamp="2026-10-01T12:00:01Z",
+                payload={"text": "Implemented"},
+            ),
         ],
     )
     return layout
