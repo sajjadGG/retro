@@ -11,9 +11,12 @@ from retro.archive import (
     cutover_compatibility_link,
     execute_migration,
     rebuild_derived_artifacts,
+    repair_archive_refs,
     sha256_file,
     verify_migration,
 )
+from retro.locking import LockUnavailableError, archive_lock
+from retro.storage import Layout
 
 
 def _source_archive(tmp_path: Path) -> Path:
@@ -140,3 +143,77 @@ def test_cutover_requires_verification_and_preserves_source(tmp_path: Path):
     backup = Path(plan["cutover"]["source_backup"])
     assert backup.is_dir()
     assert (backup / "raw" / "codex" / "session-1" / "rollout.jsonl").exists()
+
+
+def test_repair_refs_is_atomic_dry_run_and_idempotent(tmp_path: Path):
+    layout = Layout(tmp_path / "relocated")
+    path = layout.normalized_path("vscode-copilot", "session-1")
+    path.parent.mkdir(parents=True)
+    old_root = "/Users/old/Library/Application Support/retro/rollout-memory"
+    original = {
+        "event_id": "event-1",
+        "session_id": "session-1",
+        "host": "vscode-copilot",
+        "sequence": 1,
+        "actor": "assistant",
+        "event_type": "tool_call",
+        "summary": "read",
+        "raw_ref": {
+            "path": f"{old_root}/raw/vscode-copilot/session-1/events.jsonl",
+            "line": 4,
+        },
+        "timestamp": None,
+        "parent_event_id": None,
+        "payload": {
+            "name": "read",
+            "execution_raw_ref": {
+                "path": (
+                    "/another/archive/raw/vscode-copilot/"
+                    "session-1/events.jsonl"
+                ),
+                "line": 7,
+            },
+            "external_path": "/Users/old/project/file.py",
+        },
+    }
+    path.write_text(json.dumps(original) + "\n", encoding="utf-8")
+    before = path.read_bytes()
+
+    dry_run = repair_archive_refs(layout, dry_run=True)
+
+    assert dry_run["references_changed"] == 2
+    assert path.read_bytes() == before
+
+    repaired = repair_archive_refs(layout)
+    event = json.loads(path.read_text(encoding="utf-8"))
+
+    assert repaired["ok"] is True
+    assert repaired["files_changed"] == 1
+    assert repaired["references_changed"] == 2
+    assert event["raw_ref"]["path"] == (
+        "raw/vscode-copilot/session-1/events.jsonl"
+    )
+    assert event["payload"]["execution_raw_ref"]["path"] == (
+        "raw/vscode-copilot/session-1/events.jsonl"
+    )
+    assert event["payload"]["external_path"] == "/Users/old/project/file.py"
+    assert event["event_id"] == original["event_id"]
+    assert repair_archive_refs(layout)["references_changed"] == 0
+
+
+def test_archive_lock_is_shared_across_user_data_dirs(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    first_lock = layout.lock_path()
+
+    with archive_lock(layout):
+        monkeypatch.setenv("RETRO_DATA_DIR", str(tmp_path / "other-user-data"))
+        second_layout = Layout(layout.root)
+        assert second_layout.lock_path() == first_lock
+        with pytest.raises(LockUnavailableError):
+            with archive_lock(second_layout):
+                pass
+
+    assert first_lock.is_file()

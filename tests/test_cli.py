@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from retro.cli import (
     taskset_run_cmd,
     taskset_select_cmd,
 )
-from retro.config import load_config
+from retro.config import RetroConfig, load_config, save_config
 from retro.schema import NormalizedEvent, RawRef, write_events
 from retro.sdk import ImportResult, SessionDescriptor
 
@@ -387,6 +388,46 @@ def test_setup_without_schedule(tmp_path):
     assert dashboard.is_dir()
 
 
+def test_archive_repair_refs_dry_run_command(tmp_path):
+    root = tmp_path / "archive"
+
+    result = runner.invoke(
+        app,
+        ["archive", "repair-refs", "--root", str(root), "--dry-run"],
+    )
+
+    assert result.exit_code == 0
+    assert '"dry_run": true' in result.output
+    assert not root.exists()
+
+
+def test_scheduled_sync_cli_exits_zero_when_archive_volume_is_unmounted(
+    monkeypatch,
+):
+    volume = Path("/Volumes/retro-cli-unmounted")
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "--root",
+            str(volume / "archive"),
+            "--dashboard-dir",
+            str(volume / "dashboard"),
+            "--scheduled",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "sync skipped" in result.output
+    assert "Archive volume is not mounted" in result.output
+    assert not volume.exists()
+
+
 def test_doctor_fresh_install_and_dashboard_override(monkeypatch, tmp_path):
     override = Path("/tmp/retro-override-dashboard")
     monkeypatch.setenv("RETRO_DASHBOARD_DIR", str(override))
@@ -396,3 +437,72 @@ def test_doctor_fresh_install_and_dashboard_override(monkeypatch, tmp_path):
     assert result.exit_code == 0
     assert "Retro global archive" in result.output
     assert "override-dashboard" in result.output
+
+
+def test_doctor_reports_unmounted_archive_without_creating_mount_path(
+    monkeypatch,
+    tmp_path,
+):
+    volume = Path("/Volumes/retro-doctor-unmounted")
+    save_config(
+        RetroConfig(
+            archive_root=str(volume / "archive"),
+            dashboard_dir=str(tmp_path / "dashboard"),
+        )
+    )
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+    monkeypatch.setattr("retro.cli.doctor_sources", lambda: [])
+    monkeypatch.setattr(
+        "retro.schedule._run_launchctl",
+        lambda args, check=False: subprocess.CompletedProcess(
+            args, 1, "", "not loaded"
+        ),
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "Archive volume is not mounted" in result.output
+    assert "archive lock" in result.output
+    assert not volume.exists()
+
+
+def test_doctor_reports_stage_state_legacy_data_and_dashboard_staging(
+    monkeypatch,
+    tmp_path,
+):
+    archive = tmp_path / "archive"
+    dashboard = tmp_path / "dashboard"
+    save_config(
+        RetroConfig(
+            archive_root=str(archive),
+            dashboard_dir=str(dashboard),
+        )
+    )
+    state = archive / "state" / "sync.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps({"stages": {"dashboard": {"status": "failed"}}}),
+        encoding="utf-8",
+    )
+    legacy = Path(os.environ["RETRO_DATA_DIR"]) / "rollout-memory"
+    legacy.mkdir(parents=True)
+    (legacy / "legacy.txt").write_text("legacy", encoding="utf-8")
+    staging = dashboard.parent / ".retro-dashboard-stale"
+    staging.mkdir()
+    monkeypatch.setattr("retro.cli.doctor_sources", lambda: [])
+    monkeypatch.setattr(
+        "retro.schedule.schedule_status",
+        lambda: {"installed": False, "loaded": False},
+    )
+
+    result = runner.invoke(app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "last sync dashboard" in result.output
+    assert "failed" in result.output
+    assert "legacy archive data remains" in result.output
+    assert "dashboard staging" in result.output

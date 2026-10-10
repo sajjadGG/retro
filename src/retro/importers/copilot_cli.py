@@ -590,7 +590,7 @@ class CopilotCliImporter:
                             "input": arguments,
                             "requested_only": False,
                             "execution_raw_ref": {
-                                "path": str(events_path),
+                                "path": artifact_ref(events_path, self.layout.root),
                                 "line": line_no,
                             },
                             "execution_raw_event_id": raw.get("id"),

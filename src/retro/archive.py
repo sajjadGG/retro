@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import user_data_dir, user_state_dir
-from .locking import exclusive_lock
+from .config import user_data_dir
+from .locking import archive_lock
 from .memory_store import reindex as reindex_memory
 from .renderer import render_file
 from .signals import run_signals, write_signal_artifacts
@@ -32,7 +32,154 @@ _CACHE_NAMES = {
 }
 
 
+def repair_archive_refs(
+    layout: Layout,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if dry_run:
+        return _repair_archive_refs_locked(layout, dry_run=True)
+    with archive_lock(layout):
+        return _repair_archive_refs_locked(layout, dry_run=False)
+
+
+def _repair_archive_refs_locked(
+    layout: Layout,
+    *,
+    dry_run: bool,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "archive_root": str(layout.root),
+        "dry_run": dry_run,
+        "files_scanned": 0,
+        "files_changed": 0,
+        "references_changed": 0,
+        "failures": [],
+    }
+    normalized_root = layout.root / "normalized"
+    for path in sorted(normalized_root.glob("*/*.events.jsonl")):
+        report["files_scanned"] += 1
+        try:
+            changed = _repair_normalized_file(path, dry_run=dry_run)
+        except Exception as exc:
+            report["failures"].append(
+                {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+            )
+            continue
+        if changed:
+            report["files_changed"] += 1
+            report["references_changed"] += changed
+    report["ok"] = not report["failures"]
+    return report
+
+
+def _repair_normalized_file(path: Path, *, dry_run: bool) -> int:
+    host = path.parent.name
+    suffix = ".events.jsonl"
+    session_id = path.name[: -len(suffix)]
+    changed = 0
+    temporary: Path | None = None
+    output = None
+    try:
+        if not dry_run:
+            fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            temporary = Path(temporary_name)
+            output = os.fdopen(fd, "w", encoding="utf-8")
+        with path.open("r", encoding="utf-8") as source:
+            for line_no, raw_line in enumerate(source, start=1):
+                if not raw_line.strip():
+                    if output is not None:
+                        output.write(raw_line)
+                    continue
+                try:
+                    event = json.loads(raw_line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"invalid JSON at line {line_no}: {exc}") from exc
+                replacements = _repair_event_refs(event, host=host, session_id=session_id)
+                changed += replacements
+                if output is not None:
+                    if replacements:
+                        output.write(json.dumps(event, ensure_ascii=False))
+                        output.write("\n")
+                    else:
+                        output.write(raw_line)
+        if output is not None:
+            output.flush()
+            os.fsync(output.fileno())
+            output.close()
+            output = None
+        if temporary is not None and changed:
+            os.replace(temporary, path)
+        return changed
+    finally:
+        if output is not None:
+            output.close()
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def _repair_event_refs(
+    event: Any,
+    *,
+    host: str,
+    session_id: str,
+) -> int:
+    if not isinstance(event, dict):
+        return 0
+    changed = 0
+    raw_ref = event.get("raw_ref")
+    if isinstance(raw_ref, dict):
+        changed += _repair_ref_mapping(raw_ref, host=host, session_id=session_id)
+    payload = event.get("payload")
+    if isinstance(payload, dict):
+        execution_ref = payload.get("execution_raw_ref")
+        if isinstance(execution_ref, dict):
+            changed += _repair_ref_mapping(
+                execution_ref,
+                host=host,
+                session_id=session_id,
+            )
+    return changed
+
+
+def _repair_ref_mapping(
+    reference: dict[str, Any],
+    *,
+    host: str,
+    session_id: str,
+) -> int:
+    value = reference.get("path")
+    if not isinstance(value, str) or not Path(value).is_absolute():
+        return 0
+    normalized = value.replace("\\", "/")
+    marker = f"/raw/{host}/{session_id}/"
+    index = normalized.find(marker)
+    if index < 0:
+        return 0
+    reference["path"] = normalized[index + 1 :]
+    return 1
+
+
 def create_migration_plan(
+    sources: list[Path],
+    destination: Path,
+    *,
+    experiment_roots: list[Path] | None = None,
+    dashboard_dir: Path | None = None,
+    migration_id: str | None = None,
+) -> Path:
+    destination = destination.expanduser().resolve()
+    with archive_lock(Layout(destination)):
+        return _create_migration_plan_locked(
+            sources,
+            destination,
+            experiment_roots=experiment_roots,
+            dashboard_dir=dashboard_dir,
+            migration_id=migration_id,
+        )
+
+
+def _create_migration_plan_locked(
     sources: list[Path],
     destination: Path,
     *,
@@ -43,7 +190,6 @@ def create_migration_plan(
     resolved_sources = _unique_paths(sources)
     if not resolved_sources:
         raise ValueError("At least one source archive is required")
-    destination = destination.expanduser().resolve()
     for source in resolved_sources:
         if not source.is_dir():
             raise FileNotFoundError(f"Source archive does not exist: {source}")
@@ -163,8 +309,7 @@ def execute_migration(plan_path: Path) -> dict[str, Any]:
             f"Migration plan has {len(blocked)} conflicting targets; resolve them first"
         )
 
-    lock_path = user_state_dir() / "archive.lock"
-    with exclusive_lock(lock_path):
+    with archive_lock(Layout(destination)):
         plan.pop("verification", None)
         plan.pop("derived_rebuild", None)
         plan["status"] = "running"
@@ -228,7 +373,7 @@ def rebuild_derived_artifacts(
     )
     migration_dir = plan_path.parent
 
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(layout):
         plan.pop("verification", None)
         plan["status"] = "rebuilding"
         _write_plan(plan_path, plan)
@@ -279,7 +424,8 @@ def rebuild_derived_artifacts(
 
 def verify_migration(plan_path: Path) -> dict[str, Any]:
     plan_path = plan_path.expanduser().resolve()
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    plan = _load_plan(plan_path)
+    with archive_lock(Layout(Path(plan["destination"]))):
         return _verify_migration_locked(plan_path)
 
 
@@ -409,7 +555,7 @@ def cutover_compatibility_link(plan_path: Path, link_path: Path) -> Path:
     if link_path.stat().st_dev != backup.parent.stat().st_dev:
         raise RuntimeError("Compatibility cutover requires source and backup on one filesystem")
 
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(Layout(destination)):
         os.replace(link_path, backup)
         try:
             link_path.symlink_to(destination, target_is_directory=True)
@@ -588,6 +734,21 @@ def _rewrite_normalized_entry(
                     sources=sources,
                     destination=destination,
                 )
+                payload = event.get("payload")
+                execution_ref = (
+                    payload.get("execution_raw_ref")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if (
+                    isinstance(execution_ref, dict)
+                    and isinstance(execution_ref.get("path"), str)
+                ):
+                    execution_ref["path"] = _portable_reference(
+                        execution_ref["path"],
+                        sources=sources,
+                        destination=destination,
+                    )
                 dst.write(json.dumps(event, ensure_ascii=False))
                 dst.write("\n")
             dst.flush()

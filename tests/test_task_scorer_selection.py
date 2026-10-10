@@ -336,6 +336,10 @@ def test_select_sources_reports_counts_and_writes_atomically(archive: Layout, re
         "rejected": 1,
         "by_code": {"NO_NORMALIZED_ROLLOUT": 1},
     }
+    assert payload["selected"][0]["normalized_path"] == (
+        "normalized/codex/session-1.events.jsonl"
+    )
+    assert payload["selected"][0]["raw_dir"] == "raw/codex/session-1"
     assert not list(path.parent.glob(".selection.json.*"))
 
 

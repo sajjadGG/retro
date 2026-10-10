@@ -1,13 +1,21 @@
 """Tests for the public source SDK and managed extension runtime."""
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 
 from retro import extensions as extensions_module
-from retro.extensions import SourceHandle, create_source, doctor_sources
+from retro.extensions import (
+    SourceHandle,
+    cleanup_stale_import_staging,
+    create_source,
+    doctor_sources,
+)
 from retro.schema import NormalizedEvent, RawRef, read_events, write_events
 from retro.sdk import (
     EXTENSION_API_VERSION,
@@ -208,6 +216,101 @@ def test_builtin_source_uses_managed_incremental_publication(
     assert updated.event_count == first.event_count + 1
     assert updated.unknown_event_count == first.unknown_event_count + 1
     assert not list(layout.root.glob(".retro-import-*"))
+
+
+def test_unchanged_descriptors_skip_staging_and_rediscovery(
+    monkeypatch,
+    tmp_path: Path,
+):
+    count = 40
+    sources = tmp_path / "sources"
+    sources.mkdir()
+    descriptors = []
+    layout = Layout(tmp_path / "archive")
+    for index in range(count):
+        session_id = f"session-{index}"
+        source_path = sources / f"{session_id}.jsonl"
+        source_path.write_text('{"type":"message"}\n', encoding="utf-8")
+        stat = source_path.stat()
+        descriptors.append(
+            SessionDescriptor(
+                host="opencode",
+                session_id=session_id,
+                source_path=source_path,
+                metadata={
+                    "raw_filename": "session.jsonl",
+                    "source_mtime_ns": stat.st_mtime_ns,
+                    "source_size_bytes": stat.st_size,
+                },
+            )
+        )
+        raw_dir = layout.raw_dir("opencode", session_id)
+        raw_dir.mkdir(parents=True)
+        shutil.copy2(source_path, raw_dir / "session.jsonl")
+        (raw_dir / "import_meta.json").write_text(
+            json.dumps(
+                {
+                    "captured_mtime_ns": stat.st_mtime_ns,
+                    "captured_size_bytes": stat.st_size,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    class CountingSource(FakeSource):
+        discover_calls = 0
+        import_calls = 0
+
+        def discover(self):
+            type(self).discover_calls += 1
+            return descriptors
+
+        def import_session(self, *, identifier: str, force: bool = False):
+            type(self).import_calls += 1
+            raise AssertionError("unchanged sessions must not reach the adapter")
+
+    copytree_calls = []
+    real_copytree = shutil.copytree
+
+    def counted_copytree(*args, **kwargs):
+        copytree_calls.append(args)
+        return real_copytree(*args, **kwargs)
+
+    monkeypatch.setattr("retro.extensions.shutil.copytree", counted_copytree)
+    source = _handle(layout, CountingSource)
+    discovered = source.discover()
+
+    for descriptor in discovered:
+        with pytest.raises(FileExistsError):
+            source.import_session(
+                identifier=descriptor.session_id,
+                descriptor=descriptor,
+            )
+
+    assert CountingSource.discover_calls == 1
+    assert CountingSource.import_calls == 0
+    assert copytree_calls == []
+    assert not list(layout.root.glob(".retro-import-*"))
+
+
+def test_stale_import_staging_cleanup_leaves_recent_directories(tmp_path: Path):
+    layout = Layout(tmp_path / "archive")
+    layout.root.mkdir()
+    stale = layout.root / ".retro-import-opencode-old"
+    recent = layout.root / ".retro-import-opencode-recent"
+    unrelated = layout.root / "keep"
+    for path in (stale, recent, unrelated):
+        path.mkdir()
+    now = time.time()
+    stale_time = now - 48 * 60 * 60
+    os.utime(stale, (stale_time, stale_time))
+
+    removed = cleanup_stale_import_staging(layout, now=now)
+
+    assert removed == [stale]
+    assert not stale.exists()
+    assert recent.is_dir()
+    assert unrelated.is_dir()
 
 
 def test_registry_loads_entry_points_lazily(monkeypatch):

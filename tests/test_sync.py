@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
@@ -336,3 +337,142 @@ def test_scheduled_sync_defers_derived_work_until_interval(
     assert report.dashboard_rebuilt is False
     assert rebuilt == []
     assert rendered == []
+
+
+def test_dashboard_failure_retries_without_recomputing_signals(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    signal_runs = []
+
+    def run_signal_stage(layout, **kwargs):
+        signal_runs.append(kwargs)
+        return []
+
+    def write_signals(layout, readings):
+        path = layout.root / "signals" / "readings.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        return {"readings": path}
+
+    def reindex(layout):
+        path = layout.memory_index_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"index")
+
+    dashboard_attempts = []
+
+    def build_dashboard(layout, output):
+        dashboard_attempts.append(output)
+        if len(dashboard_attempts) == 1:
+            raise RuntimeError("dashboard exploded")
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.run_signals", run_signal_stage)
+    monkeypatch.setattr("retro.sync.write_signal_artifacts", write_signals)
+    monkeypatch.setattr("retro.sync.reindex_memory", reindex)
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+
+    first = run_sync(layout, dashboard_dir=dashboard, force_derived=True)
+    second = run_sync(layout, dashboard_dir=dashboard)
+
+    assert first.status == "failed"
+    assert first.stages["signals"]["status"] == "success"
+    assert first.stages["dashboard"]["status"] == "failed"
+    assert second.status == "success"
+    assert second.stages["signals"]["status"] == "skipped"
+    assert second.stages["dashboard"]["status"] == "success"
+    assert len(signal_runs) == 1
+    assert len(dashboard_attempts) == 2
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert state["schema_version"] == 2
+    assert state["pending"]["dashboard"]["needed"] is False
+
+
+def test_scheduled_sync_skips_unmounted_external_volume(monkeypatch):
+    volume = Path("/Volumes/retro-test-unmounted-volume")
+    layout = Layout(volume / "archive")
+    monkeypatch.setattr(
+        "retro.archive_health.os.path.ismount",
+        lambda path: str(path) != str(volume),
+    )
+    monkeypatch.setattr(
+        "retro.sync.source_host_names",
+        lambda: (_ for _ in ()).throw(AssertionError("capture must not start")),
+    )
+
+    report = run_sync(
+        layout,
+        dashboard_dir=volume / "dashboard",
+        scheduled=True,
+    )
+
+    assert report.status == "skipped"
+    assert report.skip_reason is not None
+    assert "Archive volume is not mounted" in report.skip_reason
+    assert str(volume) in report.skip_reason
+    assert report.stages["capture"]["status"] == "skipped"
+    assert not volume.exists()
+
+
+def test_sync_reports_external_volume_tcc_denial(monkeypatch):
+    volume = Path("/Volumes/retro-test-tcc-volume")
+    layout = Layout(volume / "archive")
+    python_app = Path("/Applications/TestPython.app")
+    real_stat = os.stat
+
+    def denied_stat(path, *args, **kwargs):
+        if str(path).startswith(str(volume)):
+            raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("retro.archive_health.sys.platform", "darwin")
+    monkeypatch.setattr("retro.archive_health.os.path.ismount", lambda path: True)
+    monkeypatch.setattr("retro.archive_health.os.stat", denied_stat)
+    monkeypatch.setattr("retro.archive_health.python_app_bundle", lambda: python_app)
+
+    report = run_sync(layout, dashboard_dir=volume / "dashboard", scheduled=True)
+
+    assert report.status == "failed"
+    message = report.failures[0]["error"]
+    assert "macOS denied Retro access" in message
+    assert str(python_app) in message
+    assert "Privacy & Security → Full Disk Access" in message
+
+
+def test_legacy_sync_state_is_copied_into_archive_and_preserved(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    (dashboard / "index.html").write_text("existing", encoding="utf-8")
+    legacy = Path(os.environ["RETRO_DATA_DIR"]) / "state" / "last-sync.json"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text(
+        json.dumps(
+            {
+                "signal_signature": "same",
+                "memory_signature": "same",
+                "last_derived_at": "2999-01-01T00:00:00+00:00",
+                "pending_sessions": ["codex/session-1"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync._signal_signature", lambda: "same")
+    monkeypatch.setattr("retro.sync._memory_source_signature", lambda layout: "same")
+
+    report = run_sync(layout, dashboard_dir=dashboard, scheduled=True)
+
+    assert report.status == "success"
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert state["migrated_from"] == str(legacy)
+    assert state["pending"]["catalog"]["keys"] == ["codex/session-1"]
+    assert legacy.is_file()

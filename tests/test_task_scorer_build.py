@@ -1301,6 +1301,31 @@ def test_default_build_requires_an_active_bundle_report(fixture: _Fixture) -> No
         build_sources(fixture.paths, fixture.config())
 
 
+def test_default_build_accepts_bundle_report_after_archive_relocation(
+    fixture: _Fixture,
+) -> None:
+    relocated_root = fixture.tmp_path / "relocated" / "pilot" / "task-scorer"
+    relocated_root.parent.mkdir(parents=True)
+    shutil.copytree(fixture.paths.root, relocated_root)
+    shutil.rmtree(fixture.paths.root)
+    relocated = TasksetPaths(root=relocated_root, name="pilot")
+
+    result = build_sources(relocated, fixture.config())
+
+    assert result.published_task_ids == (fixture.task_id,)
+
+
+def test_default_build_rejects_wrong_relative_bundle_location(
+    fixture: _Fixture,
+) -> None:
+    payload = json.loads(fixture.paths.bundle_report_path().read_text())
+    payload["sources"][0]["path"] = "task-scorer/sources/different-source"
+    write_json(fixture.paths.bundle_report_path(), payload)
+
+    with pytest.raises(BuildConfigurationError, match="does not identify"):
+        build_sources(fixture.paths, fixture.config())
+
+
 def test_new_build_atomically_replaces_the_active_task_set(fixture: _Fixture) -> None:
     first = build_sources(fixture.paths, fixture.config(), [SOURCE_ID])
     active_path = fixture.paths.active_tasks_path()

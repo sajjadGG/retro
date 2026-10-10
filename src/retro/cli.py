@@ -60,6 +60,8 @@ from .config import (
     load_config,
     resolve_dashboard_dir,
     save_config,
+    user_data_dir,
+    user_log_dir,
 )
 from .extensions import (
     SourceHandle,
@@ -1661,6 +1663,7 @@ def setup_cmd(
     no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
 ) -> None:
     """Configure global storage and optionally install periodic capture."""
+    from .archive_health import archive_access
     from .schedule import install_schedule, parse_interval
 
     current = load_config()
@@ -1677,6 +1680,15 @@ def setup_cmd(
         derived_interval_seconds=derived_interval,
         sync_on_login=True,
     )
+    for label, target in (
+        ("archive", Path(config.archive_root)),
+        ("dashboard", Path(config.dashboard_dir)),
+    ):
+        access = archive_access(target)
+        if not access.mounted or not access.accessible:
+            raise typer.BadParameter(
+                access.message or f"{label} path is not accessible: {target}"
+            )
     path = save_config(config)
     Layout(Path(config.archive_root)).ensure()
     Path(config.dashboard_dir).mkdir(parents=True, exist_ok=True)
@@ -1757,6 +1769,20 @@ def archive_cutover(
     console.print(f"[green]compatibility path ready:[/green] {link} -> {link.resolve()}")
 
 
+@archive_app.command("repair-refs")
+def archive_repair_refs(
+    root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report without rewriting files"),
+) -> None:
+    """Make archive-internal normalized raw references relocatable."""
+    from .archive import repair_archive_refs
+
+    report = repair_archive_refs(default_layout(root), dry_run=dry_run)
+    console.print_json(data=report)
+    if not report["ok"]:
+        raise typer.Exit(1)
+
+
 @app.command("sync")
 def sync_cmd(
     root: Optional[Path] = typer.Option(None, help="Override configured archive root"),
@@ -1772,7 +1798,7 @@ def sync_cmd(
     from .sync import run_sync
 
     report = run_sync(
-        _layout(root),
+        default_layout(root),
         dashboard_dir=dashboard_dir,
         scheduled=scheduled,
         force_derived=force_derived,
@@ -1789,7 +1815,11 @@ def sync_cmd(
         console.print(f"[yellow]{report.warning}[/yellow]")
     for failure in report.failures:
         console.print(f"[red]{failure['session']}: {failure['error']}[/red]")
-    if report.status not in {"success"}:
+    if report.status == "skipped" and report.skip_reason:
+        console.print(f"[yellow]{report.skip_reason}[/yellow]")
+    if report.status not in {"success"} and not (
+        scheduled and report.status == "skipped"
+    ):
         raise typer.Exit(1)
 
 
@@ -1844,40 +1874,122 @@ def schedule_uninstall() -> None:
 @app.command("doctor")
 def doctor_cmd() -> None:
     """Report global archive, source, disk, and scheduler health."""
+    from .archive_health import (
+        archive_access,
+        duplicate_volume_mounts,
+        scheduled_archive_access,
+    )
     from .schedule import schedule_status
+    from .sync import STAGE_NAMES
 
     layout = default_layout()
-    layout.ensure()
-    free = shutil.disk_usage(layout.root.parent).free
+    dashboard = resolve_dashboard_dir()
+    access = archive_access(layout.root)
+    scheduled_access = scheduled_archive_access(layout.root)
+    errors: list[str] = []
+    warnings: list[str] = []
     table = Table(title="Retro global archive")
     table.add_column("check")
     table.add_column("value")
     table.add_row("config", str(config_path()))
     table.add_row("archive", str(layout.root))
-    table.add_row("dashboard", str(resolve_dashboard_dir()))
-    table.add_row("free space", f"{free / 1024**3:.1f} GiB")
-    table.add_row(
-        "normalized sessions",
-        str(
+    table.add_row("dashboard", str(dashboard))
+    table.add_row("archive volume", access.volume or "internal filesystem")
+    table.add_row("archive volume mounted", str(access.mounted))
+    table.add_row("scheduled archive access", str(scheduled_access["accessible"]))
+    table.add_row("scheduled access evidence", str(scheduled_access["evidence"]))
+    if access.message:
+        table.add_row("archive access detail", access.message)
+    if scheduled_access.get("message") and scheduled_access["message"] != access.message:
+        table.add_row("scheduled access detail", str(scheduled_access["message"]))
+    if not access.mounted or not access.accessible:
+        errors.append(access.message or "archive is unavailable")
+    elif not scheduled_access["accessible"]:
+        errors.append(str(scheduled_access["message"]))
+    if access.volume:
+        duplicates = duplicate_volume_mounts(Path(access.volume))
+        if duplicates:
+            message = (
+                f"Expected {access.volume}, but duplicate mounted volume(s) exist: "
+                + ", ".join(str(path) for path in duplicates)
+            )
+            table.add_row("duplicate volume mounts", f"ERROR: {message}")
+            errors.append(message)
+    table.add_row("archive state", str(layout.state_dir()))
+    table.add_row("archive lock", str(layout.lock_path()))
+    table.add_row("sync state", str(layout.sync_state_path()))
+    if access.mounted and access.accessible:
+        usage_path = Path(access.volume) if access.volume else layout.root.parent
+        while not usage_path.exists() and usage_path.parent != usage_path:
+            usage_path = usage_path.parent
+        free = shutil.disk_usage(usage_path).free
+        table.add_row("free space", f"{free / 1024**3:.1f} GiB")
+        normalized_count = (
             sum(
                 len(layout.list_normalized(host))
                 for host in layout.list_normalized_hosts()
             )
-        ),
-    )
-    for host in source_host_names():
+            if layout.root.is_dir()
+            else 0
+        )
+        table.add_row("normalized sessions", str(normalized_count))
         try:
-            count = len(create_source(host, layout).discover())
-            table.add_row(f"discoverable {host}", str(count))
-        except Exception as exc:
-            table.add_row(
-                f"discoverable {host}",
-                f"ERROR: {type(exc).__name__}: {exc}",
+            sync_state = json.loads(
+                layout.sync_state_path().read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            sync_state = {}
+        except (OSError, json.JSONDecodeError) as exc:
+            sync_state = {}
+            message = f"cannot read sync state: {type(exc).__name__}: {exc}"
+            warnings.append(message)
+            table.add_row("sync state detail", f"WARNING: {message}")
+        stages = sync_state.get("stages") if isinstance(sync_state, dict) else {}
+        for name in STAGE_NAMES:
+            record = stages.get(name) if isinstance(stages, dict) else None
+            value = (
+                record.get("status", "never run")
+                if isinstance(record, dict)
+                else "never run"
+            )
+            table.add_row(f"last sync {name}", str(value))
+    legacy_root = user_data_dir() / "rollout-memory"
+    if legacy_root != layout.root and legacy_root.is_dir():
+        try:
+            has_legacy_data = next(legacy_root.iterdir(), None) is not None
+        except OSError:
+            has_legacy_data = True
+        if has_legacy_data:
+            message = f"legacy archive data remains at {legacy_root}"
+            warnings.append(message)
+            table.add_row("legacy archive", f"WARNING: {message}")
+    stale_dashboard = (
+        sorted(dashboard.parent.glob(".retro-dashboard-*"))
+        if dashboard.parent.is_dir()
+        else []
+    )
+    if stale_dashboard:
+        message = ", ".join(str(path) for path in stale_dashboard)
+        warnings.append(f"stale dashboard staging directories: {message}")
+        table.add_row("dashboard staging", f"WARNING: {message}")
+    for result in doctor_sources():
+        table.add_row(
+            f"source provider {result.record.name}",
+            "ok" if result.ok else f"ERROR: {result.message}",
+        )
+        if not result.ok:
+            warnings.append(
+                f"{result.record.name} provider failed: {result.message}"
             )
     status = schedule_status()
     table.add_row("schedule installed", str(status.get("installed")))
     table.add_row("schedule loaded", str(status.get("loaded")))
+    table.add_row("schedule logs", str(user_log_dir()))
+    for warning in warnings:
+        table.add_row("warning", warning)
     console.print(table)
+    if errors:
+        raise typer.Exit(1)
 
 
 # ---- signals ----------------------------------------------------------------

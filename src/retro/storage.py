@@ -46,6 +46,15 @@ class Layout:
     def memory_index_path(self) -> Path:
         return self.memories_dir() / "index.sqlite"
 
+    def state_dir(self) -> Path:
+        return self.root / "state"
+
+    def lock_path(self) -> Path:
+        return self.state_dir() / "archive.lock"
+
+    def sync_state_path(self) -> Path:
+        return self.state_dir() / "sync.json"
+
     def benchmarks_dir(self) -> Path:
         return self.root / "benchmarks"
 
@@ -107,6 +116,7 @@ class Layout:
             "memories",
             "benchmarks",
             "benchmark-runs",
+            "state",
         ):
             (self.root / sub).mkdir(parents=True, exist_ok=True)
 

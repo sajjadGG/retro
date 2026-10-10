@@ -215,6 +215,11 @@ def test_automatic_environment_is_embedded_for_later_bundling(archive: Layout, r
     bundled = bundle.bundle_taskset(layout=archive, name="pilot", selected_only=True)
     assert len(bundled.bundled) == 1
     assert bundled.bundled[0].path is not None
+    assert bundled.path is not None
+    report = json.loads(bundled.path.read_text(encoding="utf-8"))
+    assert report["sources"][0]["path"] == (
+        "task-scorer/sources/codex__session-1"
+    )
     environment_path = bundled.bundled[0].path / "context" / "environment.json"
     assert json.loads(environment_path.read_text(encoding="utf-8"))["environment_id"] == (
         environment.environment_id

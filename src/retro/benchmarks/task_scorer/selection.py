@@ -437,7 +437,21 @@ def selection_path(layout: Layout, name: str) -> Path:
 def write_selection(layout: Layout, name: str, result: SelectionResult) -> Path:
     """Publish the selection report atomically; never mutate raw/ or normalized/."""
     path = selection_path(layout, name)
-    atomic_write_text(path, json.dumps(result.to_dict(), indent=2, ensure_ascii=False) + "\n")
+    payload = result.to_dict()
+    selected = payload.get("selected")
+    if isinstance(selected, list):
+        for record, candidate in zip(selected, result.selected):
+            if not isinstance(record, dict):
+                continue
+            for key, candidate_path in (
+                ("normalized_path", candidate.normalized_path),
+                ("raw_dir", candidate.raw_dir),
+            ):
+                try:
+                    record[key] = candidate_path.relative_to(layout.root).as_posix()
+                except ValueError:
+                    record[key] = str(candidate_path)
+    atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return path
 
 

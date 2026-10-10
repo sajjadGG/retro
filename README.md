@@ -120,8 +120,17 @@ retro schedule uninstall
 
 Root precedence is `--root`, `RETRO_ROOT`, the legacy
 `RETRO_ARTIFACT_ROOT`, user config, then the platform per-user data directory.
-On macOS, operational state is under `~/Library/Application Support/retro/`
-and logs are under `~/Library/Logs/retro/`.
+Archive-coupled state and the cross-process lock live under
+`<archive>/state/`. Small configuration stays under the platform user data
+directory. On macOS, scheduler logs deliberately stay on the internal disk at
+`~/Library/Logs/retro/`, so an unmounted external archive cannot hide the
+failure.
+
+When an archive is under `/Volumes/<name>`, scheduled sync skips without
+creating a replacement directory if the volume is not mounted. macOS may also
+deny background jobs access to removable volumes; `retro doctor` and
+`retro schedule status` identify the `Python.app` bundle to grant Full Disk
+Access in System Settings.
 
 `retro sync` imports only new or changed local source sessions, preserves a raw
 revision when an upstream source was rewritten rather than appended, updates

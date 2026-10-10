@@ -702,6 +702,9 @@ class TestCopilotCliImporter:
         )
         assert read_result.parent_event_id == read_call.event_id
         assert read_result.payload["output"]["content"] == "print('hello')"
+        assert read_call.payload["execution_raw_ref"]["path"] == (
+            "raw/vscode-copilot/cli-session-active/events.jsonl"
+        )
         assert sum(event.event_type == "permission" for event in events) == 2
         assert any(event.event_type == "file_edit" for event in events)
         assert any(event.event_type == "subagent_start" for event in events)

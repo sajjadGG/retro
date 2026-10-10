@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from retro.config import RetroConfig, save_config
 from retro.schedule import (
     install_schedule,
     parse_interval,
@@ -46,6 +48,12 @@ def test_launch_agent_generation(monkeypatch, tmp_path: Path):
         "--scheduled",
     ]
     assert payload["StandardOutPath"].endswith("sync.log")
+    environment = payload["EnvironmentVariables"]
+    assert environment["RETRO_DATA_DIR"] == str(tmp_path / "retro-user-data")
+    assert environment["RETRO_LOG_DIR"] == str(tmp_path / "retro-user-data" / "logs")
+    assert environment["RETRO_CONFIG_PATH"] == str(
+        tmp_path / "retro-user-data" / "config.json"
+    )
 
 
 def test_launch_agent_rejects_project_virtualenv(monkeypatch, tmp_path: Path):
@@ -92,3 +100,41 @@ def test_schedule_reports_unsupported_off_macos(monkeypatch, tmp_path: Path):
     }
     with pytest.raises(RuntimeError, match="supported on macOS"):
         install_schedule(900, python_executable=tmp_path / "python", load=False)
+
+
+def test_schedule_status_surfaces_external_volume_tcc_denial(
+    monkeypatch,
+    tmp_path: Path,
+):
+    volume = Path("/Volumes/retro-schedule-tcc")
+    python_app = Path("/Applications/Xcode.app/Test/Python.app")
+    save_config(
+        RetroConfig(
+            archive_root=str(volume / "archive"),
+            dashboard_dir=str(tmp_path / "dashboard"),
+        )
+    )
+    monkeypatch.setattr("retro.schedule.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "retro.schedule._run_launchctl",
+        lambda args, check=False: subprocess.CompletedProcess(
+            args, 1, "", "not loaded"
+        ),
+    )
+    monkeypatch.setattr("retro.archive_health.os.path.ismount", lambda path: True)
+    real_stat = os.stat
+
+    def denied_stat(path, *args, **kwargs):
+        if str(path).startswith(str(volume)):
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("retro.archive_health.os.stat", denied_stat)
+    monkeypatch.setattr("retro.archive_health.python_app_bundle", lambda: python_app)
+
+    status = schedule_status()
+
+    access = status["archive_access"]
+    assert access["accessible"] is False
+    assert str(python_app) in access["message"]
+    assert "Removable Volumes" in access["message"]
