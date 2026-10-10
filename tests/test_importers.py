@@ -24,6 +24,7 @@ from retro.importers.vscode_copilot import (
 )
 from retro.schema import read_events
 from retro.storage import Layout
+from retro.utils import event_text, event_tool_input, event_tool_output
 
 
 def _write_tagged_codex_rollout(
@@ -439,7 +440,7 @@ class TestVscodeCopilotImporter:
             "reasoning",
             "file_read",
             "command",
-            "attachment",
+            "lifecycle",
         }
         read_call = next(
             event
@@ -448,7 +449,7 @@ class TestVscodeCopilotImporter:
             and event.event_type == "file_read"
             and event.payload.get("call_id") == "call-read"
         )
-        assert read_call.payload["input"]["filePath"] == "/workspace/demo/app.py"
+        assert event_tool_input(read_call)["filePath"] == "/workspace/demo/app.py"
         assert read_call.payload["vscode_chat_raw_ref"]["line"] == 3
         assert read_call.raw_ref.line == 5
         assistant_message = next(
@@ -470,12 +471,12 @@ class TestVscodeCopilotImporter:
             event
             for event in events
             if event.actor == "tool"
-            and event.event_type == "command"
+            and event.event_type == "tool_result"
             and event.payload.get("call_id") == "call-command"
         )
         assert command_result.payload["success"] is False
         assert command_result.parent_event_id == command_start.event_id
-        assert command_result.payload["result"]["exitCode"] == 1
+        assert event_tool_output(command_result)["exitCode"] == 1
 
     def test_core_snapshot_fallback_normalizes_edits_and_permissions(
         self,
@@ -500,7 +501,7 @@ class TestVscodeCopilotImporter:
         assert any(event.event_type == "file_edit" for event in events)
         assert any(event.event_type == "permission" for event in events)
         assert any(
-            event.event_type == "command"
+            event.event_type == "tool_result"
             and event.actor == "tool"
             and event.payload["is_error"] is True
             for event in events
@@ -679,11 +680,11 @@ class TestCopilotCliImporter:
             for event in events
             if event.actor == "assistant" and event.event_type == "message"
         ]
-        assert [event.payload["text"] for event in assistant_messages] == [
+        assert [event_text(event) for event in assistant_messages] == [
             "I will inspect it."
         ]
         reasoning = next(event for event in events if event.event_type == "reasoning")
-        assert reasoning.payload["thinking"] == "Read before editing. Then run tests."
+        assert event_text(reasoning) == "Read before editing. Then run tests."
         assert reasoning.payload["raw_lines"] == [4, 5]
 
         read_call = next(
@@ -697,11 +698,11 @@ class TestCopilotCliImporter:
             event
             for event in events
             if event.actor == "tool"
-            and event.event_type == "file_read"
+            and event.event_type == "tool_result"
             and event.payload.get("call_id") == "call-read"
         )
         assert read_result.parent_event_id == read_call.event_id
-        assert read_result.payload["output"]["content"] == "print('hello')"
+        assert event_tool_output(read_result)["content"] == "print('hello')"
         assert read_call.payload["execution_raw_ref"]["path"] == (
             "raw/vscode-copilot/cli-session-active/events.jsonl"
         )
@@ -861,7 +862,7 @@ class TestCopilotCliImporter:
 
         assert unknown == 0
         assert gaps == []
-        assert [event.payload["text"] for event in events] == [
+        assert [event_text(event) for event in events] == [
             "Hello world",
             "Sub agent done",
         ]

@@ -86,6 +86,7 @@ from .mining import (
     write_mining_artifacts,
 )
 from .renderer import render_file
+from .renormalize import parse_since, renormalize_archive
 from .schema import BUILTIN_HOSTS, Host, read_events
 from .sdk import SessionDescriptor
 from .signals import REGISTRY as SIGNAL_REGISTRY
@@ -533,6 +534,72 @@ def import_all(
             )
         )
     if failures:
+        raise typer.Exit(1)
+
+
+@import_app.command("renormalize")
+def import_renormalize(
+    root: Optional[Path] = typer.Option(None, "--root", help="rollout-memory root"),
+    host: Optional[str] = typer.Option(None, "--host", help="Only rebuild this host"),
+    session_id: Optional[str] = typer.Option(
+        None,
+        "--session",
+        help="Only rebuild this archived session ID",
+    ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help="Only consider raw captures updated at or after this ISO-8601 time",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Report outdated sessions without writing derived artifacts",
+    ),
+    no_render: bool = typer.Option(
+        False,
+        "--no-render",
+        help="Rebuild normalized JSONL without rendered markdown",
+    ),
+) -> None:
+    """Rebuild derived events from archived raw captures without touching raw/."""
+    lay = _layout(root)
+    try:
+        host_full = canonical_source_host(host) if host else None
+        since_value = parse_since(since)
+        report = renormalize_archive(
+            lay,
+            host=host_full,
+            session_id=session_id,
+            since=since_value,
+            dry_run=dry_run,
+            render=not no_render,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from None
+    action = "would rebuild" if dry_run else "rebuilt"
+    console.print(
+        f"[bold]{action} {report.outdated if dry_run else report.rebuilt}/"
+        f"{report.scanned} archived sessions[/bold]"
+    )
+    console.print(
+        f"  skipped current: {report.skipped:,}  failures: {len(report.failures):,}"
+    )
+    if not dry_run:
+        console.print(
+            f"  events: {report.event_count:,}  unknown: "
+            f"{report.unknown_event_count:,}  rendered: {report.rendered:,}"
+        )
+        rate = report.rebuilt / report.elapsed_seconds if report.elapsed_seconds else 0.0
+        console.print(
+            f"  normalized: {report.normalized_bytes:,} bytes  "
+            f"elapsed: {report.elapsed_seconds:.2f}s  rate: {rate:.2f} sessions/s"
+        )
+    for failure in report.failures:
+        console.print(
+            f"[red]failed {failure.host}/{failure.session_id}: {failure.error}[/red]"
+        )
+    if report.failures:
         raise typer.Exit(1)
 
 
@@ -1562,6 +1629,11 @@ def render_cmd(
     host: str = typer.Argument(..., help="registered or archived host ID"),
     session_id: str = typer.Argument(...),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    include_noise: bool = typer.Option(
+        False,
+        "--include-noise",
+        help="Include lifecycle, metadata, and usage telemetry",
+    ),
 ):
     """Re-render markdown from already-imported normalized events."""
     lay = _layout(root)
@@ -1571,7 +1643,7 @@ def render_cmd(
         console.print(f"[red]No normalized events at {normalized}[/red]")
         raise typer.Exit(1)
     dest = lay.rendered_path(host_full, session_id)
-    n = render_file(normalized, dest)
+    n = render_file(normalized, dest, include_noise=include_noise)
     console.print(f"rendered {dest}  ({n:,} bytes)")
 
 

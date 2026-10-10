@@ -1,0 +1,35 @@
+{"type":"session_meta","timestamp":"2026-10-01T00:00:00Z","payload":{"id":"codex-v2","cwd":"/workspace","originator":"codex_exec","source":"exec"}}
+{"type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-6"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Build it","images":[]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Build it"}]}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":"Injected instructions"}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Working","phase":"commentary"}}
+{"type":"event_msg","payload":{"type":"agent_reasoning","text":"Inspect first"}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Reasoning summary"}],"encrypted_content":"cipher"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"false\"}","call_id":"call-command"}}
+{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-command","stdout":"","stderr":"failed","aggregated_output":"failed","exit_code":1,"status":"failed"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-command","output":"failed"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"apply_patch","input":"*** Begin Patch","call_id":"call-patch"}}
+{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call-patch","success":true,"changes":{"a.py":{"type":"update"}},"status":"completed"}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call-patch","output":"Done"}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"mcp_demo","input":{"x":1},"call_id":"call-mcp"}}
+{"type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-mcp","result":{"Ok":{"content":[],"isError":false}}}}
+{"type":"response_item","payload":{"type":"tool_search_call","call_id":"call-search","arguments":{"query":"demo"},"status":"completed","execution":"client"}}
+{"type":"response_item","payload":{"type":"tool_search_output","call_id":"call-search","tools":[{"name":"demo"}],"status":"completed","execution":"client"}}
+{"type":"response_item","payload":{"type":"web_search_call","id":"web-1","status":"completed","action":{"type":"search","query":"demo"}}}
+{"type":"event_msg","payload":{"type":"web_search_end","call_id":"web-exec","query":"demo","results":[]}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10}},"rate_limits":null}}
+{"type":"event_msg","payload":{"type":"item_completed","thread_id":"codex-v2","turn_id":"turn-1","item":{"type":"AgentMessage","content":[]},"completed_at_ms":1}}
+{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6"}}}
+{"type":"world_state","payload":{"full":true,"state":{"model":"gpt-6"}}}
+{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call-agent","agent_thread_id":"child","agent_path":"/root/reviewer","kind":"started"}}
+{"type":"event_msg","payload":{"type":"sub_agent_activity","event_id":"call-agent","agent_thread_id":"child","agent_path":"/root/reviewer","kind":"interacted"}}
+{"type":"response_item","payload":{"type":"agent_message","author":"/root/reviewer","recipient":"/root","content":[{"type":"output_text","text":"Review complete"}]}}
+{"type":"inter_agent_communication_metadata","payload":{"trigger_turn":false}}
+{"type":"event_msg","payload":{"type":"context_compacted"}}
+{"type":"compacted","payload":{"message":"","replacement_history":[],"window_number":1}}
+{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}}
+{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":100}}
+{"type":"future_codex_record","payload":{"preserve":true}}

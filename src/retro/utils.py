@@ -47,16 +47,77 @@ def iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
 def event_text(ev: NormalizedEvent) -> str:
     """Extract the best textual content from a normalized event."""
     payload = ev.payload or {}
-    for key in ("text", "message", "thinking"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            return value
+    for key in ("text", "message", "thinking", "content", "reasoningText"):
+        text = _coerce_payload_text(payload.get(key))
+        if text:
+            return text
+    part = payload.get("part")
+    if isinstance(part, dict):
+        for key in ("text", "thinking", "content", "value"):
+            text = _coerce_payload_text(part.get(key))
+            if text:
+                return text
     raw = payload.get("raw_content")
     if raw is not None:
         if isinstance(raw, str):
             return raw
         return json.dumps(raw, ensure_ascii=False)
     return ev.summary or ""
+
+
+def event_tool_input(ev: NormalizedEvent) -> Any:
+    return payload_tool_input(ev.payload or {})
+
+
+def payload_tool_input(payload: dict[str, Any]) -> Any:
+    for key in ("input", "arguments"):
+        if key in payload:
+            return payload[key]
+    for key in ("request", "part", "invocation", "vscode_chat_invocation"):
+        value = payload.get(key)
+        if not isinstance(value, dict):
+            continue
+        for nested_key in ("arguments", "input", "toolSpecificData"):
+            if nested_key in value:
+                return value[nested_key]
+    return None
+
+
+def event_tool_output(ev: NormalizedEvent) -> Any:
+    return payload_tool_output(ev.payload or {})
+
+
+def payload_tool_output(payload: dict[str, Any]) -> Any:
+    for key in (
+        "output",
+        "result",
+        "resultDetails",
+        "vscode_chat_result",
+        "aggregated_output",
+        "content",
+    ):
+        if key in payload:
+            return payload[key]
+    part = payload.get("part")
+    if isinstance(part, dict):
+        for key in ("content", "resultDetails", "output"):
+            if key in part:
+                return part[key]
+    for key in ("invocation", "vscode_chat_invocation"):
+        value = payload.get(key)
+        if isinstance(value, dict) and "resultDetails" in value:
+            return value["resultDetails"]
+    if "tool_use_result" in payload:
+        return payload["tool_use_result"]
+    stdout = payload.get("stdout")
+    stderr = payload.get("stderr")
+    if isinstance(stdout, str) or isinstance(stderr, str):
+        return "\n".join(
+            value
+            for value in (stdout, stderr)
+            if isinstance(value, str) and value
+        )
+    return None
 
 
 def iter_messages(
@@ -77,15 +138,14 @@ def event_command_text(ev: NormalizedEvent) -> str:
         value = payload.get(key)
         if isinstance(value, str):
             return value
-    for container_key in ("arguments", "input"):
-        container = payload.get(container_key)
-        if isinstance(container, dict):
-            for key in ("command", "cmd"):
-                value = container.get(key)
-                if isinstance(value, str):
-                    return value
-        elif isinstance(container, str) and ev.event_type == "command":
-            return container
+    container = event_tool_input(ev)
+    if isinstance(container, dict):
+        for key in ("command", "cmd"):
+            value = container.get(key)
+            if isinstance(value, str):
+                return value
+    elif isinstance(container, str) and ev.event_type == "command":
+        return container
     return ""
 
 
@@ -99,10 +159,11 @@ def event_file_paths(
     paths: set[str] = set()
     _collect_mapping_paths(payload, paths)
 
-    for container_key in ("arguments", "input"):
-        value = payload.get(container_key)
-        if isinstance(value, str) and ev.event_type == "file_edit":
-            paths.update(_patch_paths(value))
+    tool_input = event_tool_input(ev)
+    if isinstance(tool_input, dict):
+        _collect_mapping_paths(tool_input, paths)
+    elif isinstance(tool_input, str) and ev.event_type == "file_edit":
+        paths.update(_patch_paths(tool_input))
 
     if ev.event_type == "file_edit":
         for value in payload.values():
@@ -203,6 +264,24 @@ def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def _coerce_payload_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content", "thinking", "value"):
+            text = _coerce_payload_text(value.get(key))
+            if text:
+                return text
+        return ""
+    if isinstance(value, list):
+        return "\n".join(
+            text
+            for item in value
+            if (text := _coerce_payload_text(item))
+        )
+    return ""
 
 
 def truncate_summary(text: str, limit: int = 200) -> str:
