@@ -469,3 +469,33 @@ def test_legacy_sync_state_is_copied_into_archive_and_preserved(
     assert state["migrated_from"] == str(legacy)
     assert state["pending"]["catalog"]["keys"] == ["codex/session-1"]
     assert legacy.is_file()
+
+
+def test_dashboard_stage_sees_in_progress_report_and_counts_unchanged(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
+    seen_reports = []
+
+    def build_dashboard(layout, output):
+        runs = sorted((layout.root / "sync" / "runs").glob("*.json"))
+        seen_reports.append(json.loads(runs[-1].read_text(encoding="utf-8")))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+
+    report = run_sync(layout, dashboard_dir=dashboard, force_derived=True)
+
+    assert report.status == "success"
+    assert seen_reports[0]["status"] == "running"
+    assert seen_reports[0]["stages"]["signals"]["status"] == "success"
+    final = json.loads(
+        sorted((layout.root / "sync" / "runs").glob("*.json"))[-1].read_text(encoding="utf-8")
+    )
+    assert final["status"] == "success"
+    assert final["unchanged"] == 0

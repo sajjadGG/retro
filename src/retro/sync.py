@@ -507,6 +507,7 @@ def _run_derived_stages(
     )
     if pending["dashboard"]["needed"] and not upstream_pending:
         def dashboard_operation() -> tuple[None, dict[str, Any], str]:
+            _write_run_report(layout, report)
             build_and_publish(layout, output_dir)
             pending["dashboard"]["needed"] = False
             state["last_derived_at"] = _now()
@@ -918,9 +919,11 @@ def _rebuild_dashboard_atomically(layout: Layout, output_dir: Path) -> None:
 def _write_run_report(layout: Layout, report: SyncReport) -> None:
     timestamp = report.started_at.replace(":", "").replace("-", "")
     path = layout.root / "sync" / "runs" / f"{timestamp}.json"
+    payload = report.to_dict()
+    payload["unchanged"] = len(report.unchanged)
     atomic_write_text(
         path,
-        json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
     )
     runs = sorted(path.parent.glob("*.json"), key=lambda item: item.stat().st_mtime)
     for old in runs[:-30]:
