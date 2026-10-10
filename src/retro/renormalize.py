@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import user_state_dir
 from .importers.claude import (
     NORMALIZER_VERSION as CLAUDE_NORMALIZER_VERSION,
 )
@@ -20,7 +19,7 @@ from .importers.codex import NORMALIZER_VERSION as CODEX_NORMALIZER_VERSION
 from .importers.codex import CodexImporter
 from .importers.copilot import NORMALIZER_VERSION as COPILOT_NORMALIZER_VERSION
 from .importers.copilot import CopilotImporter
-from .locking import exclusive_lock
+from .locking import archive_lock
 from .renderer import render_file
 from .schema import Host, validate_host_id, validate_session_id, write_events
 from .storage import Layout
@@ -106,8 +105,7 @@ def renormalize_archive(
 
     started = time.perf_counter()
     report = RenormalizeReport(dry_run=dry_run)
-    lock_path = user_state_dir() / "archive.lock"
-    with exclusive_lock(lock_path):
+    with archive_lock(layout):
         index = _load_index(layout)
         importers = _normalizers(layout)
         changed_index = False

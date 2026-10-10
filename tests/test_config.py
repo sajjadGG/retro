@@ -145,3 +145,24 @@ def test_catalog_config_errors_are_clear(tmp_path: Path, key, value, message):
     with pytest.raises(ValueError) as error:
         load_config()
     assert message in str(error.value)
+
+
+@pytest.mark.parametrize("pattern", [r"(a+)+$", r"(\w+\s?)*", r"^(ab+){2,}$", r"(?:x*)*y"])
+def test_rule_regex_rejects_nested_unbounded_repetition(pattern):
+    from retro.config import validate_rule_spec
+
+    with pytest.raises(ValueError, match="backtrack"):
+        validate_rule_spec({"id": "bad", "match": {"prompt": pattern}, "tags": ["ignore"]})
+
+
+def test_rule_regex_accepts_ordinary_alternation():
+    from retro.config import validate_rule_spec
+
+    rule = validate_rule_spec(
+        {
+            "id": "eval",
+            "match": {"prompt": r"^\s*You are (being evaluated\b|the agent-under-test\b)"},
+            "tags": ["ignore"],
+        }
+    )
+    assert rule["match"]["prompt"].startswith("^")

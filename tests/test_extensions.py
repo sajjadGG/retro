@@ -256,6 +256,9 @@ def test_unchanged_descriptors_skip_staging_and_rediscovery(
             ),
             encoding="utf-8",
         )
+        normalized = layout.normalized_path("opencode", session_id)
+        normalized.parent.mkdir(parents=True, exist_ok=True)
+        normalized.write_text("", encoding="utf-8")
 
     class CountingSource(FakeSource):
         discover_calls = 0
@@ -424,3 +427,79 @@ def test_builtin_sources_pass_doctor():
 
     assert len(results) == 3
     assert all(result.ok for result in results)
+
+
+def _write_pair(layout: Layout, session_id: str, raw_text: str, normalized_text: str) -> None:
+    raw_dir = layout.raw_dir("codex", session_id)
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "rollout.jsonl").write_text(raw_text, encoding="utf-8")
+    normalized = layout.normalized_path("codex", session_id)
+    normalized.parent.mkdir(parents=True, exist_ok=True)
+    normalized.write_text(normalized_text, encoding="utf-8")
+
+
+def test_recovery_restores_pair_interrupted_before_install(tmp_path: Path):
+    from retro.extensions import recover_interrupted_publications
+
+    layout = Layout(tmp_path / "archive")
+    _write_pair(layout, "s1", "old raw", "old normalized")
+    suffix = "a" * 32
+    raw = layout.raw_dir("codex", "s1")
+    normalized = layout.normalized_path("codex", "s1")
+    raw.rename(raw.with_name(f".s1.backup-{suffix}"))
+    normalized.rename(normalized.with_name(f".s1.events.jsonl.backup-{suffix}"))
+
+    assert recover_interrupted_publications(layout) == ["codex/s1"]
+    assert (raw / "rollout.jsonl").read_text(encoding="utf-8") == "old raw"
+    assert normalized.read_text(encoding="utf-8") == "old normalized"
+    assert not list(raw.parent.glob(".*")) and not list(normalized.parent.glob(".*"))
+
+
+def test_recovery_rolls_back_half_installed_pair(tmp_path: Path):
+    from retro.extensions import recover_interrupted_publications
+
+    layout = Layout(tmp_path / "archive")
+    _write_pair(layout, "s1", "old raw", "old normalized")
+    suffix = "b" * 32
+    raw = layout.raw_dir("codex", "s1")
+    normalized = layout.normalized_path("codex", "s1")
+    raw.rename(raw.with_name(f".s1.backup-{suffix}"))
+    normalized.rename(normalized.with_name(f".s1.events.jsonl.backup-{suffix}"))
+    raw.mkdir()
+    (raw / "rollout.jsonl").write_text("new raw", encoding="utf-8")
+
+    assert recover_interrupted_publications(layout) == ["codex/s1"]
+    assert (raw / "rollout.jsonl").read_text(encoding="utf-8") == "old raw"
+    assert normalized.read_text(encoding="utf-8") == "old normalized"
+
+
+def test_recovery_discards_backups_of_completed_publication(tmp_path: Path):
+    from retro.extensions import recover_interrupted_publications
+
+    layout = Layout(tmp_path / "archive")
+    _write_pair(layout, "s1", "new raw", "new normalized")
+    suffix = "c" * 32
+    backup = layout.raw_dir("codex", "s1").with_name(f".s1.backup-{suffix}")
+    backup.mkdir()
+    (backup / "rollout.jsonl").write_text("old raw", encoding="utf-8")
+
+    assert recover_interrupted_publications(layout) == []
+    assert not backup.exists()
+    assert (layout.raw_dir("codex", "s1") / "rollout.jsonl").read_text(encoding="utf-8") == (
+        "new raw"
+    )
+
+
+def test_hidden_archive_entries_are_not_sessions(tmp_path: Path):
+    from retro.catalog import update_catalog
+
+    layout = Layout(tmp_path / "archive")
+    _write_pair(layout, "s1", "raw", "")
+    (layout.raw_dir("codex", "s1").parent / f".s1.backup-{'d' * 32}").mkdir()
+    (layout.root / "normalized" / "codex" / f".s1.events.jsonl.backup-{'d' * 32}").write_text(
+        "", encoding="utf-8"
+    )
+
+    assert layout.list_imported("codex") == ["s1"]
+    assert layout.list_normalized("codex") == ["s1"]
+    assert set(update_catalog(layout).added_keys) == {"codex/s1"}

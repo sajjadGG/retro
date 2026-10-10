@@ -760,17 +760,19 @@ def _available_keys(layout: Layout) -> set[str]:
     raw_root = layout.root / "raw"
     if raw_root.is_dir():
         for host_dir in raw_root.iterdir():
-            if not host_dir.is_dir():
+            if not host_dir.is_dir() or host_dir.name.startswith("."):
                 continue
             for session_dir in host_dir.iterdir():
-                if session_dir.is_dir():
+                if session_dir.is_dir() and not session_dir.name.startswith("."):
                     keys.add(f"{host_dir.name}/{session_dir.name}")
     normalized_root = layout.root / "normalized"
     if normalized_root.is_dir():
         for host_dir in normalized_root.iterdir():
-            if not host_dir.is_dir():
+            if not host_dir.is_dir() or host_dir.name.startswith("."):
                 continue
             for path in host_dir.glob(f"*{_NORMALIZED_SUFFIX}"):
+                if path.name.startswith("."):
+                    continue
                 keys.add(
                     f"{host_dir.name}/{path.name[: -len(_NORMALIZED_SUFFIX)]}"
                 )

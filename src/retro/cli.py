@@ -14,8 +14,9 @@ import json
 import re
 import shutil
 from collections import Counter
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -54,7 +55,7 @@ from .benchmarks.task_scorer.selection import (
     SourceCandidate,
     select_taskset,
 )
-from .catalog import load_catalog, update_catalog
+from .catalog import Catalog, SessionRecord, load_catalog, update_catalog
 from .catalog.cli import projects_app, rules_app, sessions_app
 from .config import (
     config_path,
@@ -64,7 +65,6 @@ from .config import (
     update_config,
     user_data_dir,
     user_log_dir,
-    user_state_dir,
 )
 from .extensions import (
     SourceHandle,
@@ -74,7 +74,7 @@ from .extensions import (
     extension_records,
     source_host_names,
 )
-from .locking import exclusive_lock
+from .locking import archive_lock
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -833,7 +833,7 @@ def mine_cmd(
             )
 
     lay = _layout(root)
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(lay):
         update_catalog(lay)
     targets = _mine_targets(
         lay,
@@ -2144,6 +2144,29 @@ def signal_list(
     console.print(table)
 
 
+class _CatalogSlice:
+    """Included catalog records, optionally narrowed to one host or session list."""
+
+    def __init__(
+        self,
+        catalog: Catalog,
+        *,
+        host: str | None,
+        session_ids: list[str] | None,
+    ) -> None:
+        self._catalog = catalog
+        self._host = host
+        self._session_ids = set(session_ids) if session_ids else None
+
+    def included(self) -> Iterator[SessionRecord]:
+        for record in self._catalog.included():
+            if self._host is not None and record.host != self._host:
+                continue
+            if self._session_ids is not None and record.session_id not in self._session_ids:
+                continue
+            yield record
+
+
 @signal_app.command("run")
 def signal_run(
     host: Optional[str] = typer.Option(None, help="Restrict to one host ID"),
@@ -2158,25 +2181,29 @@ def signal_run(
     ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
-    """Update signals/sessions.jsonl for every catalogued session."""
+    """Update signals/sessions.jsonl for every included catalog session."""
     lay = _layout(root)
     host_full = _expand_host(host) if host else None
     sids = [s.strip() for s in session_id.split(",") if s.strip()] if session_id else None
-    source = None
-    if include_scratch:
-        from .signals import NormalizedSource
+    with archive_lock(lay):
+        source: Any
+        if include_scratch:
+            from .signals import NormalizedSource
 
-        source = NormalizedSource(
-            layout=lay, host=host_full, session_ids=sids, skip_temp=False
+            source = NormalizedSource(
+                layout=lay, host=host_full, session_ids=sids, skip_temp=False
+            )
+        else:
+            update_catalog(lay)
+            source = _CatalogSlice(load_catalog(lay), host=host_full, session_ids=sids)
+        update = update_signals(
+            lay,
+            source,
+            force=force,
+            host=host_full,
+            session_ids=sids,
+            prune=not (host_full or sids),
         )
-    update = update_signals(
-        lay,
-        source,
-        force=force,
-        host=host_full,
-        session_ids=sids,
-        prune=not (host_full or sids),
-    )
     console.print(
         f"[green]signals up to date[/green] set={update.version} sessions={update.total:,} "
         f"added={len(update.added_keys):,} changed={len(update.changed_keys):,} "
@@ -2378,7 +2405,7 @@ def memory_reindex(
     from .memory_store import reindex
 
     lay = _layout(root)
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(lay):
         update_catalog(lay)
         report = reindex(lay)
     console.print(f"[green]indexed {report.indexed} memories[/green]")

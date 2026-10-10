@@ -124,14 +124,20 @@ class Layout:
         host_dir = self.root / "raw" / validate_host_id(host)
         if not host_dir.exists():
             return []
-        return sorted(p.name for p in host_dir.iterdir() if p.is_dir())
+        return sorted(
+            p.name for p in host_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+        )
 
     def list_normalized(self, host: Host) -> list[str]:
         host_dir = self.root / "normalized" / validate_host_id(host)
         if not host_dir.exists():
             return []
         suffix = ".events.jsonl"
-        return sorted(p.name[: -len(suffix)] for p in host_dir.glob(f"*{suffix}") if p.is_file())
+        return sorted(
+            p.name[: -len(suffix)]
+            for p in host_dir.glob(f"*{suffix}")
+            if p.is_file() and not p.name.startswith(".")
+        )
 
     def list_imported_hosts(self) -> list[Host]:
         return self._list_host_dirs(self.root / "raw")
@@ -149,7 +155,7 @@ class Layout:
         return sorted(
             validate_host_id(path.name)
             for path in root.iterdir()
-            if path.is_dir()
+            if path.is_dir() and not path.name.startswith(".")
         )
 
 

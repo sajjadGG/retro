@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -47,6 +48,10 @@ _BUILTIN_ALIASES = {
     "gh-copilot": "vscode-copilot",
 }
 STALE_IMPORT_SECONDS = 24 * 60 * 60
+_RAW_BACKUP_RE = re.compile(r"\.(?P<session>[A-Za-z0-9][A-Za-z0-9._-]*)\.backup-(?P<suffix>[0-9a-f]{32})")
+_NORMALIZED_BACKUP_RE = re.compile(
+    r"\.(?P<session>[A-Za-z0-9][A-Za-z0-9._-]*)\.events\.jsonl\.backup-(?P<suffix>[0-9a-f]{32})"
+)
 
 
 class ClaudeSource:
@@ -423,12 +428,66 @@ def cleanup_stale_import_staging(
     return removed
 
 
+def recover_interrupted_publications(layout: Layout) -> list[str]:
+    """Restore archive pairs left half-published by a killed capture.
+
+    `_publish_capture` parks the previous raw directory and normalized file under
+    `.<name>.backup-<suffix>` before installing the staged pair. When both targets
+    exist the publication finished and the backups are leftovers; when either is
+    missing the pair is rolled back to the backups so raw and normalized agree.
+    """
+    recovered: list[str] = []
+    raw_root = layout.root / "raw"
+    normalized_root = layout.root / "normalized"
+    groups: dict[tuple[str, str, str], dict[str, Path]] = {}
+    for kind, root, suffix_pattern in (
+        ("raw", raw_root, _RAW_BACKUP_RE),
+        ("normalized", normalized_root, _NORMALIZED_BACKUP_RE),
+    ):
+        if not root.is_dir():
+            continue
+        for host_dir in root.iterdir():
+            if not host_dir.is_dir() or host_dir.name.startswith("."):
+                continue
+            for path in host_dir.glob(".*.backup-*"):
+                match = suffix_pattern.fullmatch(path.name)
+                if match is None:
+                    continue
+                key = (host_dir.name, match.group("session"), match.group("suffix"))
+                groups.setdefault(key, {})[kind] = path
+    for (host, session_id, _suffix), backups in sorted(groups.items()):
+        target_raw = raw_root / host / session_id
+        target_normalized = normalized_root / host / f"{session_id}.events.jsonl"
+        raw_backup = backups.get("raw")
+        normalized_backup = backups.get("normalized")
+        complete = (raw_backup is None or target_raw.exists()) and (
+            normalized_backup is None or target_normalized.exists()
+        )
+        if not complete:
+            if raw_backup is not None:
+                if target_raw.exists():
+                    _remove_path(target_raw)
+                os.replace(raw_backup, target_raw)
+            if normalized_backup is not None:
+                if target_normalized.exists():
+                    _remove_path(target_normalized)
+                os.replace(normalized_backup, target_normalized)
+            recovered.append(f"{host}/{session_id}")
+        else:
+            for backup in (raw_backup, normalized_backup):
+                if backup is not None:
+                    _remove_path(backup)
+    return recovered
+
+
 def _descriptor_is_unchanged(
     layout: Layout,
     descriptor: SessionDescriptor,
 ) -> bool:
     raw_dir = layout.raw_dir(descriptor.host, descriptor.session_id)
     if not raw_dir.is_dir() or has_only_repo_state_capture(raw_dir):
+        return False
+    if not layout.normalized_path(descriptor.host, descriptor.session_id).is_file():
         return False
     fingerprint = _descriptor_fingerprint(descriptor)
     if fingerprint is None:

@@ -138,3 +138,23 @@ def test_schedule_status_surfaces_external_volume_tcc_denial(
     assert access["accessible"] is False
     assert str(python_app) in access["message"]
     assert "Removable Volumes" in access["message"]
+
+
+def test_launch_agent_forwards_archive_and_source_overrides(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr("retro.schedule.sys.platform", "darwin")
+    path = tmp_path / "io.retro.sync.plist"
+    python = tmp_path / "python"
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setenv("RETRO_LAUNCH_AGENT_PATH", str(path))
+    monkeypatch.setenv("RETRO_ROOT", "/Volumes/Archive/rollout-memory")
+    monkeypatch.setenv("RETRO_DASHBOARD_DIR", "/Volumes/Archive/dashboard")
+    monkeypatch.setenv("CODEX_HOME", "/Users/me/.codex-work")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    install_schedule(900, python_executable=python, load=False)
+
+    environment = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+    assert environment["RETRO_ROOT"] == "/Volumes/Archive/rollout-memory"
+    assert environment["RETRO_DASHBOARD_DIR"] == "/Volumes/Archive/dashboard"
+    assert environment["CODEX_HOME"] == "/Users/me/.codex-work"
+    assert "CLAUDE_CONFIG_DIR" not in environment

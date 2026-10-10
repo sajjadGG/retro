@@ -33,6 +33,10 @@ _RULE_LIST_FIELDS = {
 }
 _RULE_BOOL_FIELDS = {"interactive", "is_subagent"}
 _RULE_REGEX_FIELDS = {"title", "prompt", "session_id"}
+_NESTED_QUANTIFIER = re.compile(
+    r"\((?:[^()\\]|\\.)*?(?<!\\)(?:[+*]|\{\d*,\})(?:[^()\\]|\\.)*\)"
+    r"(?:[+*]|\{\d*,\d*\})"
+)
 _RULE_COUNT_FIELDS = {"min_user_messages", "max_user_messages"}
 _RULE_DATE_FIELDS = {"started_after", "started_before"}
 _RULE_MATCH_FIELDS = (
@@ -211,6 +215,12 @@ def validate_rule_spec(rule: Any, *, where: str = "rule") -> dict[str, Any]:
                 re.compile(value)
             except re.error as exc:
                 raise ValueError(f"{location} is not a valid regex: {exc}") from exc
+            if _NESTED_QUANTIFIER.search(value):
+                raise ValueError(
+                    f"{location} repeats a group that already contains an unbounded "
+                    "quantifier (e.g. (a+)+), which can backtrack catastrophically; "
+                    "rewrite it without nested repetition"
+                )
             normalized_match[name] = value
         elif name in _RULE_COUNT_FIELDS:
             if type(value) is not int or value < 0:

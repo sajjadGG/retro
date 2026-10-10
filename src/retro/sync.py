@@ -23,6 +23,7 @@ from .config import load_config, resolve_dashboard_dir, user_state_dir
 from .extensions import (
     cleanup_stale_import_staging,
     create_source,
+    recover_interrupted_publications,
     source_host_names,
 )
 from .importers.claude import ClaudeSession
@@ -177,6 +178,7 @@ def _run_sync_locked(
     }
 
     def capture_operation() -> tuple[set[str], dict[str, Any], str]:
+        recovered = recover_interrupted_publications(layout)
         removed = cleanup_stale_import_staging(layout)
         report.stale_staging_removed.extend(str(path) for path in removed)
         failure_count = len(report.failures)
@@ -188,6 +190,7 @@ def _run_sync_locked(
             {
                 "changed_keys": len(changed),
                 "removed_staging_dirs": len(removed),
+                "recovered_publications": recovered,
             },
             status,
         )
@@ -510,7 +513,6 @@ def _run_derived_stages(
             _write_run_report(layout, report)
             build_and_publish(layout, output_dir)
             pending["dashboard"]["needed"] = False
-            state["last_derived_at"] = _now()
             return None, {"output_dir": str(output_dir)}, "success"
 
         dashboard_ok, _ = _call_stage(
@@ -533,6 +535,9 @@ def _run_derived_stages(
         )
     else:
         _skip_stage("dashboard", layout=layout, state=state, report=report)
+
+    if not any(_stage_has_pending(pending, name) for name in DERIVED_STAGE_NAMES):
+        state["last_derived_at"] = _now()
 
 
 def _call_stage(

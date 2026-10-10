@@ -17,6 +17,14 @@ class LockUnavailableError(RuntimeError):
 
 
 @contextmanager
+def config_lock() -> Iterator[None]:
+    from .config import config_path
+
+    with exclusive_lock(config_path().parent / "config.lock"):
+        yield
+
+
+@contextmanager
 def archive_lock(layout: Layout) -> Iterator[None]:
     require_archive_volume(layout.root)
     with exclusive_lock(layout.lock_path()):

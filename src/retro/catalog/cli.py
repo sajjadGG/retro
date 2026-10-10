@@ -14,10 +14,9 @@ from rich.table import Table
 from ..config import (
     load_config,
     update_config,
-    user_state_dir,
     validate_rule_spec,
 )
-from ..locking import exclusive_lock
+from ..locking import archive_lock, config_lock
 from ..storage import Layout, default_layout
 from . import Catalog, SessionRecord, load_catalog, update_catalog
 from .annotations import append_annotation, load_annotations
@@ -261,7 +260,7 @@ def rules_add(
     rule = _validated_rule(_load_json_argument(spec))
     if rule["id"].startswith("builtin."):
         raise typer.BadParameter("custom rule ids must not use the builtin. prefix")
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with config_lock():
         config = load_config()
         if any(item["id"] == rule["id"] for item in config.rules):
             raise typer.BadParameter(f"rule {rule['id']!r} already exists")
@@ -274,7 +273,7 @@ def rules_remove(rule_id: str = typer.Argument(...)) -> None:
     """Remove one configured user rule."""
     if rule_id.startswith("builtin."):
         raise typer.BadParameter("built-in rules can be disabled but not removed")
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with config_lock():
         config = load_config()
         retained = [rule for rule in config.rules if rule["id"] != rule_id]
         if len(retained) == len(config.rules):
@@ -438,7 +437,7 @@ def projects_merge(
     """Persist a project-id alias from SOURCE into TARGET."""
     if source == target:
         raise typer.BadParameter("SOURCE and TARGET must differ")
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with config_lock():
         config = load_config()
         projects = dict(config.projects)
         aliases = dict(projects.get("aliases", {}))
@@ -456,7 +455,7 @@ def projects_rename(
     """Persist a display name for a canonical project id."""
     if not name.strip():
         raise typer.BadParameter("NAME must be non-empty")
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with config_lock():
         config = load_config()
         projects = dict(config.projects)
         names = dict(projects.get("names", {}))
@@ -468,7 +467,7 @@ def projects_rename(
 
 def _refresh(root: Optional[Path]) -> tuple[Layout, Catalog]:
     layout = default_layout(root)
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(layout):
         update_catalog(layout)
     return layout, load_catalog(layout)
 
@@ -481,7 +480,7 @@ def _annotate(
 ) -> None:
     layout = default_layout(root)
     key = _selector_key(selector, None)
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with archive_lock(layout):
         update_catalog(layout)
         catalog = load_catalog(layout)
         _require_record(catalog, key)
@@ -491,7 +490,7 @@ def _annotate(
 
 
 def _set_rule_enabled(rule_id: str, enabled: bool) -> None:
-    with exclusive_lock(user_state_dir() / "archive.lock"):
+    with config_lock():
         config = load_config()
         known = {rule.id for rule in catalog_rules(config)}
         if rule_id not in known:

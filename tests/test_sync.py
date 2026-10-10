@@ -499,3 +499,32 @@ def test_dashboard_stage_sees_in_progress_report_and_counts_unchanged(
     )
     assert final["status"] == "success"
     assert final["unchanged"] == 0
+
+
+def test_clean_scheduled_derived_pass_advances_last_derived_at(
+    monkeypatch,
+    tmp_path: Path,
+):
+    layout = Layout(tmp_path / "archive")
+    dashboard = tmp_path / "dashboard"
+    _patch_empty_sources(monkeypatch)
+    monkeypatch.setattr("retro.sync.reindex_memory", lambda layout: None)
+    builds = []
+
+    def build_dashboard(layout, output):
+        builds.append(output)
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "index.html").write_text("ok", encoding="utf-8")
+
+    monkeypatch.setattr("retro.sync.build_and_publish", build_dashboard)
+    run_sync(layout, dashboard_dir=dashboard)
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    state["last_derived_at"] = "2000-01-01T00:00:00+00:00"
+    layout.sync_state_path().write_text(json.dumps(state), encoding="utf-8")
+
+    report = run_sync(layout, dashboard_dir=dashboard, scheduled=True)
+
+    state = json.loads(layout.sync_state_path().read_text(encoding="utf-8"))
+    assert report.status == "success"
+    assert len(builds) == 1
+    assert state["last_derived_at"] > "2000-01-01T00:00:00+00:00"

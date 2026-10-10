@@ -14,6 +14,19 @@ from .storage import default_layout
 from .utils import atomic_write_bytes
 
 LAUNCHD_LABEL = "io.retro.sync"
+FORWARDED_ENVIRONMENT = (
+    "RETRO_DATA_DIR",
+    "RETRO_LOG_DIR",
+    "RETRO_CONFIG_PATH",
+    "RETRO_ROOT",
+    "RETRO_ARTIFACT_ROOT",
+    "RETRO_DASHBOARD_DIR",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+)
 
 
 def parse_interval(value: str) -> int:
@@ -73,7 +86,7 @@ def install_schedule(
     environment = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
     }
-    for name in ("RETRO_DATA_DIR", "RETRO_LOG_DIR", "RETRO_CONFIG_PATH"):
+    for name in FORWARDED_ENVIRONMENT:
         value = os.environ.get(name)
         if value:
             environment[name] = value
