@@ -88,7 +88,10 @@ def init(layout: Layout) -> None:
 
 
 def reindex(layout: Layout) -> ReindexReport:
+    from .catalog import load_catalog
+
     layout.ensure()
+    excluded_keys = {record.key for record in load_catalog(layout).excluded()}
     db_path = layout.memory_index_path()
     for path in (db_path, db_path.with_suffix(".sqlite-wal"), db_path.with_suffix(".sqlite-shm")):
         if path.exists():
@@ -100,10 +103,10 @@ def reindex(layout: Layout) -> ReindexReport:
     links = 0
     try:
         with con:
-            for record in _iter_source_records(layout):
+            for record in _iter_source_records(layout, excluded_keys):
                 source_records += 1
                 evidence_refs += _upsert_memory(con, record)
-            for record in _iter_mined_records(layout):
+            for record in _iter_mined_records(layout, excluded_keys):
                 mined_records += 1
                 evidence_refs += _upsert_memory(con, record)
             for event in _iter_memory_events(layout):
@@ -416,12 +419,18 @@ def _create_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def _iter_source_records(layout: Layout) -> list[dict[str, Any]]:
+def _iter_source_records(
+    layout: Layout,
+    excluded_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
     path = layout.memory_items_path()
     if not path.exists():
         return []
     records = []
+    excluded = excluded_keys or set()
     for _, raw in iter_jsonl(path):
+        if _mining_result_key(raw) in excluded:
+            continue
         if "candidates" in raw:
             records.extend(_records_from_mining_result(raw))
         else:
@@ -429,18 +438,32 @@ def _iter_source_records(layout: Layout) -> list[dict[str, Any]]:
     return records
 
 
-def _iter_mined_records(layout: Layout) -> list[dict[str, Any]]:
+def _iter_mined_records(
+    layout: Layout,
+    excluded_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     mined_dir = layout.root / "mined"
     if not mined_dir.exists():
         return records
+    excluded = excluded_keys or set()
     for path in sorted(mined_dir.glob("*/*/*.json")):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        if _mining_result_key(raw) in excluded:
+            continue
         records.extend(_records_from_mining_result(raw))
     return records
+
+
+def _mining_result_key(raw: dict[str, Any]) -> str | None:
+    host = raw.get("host")
+    session_id = raw.get("session_id")
+    if not isinstance(host, str) or not isinstance(session_id, str):
+        return None
+    return f"{host}/{session_id}"
 
 
 def _iter_memory_events(layout: Layout) -> list[dict[str, Any]]:

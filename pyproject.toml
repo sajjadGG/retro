@@ -59,6 +59,7 @@ ignore = ["B008"]
 [tool.ruff.lint.per-file-ignores]
 # Typer evaluates CLI annotations at runtime; Optional is required on Python 3.9.
 "src/retro/cli.py" = ["UP045"]
+"src/retro/catalog/cli.py" = ["UP045"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

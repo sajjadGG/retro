@@ -9,6 +9,7 @@ Commands:
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import shutil
@@ -53,14 +54,17 @@ from .benchmarks.task_scorer.selection import (
     SourceCandidate,
     select_taskset,
 )
+from .catalog import load_catalog, update_catalog
+from .catalog.cli import projects_app, rules_app, sessions_app
 from .config import (
-    RetroConfig,
     config_path,
     load_config,
     resolve_dashboard_dir,
     save_config,
+    update_config,
     user_data_dir,
     user_log_dir,
+    user_state_dir,
 )
 from .extensions import (
     SourceHandle,
@@ -70,6 +74,7 @@ from .extensions import (
     extension_records,
     source_host_names,
 )
+from .locking import exclusive_lock
 from .mining import (
     FILTER_REGISTRY as MINING_FILTERS,
 )
@@ -144,6 +149,9 @@ extensions_app = typer.Typer(
     help="Inspect built-in and installed source providers.",
 )
 app.add_typer(extensions_app, name="extensions")
+app.add_typer(sessions_app, name="sessions")
+app.add_typer(rules_app, name="rules")
+app.add_typer(projects_app, name="projects")
 
 console = Console()
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$")
@@ -722,6 +730,11 @@ def mine_cmd(
     all_sessions: bool = typer.Option(
         False, "--all", help="Mine all imported normalized sessions for the host"
     ),
+    include_excluded: bool = typer.Option(
+        False,
+        "--include-excluded",
+        help="Mine sessions excluded by the catalog.",
+    ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """Mine prompt-time memory from an imported normalized rollout."""
@@ -743,7 +756,15 @@ def mine_cmd(
             )
 
     lay = _layout(root)
-    targets = _mine_targets(lay, host, session_id, all_sessions=all_sessions)
+    with exclusive_lock(user_state_dir() / "archive.lock"):
+        update_catalog(lay)
+    targets = _mine_targets(
+        lay,
+        host,
+        session_id,
+        all_sessions=all_sessions,
+        include_excluded=include_excluded,
+    )
     if not targets:
         console.print("[yellow]No normalized sessions found to mine.[/yellow]")
         raise typer.Exit(0)
@@ -811,6 +832,7 @@ def _mine_targets(
     session_id: str,
     *,
     all_sessions: bool,
+    include_excluded: bool = False,
 ) -> list[tuple[Host, str]]:
     hosts = (
         lay.list_normalized_hosts()
@@ -821,10 +843,32 @@ def _mine_targets(
         targets: list[tuple[Host, str]] = []
         for h in hosts:
             targets.extend((h, sid) for sid in lay.list_normalized(h))
-        return targets
+        return _included_mining_targets(lay, targets, include_excluded)
     if len(hosts) != 1:
         raise typer.BadParameter("When host is *, session_id must be * or --all must be used")
-    return [(hosts[0], session_id)]
+    return _included_mining_targets(
+        lay,
+        [(hosts[0], session_id)],
+        include_excluded,
+    )
+
+
+def _included_mining_targets(
+    lay: Layout,
+    targets: list[tuple[Host, str]],
+    include_excluded: bool,
+) -> list[tuple[Host, str]]:
+    if include_excluded:
+        return targets
+    catalog = load_catalog(lay)
+    return [
+        (host, session_id)
+        for host, session_id in targets
+        if not (
+            (record := catalog.get(f"{host}/{session_id}"))
+            and record.excluded
+        )
+    ]
 
 
 # ---- benchmark ---------------------------------------------------------------
@@ -1605,33 +1649,32 @@ def config_set(
     value: str = typer.Argument(...),
 ) -> None:
     """Update one per-user setting."""
-    current = load_config()
-    values = current.to_dict()
     normalized = key.lower().replace("_", "-")
+    updates: dict[str, object]
     if normalized == "archive-root":
-        values["archive_root"] = str(Path(value).expanduser().resolve())
+        updates = {"archive_root": str(Path(value).expanduser().resolve())}
     elif normalized == "dashboard-dir":
-        values["dashboard_dir"] = str(Path(value).expanduser().resolve())
+        updates = {"dashboard_dir": str(Path(value).expanduser().resolve())}
     elif normalized == "sync-interval":
         from .schedule import parse_interval
 
-        values["sync_interval_seconds"] = parse_interval(value)
+        updates = {"sync_interval_seconds": parse_interval(value)}
     elif normalized == "derived-interval":
         from .schedule import parse_interval
 
-        values["derived_interval_seconds"] = parse_interval(value)
+        updates = {"derived_interval_seconds": parse_interval(value)}
     elif normalized == "sync-on-login":
         lowered = value.lower()
         if lowered not in {"true", "false", "yes", "no", "1", "0"}:
             raise typer.BadParameter("sync-on-login must be true or false")
-        values["sync_on_login"] = lowered in {"true", "yes", "1"}
+        updates = {"sync_on_login": lowered in {"true", "yes", "1"}}
     else:
         raise typer.BadParameter(
             "key must be archive-root, dashboard-dir, sync-interval, "
             "derived-interval, or sync-on-login"
         )
-    updated = RetroConfig(**values)
-    path = save_config(updated)
+    update_config(**updates)
+    path = config_path()
     console.print(f"[green]updated[/green] {path}")
 
 
@@ -1662,13 +1705,10 @@ def setup_cmd(
     current = load_config()
     interval = parse_interval(periodic)
     derived_interval = parse_interval(derived_every)
-    config = RetroConfig(
-        archive_root=str(
-            (archive_root or Path(current.archive_root)).expanduser().resolve()
-        ),
-        dashboard_dir=str(
-            (dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()
-        ),
+    config = dataclasses.replace(
+        current,
+        archive_root=str((archive_root or Path(current.archive_root)).expanduser().resolve()),
+        dashboard_dir=str((dashboard_dir or Path(current.dashboard_dir)).expanduser().resolve()),
         sync_interval_seconds=interval,
         derived_interval_seconds=derived_interval,
         sync_on_login=True,
@@ -1824,16 +1864,7 @@ def schedule_install(
     from .schedule import install_schedule, parse_interval
 
     interval = parse_interval(every)
-    config = load_config()
-    save_config(
-        RetroConfig(
-            archive_root=config.archive_root,
-            dashboard_dir=config.dashboard_dir,
-            sync_interval_seconds=interval,
-            derived_interval_seconds=config.derived_interval_seconds,
-            sync_on_login=config.sync_on_login,
-        )
-    )
+    update_config(sync_interval_seconds=interval)
     path = install_schedule(interval)
     console.print(f"[green]schedule installed:[/green] {path}")
 
@@ -2196,7 +2227,9 @@ def memory_reindex(
     from .memory_store import reindex
 
     lay = _layout(root)
-    report = reindex(lay)
+    with exclusive_lock(user_state_dir() / "archive.lock"):
+        update_catalog(lay)
+        report = reindex(lay)
     console.print(f"[green]indexed {report.indexed} memories[/green]")
     console.print(f"  items.jsonl records: {report.source_records}")
     console.print(f"  mined artifacts:     {report.mined_records}")

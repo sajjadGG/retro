@@ -30,6 +30,7 @@ BENCHMARK_ATTEMPT_SCHEMA = "retro-benchmark-attempt-v1"
 _PINNED_IMAGE_RE = re.compile(r"^(?:[^@\s]+@)?sha256:[0-9a-f]{64}$")
 
 REJECTION_CODES: tuple[str, ...] = (
+    "EXCLUDED_BY_CATALOG",
     "NO_NORMALIZED_ROLLOUT",
     "NO_REPO_CWD",
     "NOT_GIT_REPOSITORY",
