@@ -1,0 +1,192 @@
+{
+  "schema": 2,
+  "version": "sig-v2-0001",
+  "signals": [
+    {
+      "id": "usage.cost_usd",
+      "title": "Estimated cost",
+      "category": "usage",
+      "kind": "money",
+      "unit": "usd",
+      "polarity": "lower_better",
+      "method": "exact",
+      "version": 1,
+      "description": "Estimated provider cost.",
+      "categories": null
+    },
+    {
+      "id": "usage.tokens_total",
+      "title": "Total tokens",
+      "category": "usage",
+      "kind": "count",
+      "unit": "tokens",
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "All billed tokens.",
+      "categories": null
+    },
+    {
+      "id": "usage.duration_s",
+      "title": "Wall duration",
+      "category": "usage",
+      "kind": "duration",
+      "unit": "seconds",
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "Session wall time.",
+      "categories": null
+    },
+    {
+      "id": "usage.active_s",
+      "title": "Active time",
+      "category": "usage",
+      "kind": "duration",
+      "unit": "seconds",
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "Capped inter-event time.",
+      "categories": null
+    },
+    {
+      "id": "activity.user_turns",
+      "title": "User turns",
+      "category": "activity",
+      "kind": "count",
+      "unit": "count",
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "User-authored messages.",
+      "categories": null
+    },
+    {
+      "id": "activity.tool_calls",
+      "title": "Tool calls",
+      "category": "activity",
+      "kind": "count",
+      "unit": "count",
+      "polarity": "neutral",
+      "method": "exact",
+      "version": 1,
+      "description": "Tool invocations.",
+      "categories": null
+    },
+    {
+      "id": "activity.file_edits",
+      "title": "File edits",
+      "category": "activity",
+      "kind": "count",
+      "unit": "count",
+      "polarity": "higher_better",
+      "method": "heuristic",
+      "version": 1,
+      "description": "Edits applied.",
+      "categories": null
+    },
+    {
+      "id": "activity.files_touched",
+      "title": "Files touched",
+      "category": "activity",
+      "kind": "count",
+      "unit": "count",
+      "polarity": "neutral",
+      "method": "heuristic",
+      "version": 1,
+      "description": "Distinct files read or written.",
+      "categories": null
+    },
+    {
+      "id": "outcome.status",
+      "title": "Outcome",
+      "category": "outcome",
+      "kind": "category",
+      "unit": null,
+      "polarity": "higher_better",
+      "method": "heuristic",
+      "version": 1,
+      "description": "How the session ended.",
+      "categories": [
+        "success",
+        "partial",
+        "failed",
+        "abandoned",
+        "unknown"
+      ]
+    },
+    {
+      "id": "outcome.committed",
+      "title": "Committed",
+      "category": "outcome",
+      "kind": "boolean",
+      "unit": null,
+      "polarity": "higher_better",
+      "method": "exact",
+      "version": 1,
+      "description": "A commit was created.",
+      "categories": null
+    },
+    {
+      "id": "friction.user_corrections",
+      "title": "User corrections",
+      "category": "friction",
+      "kind": "count",
+      "unit": "count",
+      "polarity": "lower_better",
+      "method": "regex",
+      "version": 1,
+      "description": "User messages that correct the agent.",
+      "categories": null
+    },
+    {
+      "id": "friction.tool_error_rate",
+      "title": "Tool error rate",
+      "category": "friction",
+      "kind": "ratio",
+      "unit": "ratio",
+      "polarity": "lower_better",
+      "method": "exact",
+      "version": 1,
+      "description": "Share of tool calls that failed.",
+      "categories": null
+    },
+    {
+      "id": "risk.secret_exposure",
+      "title": "Secret exposure",
+      "category": "risk",
+      "kind": "boolean",
+      "unit": null,
+      "polarity": "lower_better",
+      "method": "regex",
+      "version": 1,
+      "description": "A secret appeared in the transcript.",
+      "categories": null
+    },
+    {
+      "id": "work.kind",
+      "title": "Work kind",
+      "category": "work",
+      "kind": "category",
+      "unit": null,
+      "polarity": "neutral",
+      "method": "llm",
+      "version": 1,
+      "description": "Dominant kind of work.",
+      "categories": [
+        "build",
+        "debug",
+        "refactor",
+        "test",
+        "explore",
+        "review",
+        "docs",
+        "ops",
+        "research",
+        "chat",
+        "other"
+      ]
+    }
+  ]
+}

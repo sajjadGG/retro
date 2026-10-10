@@ -168,11 +168,29 @@ def test_extension_import_command_routes_provider(monkeypatch, tmp_path: Path):
     assert (root / "normalized/opencode/session-1.events.jsonl").is_file()
 
 
-def test_dashboard_view_non_interactive():
-    result = runner.invoke(app, ["dashboard", "view"])
-    assert result.exit_code == 0
-    assert "Retro Rollout Dashboard" in result.output or "Retro Portfolio Dashboard" in result.output
-    assert "Imported Sessions Summary" in result.output
+def test_dashboard_view_non_interactive(tmp_path):
+    archive = Path(__file__).parent / "fixtures" / "dashboard-archive"
+    result = runner.invoke(app, ["dashboard", "view", "--root", str(archive), "--no-interactive"])
+    assert result.exit_code == 0, result.output
+    assert "retro dashboard" in result.output
+    assert "sessions shown" in result.output
+    assert "projects" in result.output
+
+
+def test_dashboard_build_writes_a_published_generation(tmp_path):
+    archive = Path(__file__).parent / "fixtures" / "dashboard-archive"
+    out = tmp_path / "dashboard"
+    result = runner.invoke(app, ["dashboard", "build", "--root", str(archive), "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert "dashboard ready" in result.output
+    assert (out / "index.html").exists()
+    assert (out / "data" / "manifest.js").exists()
+    assert (out / "current").is_symlink()
+
+    bad = runner.invoke(
+        app, ["dashboard", "build", "--mode", "nope", "--root", str(archive), "--out", str(out)]
+    )
+    assert bad.exit_code != 0
 
 
 def test_analyze_command(tmp_path):

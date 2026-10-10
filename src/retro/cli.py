@@ -12,7 +12,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import sys
 from collections import Counter
 from pathlib import Path
 from typing import Optional
@@ -130,12 +129,6 @@ memory_app = typer.Typer(
     help="Build and query the local memory index.",
 )
 app.add_typer(memory_app, name="memory")
-
-quest_app = typer.Typer(
-    no_args_is_help=True,
-    help="Manage daily quests and streaks.",
-)
-app.add_typer(quest_app, name="quest")
 
 config_app = typer.Typer(no_args_is_help=True, help="Inspect and update per-user configuration.")
 app.add_typer(config_app, name="config")
@@ -2107,61 +2100,60 @@ def dashboard_build(
     mode: str = typer.Option(
         "auto",
         "--mode",
-        help="Cost mode: auto, calculate, or display.",
+        help="auto reuses unchanged session-detail shards; full rebuilds every shard.",
     ),
-    root: Optional[Path] = typer.Option(
-        None,
-        help="rollout-memory root (default ./rollout-memory)",
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    out: Optional[Path] = typer.Option(None, "--out", help="dashboard directory"),
+    publish: bool = typer.Option(
+        True,
+        "--publish/--no-publish",
+        help="Publish a new generation atomically, or write straight into --out.",
     ),
-    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
 ):
-    """Build dashboard/data/rollouts.json and dashboard/index.html."""
-    if mode not in {"auto", "calculate", "display"}:
-        raise typer.BadParameter("mode must be one of: auto, calculate, display")
+    """Build the static dashboard from the session catalog and the signal store."""
+    from .dashboard import BUILD_MODES, build_dashboard
 
-    from .dashboard_build import build as build_dashboard_html
+    if mode not in BUILD_MODES:
+        raise typer.BadParameter(f"mode must be one of: {', '.join(BUILD_MODES)}")
 
-    index_path = build_dashboard_html(
-        mode=mode,
-        artifact_root=root,
-        out_dir=resolve_dashboard_dir(out),
+    layout = _layout(root)
+    report = build_dashboard(layout, resolve_dashboard_dir(out), mode=mode, publish=publish)
+    console.print(f"[green]dashboard ready:[/green] {report.index_path}")
+    console.print(
+        f"  sessions={report.sessions:,} included={report.included:,} "
+        f"scored={report.with_signals:,} signals={report.signal_definitions}"
     )
-    console.print(f"[green]dashboard ready:[/green] {index_path}")
-
-
-@dashboard_app.command("experiments")
-def dashboard_experiments(
-    root: Optional[Path] = typer.Option(
-        None,
-        help="rollout-memory root (default ./rollout-memory)",
-    ),
-    out: Optional[Path] = typer.Option(None, help="output directory (default ./dashboard)"),
-):
-    """Build the experimental trajectory-signals page (trajectory_experiments.html)."""
-    from .dashboard_experiments import build as build_experiments_html
-
-    html_path = build_experiments_html(
-        artifact_root=root,
-        out_dir=resolve_dashboard_dir(out),
+    console.print(
+        f"  shards: sessions={report.session_shards} signals={report.signal_shards} "
+        f"detail={report.detail_shards} (reused {report.detail_cached})"
     )
-    console.print(f"[green]experiments page ready:[/green] {html_path}")
+    console.print(
+        f"  size={report.bytes_total / 1_048_576:.1f} MiB "
+        f"index={report.index_bytes / 1024:.0f} KiB in {report.duration_s:.1f}s"
+    )
+    for warning in report.warnings:
+        console.print(f"[yellow]  ! {warning}[/yellow]")
 
 
 @dashboard_app.command("view")
 def dashboard_view(
-    mode: str = typer.Option(
-        "auto",
-        "--mode",
-        help="Cost mode: auto, calculate, or display.",
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    limit: int = typer.Option(25, "--limit", help="rows per table"),
+    interactive: Optional[bool] = typer.Option(
+        None,
+        "--interactive/--no-interactive",
+        help="Force or suppress the interactive loop (default: auto-detect a TTY).",
     ),
 ):
-    """View the rollout dashboard interactively in the terminal."""
-    if mode not in {"auto", "calculate", "display"}:
-        raise typer.BadParameter("mode must be one of: auto, calculate, display")
+    """Browse the catalog, projects, sessions and signals in the terminal."""
+    from .dashboard import run_terminal_dashboard
 
-    from .dashboard_terminal import run_terminal_dashboard
-
-    run_terminal_dashboard(mode=mode)
+    run_terminal_dashboard(
+        _layout(root),
+        interactive=interactive,
+        console=console,
+        limit=limit,
+    )
 
 
 @app.command("analyze")
@@ -2367,107 +2359,6 @@ def callback(
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ):
     """retro: local-first coding agent session capture and memory tool."""
-    # Print streak message on execution if in a TTY
-    if sys.stdout.isatty():
-        try:
-            from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-            lay = default_layout(root)
-            state = load_quest_state(lay)
-            gen_new = ensure_daily_quests(lay, state)
-            if gen_new:
-                save_quest_state(lay, state)
-            
-            streak = state.get("streak_count", 0)
-            active_quests_count = sum(1 for q in state.get("daily_quests", []) if q["status"] == "active")
-            if active_quests_count > 0:
-                console.print(
-                    f"[bold teal]\\[retro][/bold teal] Streak: {streak} Days. "
-                    f"{active_quests_count} New Quests Available."
-                )
-        except Exception:
-            pass
-
-
-@quest_app.command("list")
-def quest_list(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """List active daily quests, progression, and streak count."""
-    from .quest import ensure_daily_quests, load_quest_state, save_quest_state
-    lay = _layout(root)
-    state = load_quest_state(lay)
-    ensure_daily_quests(lay, state)
-    save_quest_state(lay, state)
-
-    console.print()
-    console.print("[bold teal]Operator Ranks & Progression[/bold teal]")
-    console.print(f"  Current Rank:   [bold green]{state.get('user_level')}[/bold green]")
-    console.print(f"  Streak Count:   [bold yellow]{state.get('streak_count')} Days[/bold yellow]")
-    console.print(f"  Streak Freezes: [bold cyan]{state.get('streak_freezes', 0)}[/bold cyan]")
-    console.print(f"  Experience:     [bold]{state.get('experience_points')} XP[/bold]")
-    console.print()
-
-    console.print("[bold]Active Daily Quests:[/bold]")
-    quests = state.get("daily_quests", [])
-    if not quests:
-        console.print("  No quests available.")
-    else:
-        for q in quests:
-            is_comp = q["status"] == "completed"
-            status_str = "[green]Completed[/green]" if is_comp else "[yellow]Active[/yellow]"
-            console.print(f"  • [bold]{q['name']}[/bold] ({status_str})")
-            console.print(f"    Objective: {q['objective']}")
-            console.print(f"    Rationale: {q['rationale']}")
-            console.print()
-
-
-@quest_app.command("verify")
-def quest_verify(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """Run local metrics checks to verify active daily quests."""
-    from .quest import load_quest_state, save_quest_state, verify_quests
-    lay = _layout(root)
-    state = load_quest_state(lay)
-
-    report = verify_quests(lay, state)
-    save_quest_state(lay, state)
-
-    console.print()
-    console.print("[bold teal]Quest Verification Summary[/bold teal]")
-    console.print()
-
-    for q, verified, reason in report["results"]:
-        status_str = "[green]✓ Verified[/green]" if verified else "[red]✗ Not Verified[/red]"
-        console.print(f"  • [bold]{q['name']}[/bold]: {status_str}")
-        console.print(f"    {reason}")
-        console.print()
-
-    if report["xp_gained"] > 0:
-        console.print(f"[bold green]+{report['xp_gained']} XP Gained![/bold green]")
-        console.print(
-            f"New Experience: [bold]{report['new_xp']} XP[/bold] "
-            f"(Rank: [bold]{report['new_level']}[/bold])"
-        )
-        for q_id in report["now_completed_ids"]:
-            console.print(f"Completed Quest: [bold]{q_id}[/bold]")
-    else:
-        console.print("No quests verified this run. Keep working on them!")
-    console.print()
-
-
-@quest_app.command("buy-freeze")
-def quest_buy_freeze(
-    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
-):
-    """Purchase a Streak Freeze to protect your streak on inactive days (costs 200 XP)."""
-    from .quest import buy_streak_freeze, load_quest_state, save_quest_state
-    lay = _layout(root)
-    state = load_quest_state(lay)
-
-    msg = buy_streak_freeze(state)
-    save_quest_state(lay, state)
-    console.print(msg)
 
 
 if __name__ == "__main__":

@@ -807,24 +807,26 @@ Optional embeddings are still intentionally out of the core path for now; keywor
 
 ## Dashboard
 
-A static, local HTML dashboard reads everything under `rollout-memory/` and produces:
+A static, offline dashboard over the session catalog and the signal store — no server, no
+bundler, no network. It opens straight from disk.
 
-- KPI strip (sessions, days, events, tool calls, tokens, est. cost).
-- Signals panel (color-coded by group, per-signal aggregates across sessions).
-- Activity-by-day bars.
-- Searchable / filterable session table.
-- Per-session drill-down with tabs: **Summary**, **Models**, **Signals**, **Transcript**, **Memory**.
-- Indexed memory sections for counts, top utility, lifecycle events, and source-session drill-downs when `retro memory reindex` has been run.
+| Page | Answers |
+| --- | --- |
+| Overview | What happened recently across all agents and projects, versus the previous period: sessions, active hours, estimated cost, outcome mix, work-kind mix, notable movers, streak |
+| Projects | Which projects cost time and money; one row per consolidated project (worktrees, clones and symlinked paths collapse into one), with the per-agent split, success rate, tool error rate and last activity |
+| Sessions | Every captured session, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable and virtualized for tens of thousands of rows, with toggles for excluded sessions and subagent roll-up |
+| Session | One session: header, tags and why each was applied, inline markers, signals grouped by category with evidence event ids, the subagent tree, and links to the transcript, normalized events and raw capture in the archive |
+| Signals | Every signal in `signals/definitions.json` with its distribution, compared across agents, clients, projects, models or work kinds with a minimum-sample guard |
+| Data quality | Why sessions were excluded (by tag and rule, with examples), interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run with its failures |
 
-The **Models** tab shows the per-model token + cost breakdown (input / cache_create / cache_read / output / total / cost) for each session.
+The build reads only derived files — `catalog/sessions.jsonl`, `signals/definitions.json`,
+`signals/sessions.jsonl` and the newest `sync/runs/*.json` — never the normalized event
+stream, so it stays fast as the archive grows. Rendered transcripts are linked in place and
+never copied.
 
-Portfolio totals and host/day aggregates cover every normalized session. To
-keep large archives responsive, the interactive table carries the 1,000 newest
-session details and the memory browser carries the 2,000 highest-ranked
-candidates. The table reports this explicitly as “showing N of total.”
-Transcripts are linked from the archive and loaded only when requested from a
-session's **Transcript** tab; they are not duplicated into every dashboard
-generation. Atomic publication retains the current and previous generations.
+Session rows are shipped as a compact fact table in `data/sessions-*.js` shards; the browser
+does the slicing and aggregation. Per-session detail lives in hashed buckets that are rebuilt
+only when a session's catalog fingerprint changes. `index.html` is a two-kilobyte shell.
 
 ### Preview
 
@@ -835,30 +837,27 @@ generation. Atomic publication retains the current and previous generations.
 ### Build
 
 ```bash
-# Default mode: auto (use embedded cost when present, else compute from tokens)
+# Build and publish a new generation (reuses unchanged detail shards)
 retro dashboard build
 
-# Force recomputation from token counts
-retro dashboard build --mode calculate
+# Rebuild every shard
+retro dashboard build --mode full
 
-# Show only provider-embedded costUSD; None when missing
-retro dashboard build --mode display
-
-# Build from a non-default artifact root / to a non-default output directory
+# Build from a non-default archive / into a non-default output directory
 retro dashboard build --root /path/to/rollout-memory --out /path/to/output
 
-# Module form (the builder ships inside the package; works from any install)
-RETRO_COST_MODE=calculate python -m retro.dashboard_build
-python -m retro.dashboard_build --artifact-root /path/to/rollout-memory
-
-# Experimental: trajectory-signals page (trajectory_experiments.html)
-retro dashboard experiments
+# Write straight into --out without the generation swap
+retro dashboard build --no-publish
 ```
 
-The artifact root and dashboard output come from the per-user config. Override
-either for one command with `--root` and `--out`.
+The archive root and dashboard output come from the per-user config; override either for one
+command with `--root` and `--out`. Then open the configured `dashboard/index.html` directly
+from disk. Each build stages into a temporary directory and swaps the `current` symlink
+atomically, keeping at most two generations.
 
-Then open the configured `dashboard/index.html` directly from disk.
+```bash
+retro dashboard view     # the same data in the terminal
+```
 
 ### Cost computation
 
@@ -956,11 +955,16 @@ src/retro/
   analyzer.py            # command/tool pattern analysis + operator diagnostics
   memory_store.py        # SQLite memory index (FTS5, wiki-links, weave)
   llm.py                 # headless `codex exec` helper
-  quest.py               # daily quests / streak progression (experimental)
   trajectory.py          # trajectory extraction for experimental signals
-  dashboard_build.py     # static HTML + rollouts.json builder (`retro dashboard build`)
-  dashboard_experiments.py  # trajectory-signals page (experimental)
-  dashboard_terminal.py  # interactive terminal dashboard (`retro dashboard view`)
+  dashboard/
+    inputs.py            # readers for catalog/, signals/, sync/runs/
+    facts.py             # fact table, signal matrix, quality aggregates
+    metrics.py           # shared aggregation helpers
+    shards.py            # data/*.js shard writers + detail bucket cache
+    build.py             # build orchestration
+    publish.py           # atomic generation publication
+    terminal.py          # interactive terminal view (`retro dashboard view`)
+    assets/              # index.html, app.css, core.js, views.js, app.js
   pricing/
     litellm-pricing.json # bundled LiteLLM rates snapshot
   importers/
@@ -982,11 +986,8 @@ src/retro/
       risk_aware.py      # prune high-risk / low-confidence / near-duplicates
 
 dashboard/
-  build_dashboard.py     # back-compat shim → retro.dashboard_build
   pricing/refresh.py     # refresh the bundled snapshot from upstream LiteLLM
   README.md
-  index.html             # generated
-  data/rollouts.json     # generated
 
 specs/                    # design docs (see top of this README)
 rollout-memory/          # captured artifacts (gitignored)

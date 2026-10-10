@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>retro dashboard</title>
+<link rel="stylesheet" href="assets/app.css">
+<script>
+window.RETRO = {data: {}, waiters: {}, loading: {}, failed: {}};
+function RETRO_DATA(name, payload) {
+  window.RETRO.data[name] = payload;
+  var queue = window.RETRO.waiters[name];
+  if (queue) {
+    delete window.RETRO.waiters[name];
+    for (var i = 0; i < queue.length; i++) { queue[i](payload); }
+  }
+}
+</script>
+</head>
+<body>
+<a class="skip" href="#view">Skip to content</a>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">▚</span>
+    <span>retro</span>
+  </div>
+  <nav class="nav" aria-label="Primary">
+    <a href="#/overview" data-route="overview">Overview</a>
+    <a href="#/projects" data-route="projects">Projects</a>
+    <a href="#/sessions" data-route="sessions">Sessions</a>
+    <a href="#/signals" data-route="signals">Signals</a>
+    <a href="#/quality" data-route="quality">Data quality</a>
+  </nav>
+  <div class="topbar-right">
+    <span class="loadstate" id="loadstate" role="status" aria-live="polite"></span>
+    <button type="button" id="theme" class="ghost" aria-pressed="false" title="Toggle theme (t)">◐</button>
+  </div>
+</header>
+<div id="banner" class="banner" hidden></div>
+<main id="view" tabindex="-1"></main>
+<footer class="footer">
+  <span id="footer-build"></span>
+  <span class="hint">keys: <kbd>/</kbd> search · <kbd>g</kbd> then <kbd>o p s i q</kbd> · <kbd>t</kbd> theme · <kbd>?</kbd> help</span>
+</footer>
+<div id="help" class="modal" hidden role="dialog" aria-modal="true" aria-label="Keyboard help"></div>
+<script src="data/manifest.js"></script>
+<script src="assets/core.js"></script>
+<script src="assets/views.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

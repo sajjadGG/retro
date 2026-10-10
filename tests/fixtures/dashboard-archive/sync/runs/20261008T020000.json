@@ -1,0 +1,22 @@
+{
+  "started_at": "2026-10-08T02:00:00+00:00",
+  "completed_at": "2026-10-09T02:14:00+00:00",
+  "status": "ok",
+  "scheduled": true,
+  "archive_root": "/archive",
+  "dashboard_dir": "/dash",
+  "free_bytes": 37200158720,
+  "imported": [
+    "codex/019d0001-0000-7000-8000-000000000001"
+  ],
+  "unchanged": [],
+  "rendered": [],
+  "revisions": [],
+  "failures": [],
+  "signals_recomputed": true,
+  "memory_reindexed": false,
+  "dashboard_rebuilt": false,
+  "derived_deferred": false,
+  "pending_sessions": [],
+  "warning": null
+}

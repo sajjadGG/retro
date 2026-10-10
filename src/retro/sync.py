@@ -938,12 +938,9 @@ def _memory_source_signature(layout: Layout) -> str:
 
 
 def _rebuild_dashboard_atomically(layout: Layout, output_dir: Path) -> None:
-    from .dashboard_publish import build_and_publish_dashboard
+    from .dashboard import build_and_publish
 
-    build_and_publish_dashboard(
-        artifact_root=layout.root,
-        output_dir=output_dir,
-    )
+    build_and_publish(layout, output_dir)
 
 
 def _write_run_report(layout: Layout, report: SyncReport) -> None:

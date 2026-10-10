@@ -32,6 +32,7 @@ Key packages under `src/retro/`:
 | `signals/` | Evaluators that emit readings (numeric/boolean/categorical) about a session |
 | `mining/` | Methods that extract reusable memory candidates from normalized events |
 | `renderer.py` | Markdown transcript renderer |
+| `dashboard/` | Static dashboard over `catalog/` + `signals/` (readers, fact table, shard writers, atomic publish, terminal view, assets) |
 | `cli.py` | Typer CLI entry point |
 
 ## Plugin system

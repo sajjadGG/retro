@@ -1,237 +1,211 @@
-"""End-to-end tests for the packaged dashboard builder."""
-
+"""Dashboard build output: shards, manifest, incremental detail buckets, smoke checks."""
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
-import retro.dashboard_build as dashboard_build_module
-from retro.dashboard_build import PricingMap, build
-from retro.dashboard_experiments import build as build_experiments
-from retro.dashboard_publish import build_and_publish_dashboard
-from retro.schema import NormalizedEvent, RawRef, write_events
-from retro.signals import run_signals, write_signal_artifacts
+import pytest
+
+from retro.dashboard.build import build, copy_assets
+from retro.dashboard.facts import COLUMNS
+from retro.dashboard.shards import js_payload
 from retro.storage import Layout
+from tests.dashboard_helpers import archive, empty_archive, read_shard  # noqa: F401
+
+KEY_MAIN = "codex/019d0001-0000-7000-8000-000000000001"
 
 
-def test_build_empty_artifact_root(tmp_path: Path):
-    artifact_root = tmp_path / "rollout-memory"
-    artifact_root.mkdir()
-    out_dir = tmp_path / "dashboard"
-
-    index_path = build(artifact_root=artifact_root, out_dir=out_dir)
-
-    assert index_path == out_dir / "index.html"
-    assert index_path.exists()
-    payload = json.loads((out_dir / "data" / "rollouts.json").read_text(encoding="utf-8"))
-    assert payload["sessions"] == []
-    assert payload["cost_mode"] == "auto"
+@pytest.fixture
+def built(archive: Layout, tmp_path: Path):  # noqa: F811
+    out = tmp_path / "dashboard"
+    report = build(archive, out, cache_dir=tmp_path / "cache")
+    return out, report
 
 
-def test_build_rejects_unknown_mode(tmp_path: Path):
-    try:
-        build(mode="bogus", artifact_root=tmp_path, out_dir=tmp_path / "out")
-    except ValueError as exc:
-        assert "bogus" in str(exc)
-    else:
-        raise AssertionError("expected ValueError for unknown mode")
+def manifest_of(out: Path) -> dict:
+    name, payload = read_shard(out / "data" / "manifest.js")
+    assert name == "manifest"
+    return payload
 
 
-def test_pricing_snapshot_ships_with_package():
-    pricing = PricingMap.load()
-    # The bundled LiteLLM snapshot must resolve rates without DEFAULT_RATES.
-    rates = pricing.rates_for("gpt-5")
-    assert rates["input"] > 0
-    assert rates["output"] > 0
+def test_build_emits_a_small_shell_and_assets(built):
+    out, report = built
+    assert report.index_path == out / "index.html"
+    assert report.index_bytes < 300 * 1024
+    html = (out / "index.html").read_text(encoding="utf-8")
+    for reference in re.findall(r'(?:src|href)="([^"]+)"', html):
+        if reference.startswith("#"):
+            continue
+        assert (out / reference).exists(), reference
+    assert "type=\"module\"" not in html
+    assert "http://" not in html and "https://" not in html
 
 
-def test_build_includes_vscode_copilot_usage(copilot_imported, tmp_path: Path):
-    layout, session_id = copilot_imported
-    out_dir = tmp_path / "dashboard"
-
-    index_path = build(artifact_root=layout.root, out_dir=out_dir)
-
-    payload = json.loads((out_dir / "data" / "rollouts.json").read_text(encoding="utf-8"))
-    assert payload["summary"]["by_host"] == {"vscode-copilot": 1}
-    session = payload["sessions"][0]
-    assert session["session_id"] == session_id
-    assert session["host"] == "vscode-copilot"
-    assert session["tokens"]["input_tokens"] == 120
-    assert session["tokens"]["output_tokens"] == 30
-    assert session["tokens"]["total_tokens"] == 150
-    assert session["tokens"]["copilot_credits"] == 1.25
-    assert session["models"] == ["copilot/gpt-5.4"]
-    assert session["project_name"] == "demo"
-    assert session["estimated_cost_usd"] > 0
-    html = index_path.read_text(encoding="utf-8")
-    assert "VS Code Copilot" in html
-    assert "badge.vscode-copilot" in html
+def test_manifest_describes_the_fact_table(built):
+    out, _ = built
+    manifest = manifest_of(out)
+    assert manifest["schema"] == 1
+    assert manifest["columns"] == list(COLUMNS)
+    assert manifest["counts"]["sessions"] == 8
+    assert manifest["counts"]["included"] == 6
+    assert manifest["dict"]["agents"]
+    assert manifest["signals"]["version"] == "sig-v2-0001"
+    assert "usage.cost_usd" in manifest["signals"]["headline"]
+    assert manifest["signals"]["encodings"]["outcome.status"]["encoding"] == "cat"
+    assert manifest["quality"]["excluded"] == 2
+    assert manifest["sync"]["latest"]["status"] == "failed"
+    assert manifest["archive"]["url"].startswith("file://")
 
 
-def test_build_includes_copilot_agent_host_usage(
-    copilot_cli_imported,
-    tmp_path: Path,
-):
-    layout, session_id = copilot_cli_imported
-    out_dir = tmp_path / "dashboard"
+def test_every_declared_shard_exists_and_parses(built):
+    out, _ = built
+    manifest = manifest_of(out)
+    total = 0
+    for shard in manifest["shards"]["sessions"]:
+        name, payload = read_shard(out / shard["file"])
+        assert name == "sessions:" + str(shard["shard"])
+        assert len(payload["rows"]) == shard["rows"]
+        total += len(payload["rows"])
+        for row in payload["rows"]:
+            assert len(row) == len(COLUMNS)
+    assert total == manifest["counts"]["sessions"]
 
-    index_path = build(artifact_root=layout.root, out_dir=out_dir)
+    for shard in manifest["shards"]["signals"]:
+        name, payload = read_shard(out / shard["file"])
+        assert name == "signals:" + str(shard["shard"])
+        for values in payload["signals"].values():
+            assert len(values) % 2 == 0
 
-    payload = json.loads((out_dir / "data" / "rollouts.json").read_text(encoding="utf-8"))
-    assert payload["summary"]["by_host"] == {"vscode-copilot": 1}
-    assert payload["summary"]["by_source"] == {"copilot-cli": 1}
-    session = payload["sessions"][0]
-    assert session["session_id"] == session_id
-    assert session["source_kind"] == "copilot-cli"
-    assert session["active"] is True
-    assert session["tokens"]["input_tokens"] == 430
-    assert session["tokens"]["output_tokens"] == 150
-    assert session["tokens"]["cached_input_tokens"] == 1000
-    assert session["tokens"]["cache_creation_tokens"] == 70
-    assert session["tokens"]["reasoning_output_tokens"] == 35
-    assert session["tokens"]["total_tokens"] == 1650
-    assert session["tokens"]["copilot_credits"] == 1.5
-    assert set(session["tokens_by_model"]) == {
-        "gpt-5.6-sol",
-        "claude-sonnet-5",
-    }
-    assert session["estimated_cost_usd"] > 0
-    html = index_path.read_text(encoding="utf-8")
-    assert "active snapshot" in html
-    assert "copilot-cli" in html
+    for path in (out / "data" / "detail").glob("*.js"):
+        name, payload = read_shard(path)
+        assert name.startswith("detail:")
+        assert payload["sessions"]
 
 
-def test_build_includes_extension_host_in_dynamic_summary(tmp_path: Path):
-    layout = Layout(tmp_path / "archive")
-    write_events(
-        layout.normalized_path("opencode", "session-1"),
-        [
-            NormalizedEvent(
-                event_id="message-1",
-                session_id="session-1",
-                host="opencode",
-                sequence=1,
-                actor="user",
-                event_type="message",
-                summary="hello",
-                raw_ref=RawRef(
-                    path="raw/opencode/session-1/session.jsonl",
-                    line=1,
-                ),
-                timestamp="2026-09-29T20:00:00Z",
-                payload={"text": "hello"},
-            )
-        ],
-    )
-    out_dir = tmp_path / "dashboard"
-
-    index_path = build(artifact_root=layout.root, out_dir=out_dir)
-
-    payload = json.loads((out_dir / "data" / "rollouts.json").read_text(encoding="utf-8"))
-    assert payload["summary"]["by_host"] == {"opencode": 1}
-    assert payload["summary"]["by_day"]["2026-09-29"]["sessions_by_host"] == {
-        "opencode": 1
-    }
-    html = index_path.read_text(encoding="utf-8")
-    assert "populateHostFilters" in html
-    assert "hostColor(host)" in html
-
-    write_signal_artifacts(layout, run_signals(layout))
-    experiments_path = build_experiments(
-        artifact_root=layout.root,
-        out_dir=out_dir,
-    )
-    experiments = json.loads(
-        (out_dir / "data" / "trajectory_experiments.json").read_text(encoding="utf-8")
-    )
-    assert experiments["sessions"][0]["host"] == "opencode"
-    assert "populateHosts" in experiments_path.read_text(encoding="utf-8")
+def test_detail_shards_hold_full_session_records(built):
+    out, _ = built
+    manifest = manifest_of(out)
+    bucket = None
+    for shard in manifest["shards"]["sessions"]:
+        _, payload = read_shard(out / shard["file"])
+        for row in payload["rows"]:
+            if row[0] == KEY_MAIN:
+                bucket = row[manifest["columns"].index("bucket")]
+    assert bucket is not None
+    _, detail = read_shard(out / "data" / "detail" / f"d-{bucket:04d}.js")
+    session = detail["sessions"][KEY_MAIN]
+    assert session["signals"]["evidence"]["outcome.status"] == ["ev-401", "ev-402"]
+    assert session["tag_sources"]["keep"] == ["marker"]
+    assert session["paths"]["transcript"].endswith(".md")
 
 
-def test_build_bounds_session_details_and_links_transcripts(
-    monkeypatch,
-    tmp_path: Path,
-):
-    layout = Layout(tmp_path / "archive")
-    for index in (1, 2):
-        session_id = f"session-{index}"
-        write_events(
-            layout.normalized_path("opencode", session_id),
-            [
-                NormalizedEvent(
-                    event_id=f"message-{index}",
-                    session_id=session_id,
-                    host="opencode",
-                    sequence=1,
-                    actor="user",
-                    event_type="message",
-                    summary=f"session {index}",
-                    raw_ref=RawRef(
-                        path=f"raw/opencode/{session_id}/session.jsonl",
-                        line=1,
-                    ),
-                    timestamp=f"2026-09-29T20:00:0{index}Z",
-                )
-            ],
-        )
-        rendered = layout.rendered_path("opencode", session_id)
-        rendered.parent.mkdir(parents=True, exist_ok=True)
-        rendered.write_text(
-            f"TRANSCRIPT-CONTENT-{index}\n",
-            encoding="utf-8",
-        )
-    monkeypatch.setattr(
-        dashboard_build_module,
-        "DASHBOARD_SESSION_LIMIT",
-        1,
-    )
-    out_dir = tmp_path / "dashboard"
-
-    index_path = build(artifact_root=layout.root, out_dir=out_dir)
-
-    payload = json.loads((out_dir / "data" / "rollouts.json").read_text(encoding="utf-8"))
-    assert payload["summary"]["session_count"] == 2
-    assert payload["summary"]["sessions_in_payload"] == 1
-    assert len(payload["sessions"]) == 1
-    assert "rendered_markdown" not in payload["sessions"][0]
-    assert payload["sessions"][0]["rendered_href"].startswith("rendered/opencode/")
-    html = index_path.read_text(encoding="utf-8")
-    assert "TRANSCRIPT-CONTENT" not in html
-    assert "Load transcript here" in html
-    assert (out_dir / "rendered").is_symlink()
+def test_payload_escapes_script_terminators(tmp_path: Path):
+    path = tmp_path / "shard.js"
+    path.write_text(js_payload("x", {"title": "</script><img src=x>&"}), encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    assert "</script>" not in text and "&" not in text
+    name, payload = read_shard(path)
+    assert name == "x"
+    assert payload["title"] == "</script><img src=x>&"
 
 
-def test_atomic_publication_exposes_rendered_transcripts(tmp_path: Path):
-    layout = Layout(tmp_path / "archive")
-    write_events(
-        layout.normalized_path("opencode", "session-1"),
-        [
-            NormalizedEvent(
-                event_id="message-1",
-                session_id="session-1",
-                host="opencode",
-                sequence=1,
-                actor="user",
-                event_type="message",
-                summary="hello",
-                raw_ref=RawRef(
-                    path="raw/opencode/session-1/session.jsonl",
-                    line=1,
-                ),
-            )
-        ],
-    )
-    transcript = layout.rendered_path("opencode", "session-1")
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text("hello transcript\n", encoding="utf-8")
-    out_dir = tmp_path / "dashboard"
+def test_build_is_incremental_between_runs(archive: Layout, tmp_path: Path):  # noqa: F811
+    cache = tmp_path / "cache"
+    first = build(archive, tmp_path / "one", cache_dir=cache)
+    assert first.detail_written == first.detail_shards
+    assert first.detail_cached == 0
 
-    build_and_publish_dashboard(
-        artifact_root=layout.root,
-        output_dir=out_dir,
-    )
+    second = build(archive, tmp_path / "two", cache_dir=cache)
+    assert second.detail_cached == second.detail_shards
+    assert second.detail_written == 0
 
-    assert (out_dir / "rendered").is_symlink()
-    assert (
-        out_dir / "rendered" / "opencode" / "session-1.md"
-    ).read_text(encoding="utf-8") == "hello transcript\n"
+    path = archive.root / "catalog" / "sessions.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = [line.replace('"fingerprint": "fp-codex-1"', '"fingerprint": "fp-codex-1b"') for line in lines]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    third = build(archive, tmp_path / "three", cache_dir=cache)
+    assert third.detail_written == 1
+    assert third.detail_cached == third.detail_shards - 1
+
+
+def test_full_mode_rebuilds_every_detail_shard(archive: Layout, tmp_path: Path):  # noqa: F811
+    cache = tmp_path / "cache"
+    build(archive, tmp_path / "one", cache_dir=cache)
+    report = build(archive, tmp_path / "two", mode="full", cache_dir=cache)
+    assert report.detail_cached == 0
+    assert report.detail_written == report.detail_shards
+
+
+def test_cache_drops_buckets_that_no_longer_exist(archive: Layout, tmp_path: Path):  # noqa: F811
+    cache = tmp_path / "cache"
+    build(archive, tmp_path / "one", cache_dir=cache)
+    index = json.loads((cache / "index.json").read_text(encoding="utf-8"))
+    assert index["buckets"]
+    (archive.root / "catalog" / "sessions.jsonl").write_text("", encoding="utf-8")
+    build(archive, tmp_path / "two", cache_dir=cache)
+    index = json.loads((cache / "index.json").read_text(encoding="utf-8"))
+    assert index["buckets"] == {}
+    assert not list(cache.glob("d-*.js"))
+
+
+def test_build_warns_when_inputs_are_missing(empty_archive: Layout, tmp_path: Path):  # noqa: F811
+    report = build(empty_archive, tmp_path / "dashboard")
+    assert report.sessions == 0
+    assert any("catalog missing" in warning for warning in report.warnings)
+    assert any("signal store missing" in warning for warning in report.warnings)
+    manifest = manifest_of(tmp_path / "dashboard")
+    assert manifest["counts"]["sessions"] == 0
+
+
+def test_stale_signals_surface_as_a_warning(built):
+    _, report = built
+    assert any("older than their catalog fingerprint" in warning for warning in report.warnings)
+
+
+def test_build_never_copies_transcripts(built):
+    out, _ = built
+    assert not (out / "rendered").exists()
+    assert not list(out.rglob("*.md"))
+
+
+def test_build_report_records_size_and_mode(built):
+    out, report = built
+    assert report.mode == "auto"
+    assert report.bytes_total > 0
+    assert report.duration_s >= 0
+    name, payload = read_shard(out / "data" / "build.js")
+    assert name == "build"
+    assert payload["sessions"] == 8
+
+
+def test_legacy_cost_modes_are_accepted(archive: Layout, tmp_path: Path):  # noqa: F811
+    assert build(archive, tmp_path / "legacy", mode="display").mode == "auto"
+    with pytest.raises(ValueError):
+        build(archive, tmp_path / "bad", mode="nonsense")
+
+
+def test_assets_stay_offline_and_framework_free(tmp_path: Path):
+    out = tmp_path / "assets-contract"
+    copy_assets(out)
+    html = (out / "index.html").read_text(encoding="utf-8")
+    assert "type=\"module\"" not in html
+    scripts = re.findall(r'<script src="([^"]+)"', html)
+    assert scripts == ["data/manifest.js", "assets/core.js", "assets/views.js", "assets/app.js"]
+    for asset in sorted((out / "assets").iterdir()):
+        text = asset.read_text(encoding="utf-8")
+        assert "fetch(" not in text
+        assert "innerHTML" not in text
+        assert "import " not in text.replace("important", "")
+        for url in re.findall(r"https?://[^\s\"')]+", text):
+            assert url.startswith("http://www.w3.org/"), url
+
+
+def test_copy_assets_is_idempotent(tmp_path: Path):
+    out = tmp_path / "assets-out"
+    copy_assets(out)
+    copy_assets(out)
+    assert (out / "index.html").exists()
+    assert (out / "assets" / "app.css").exists()
+    assert (out / "assets" / "core.js").exists()
