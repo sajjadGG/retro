@@ -238,16 +238,24 @@ def test_legacy_cost_modes_are_accepted(archive: Layout, tmp_path: Path):  # noq
         build(archive, tmp_path / "bad", mode="nonsense")
 
 
-def test_assets_stay_offline_and_framework_free(tmp_path: Path):
+def test_static_assets_stay_offline_and_controls_stay_local_and_framework_free(tmp_path: Path):
     out = tmp_path / "assets-contract"
     copy_assets(out)
     html = (out / "index.html").read_text(encoding="utf-8")
     assert "type=\"module\"" not in html
     scripts = re.findall(r'<script src="([^"]+)"', html)
-    assert scripts == ["data/manifest.js", "assets/core.js", "assets/views.js", "assets/app.js"]
+    assert scripts == [
+        "data/manifest.js", "assets/core.js", "assets/views.js", "assets/benchmarks.js",
+        "assets/experiments.js", "assets/app.js",
+    ]
     for asset in sorted((out / "assets").iterdir()):
         text = asset.read_text(encoding="utf-8")
-        assert "fetch(" not in text
+        if asset.name == "experiments.js":
+            assert 'global.fetch("/api/" + path' in text
+            assert 'global.location.protocol === "http:"' in text
+            assert 'options.headers["X-Retro-Control-Token"] = token' in text
+        else:
+            assert "fetch(" not in text
         assert "innerHTML" not in text
         assert "import " not in text.replace("important", "")
         for url in re.findall(r"https?://[^\s\"')]+", text):

@@ -740,6 +740,13 @@
       " · " + detail.agent + " / " + detail.client,
       detail.excluded ? el("span", {class: "tag", text: "excluded"}) : null
     ]));
+    if (params(ctx).event) {
+      host.appendChild(C.panel("Benchmark source event", [
+        el("p", {class: "mono", text: params(ctx).event}),
+        el("p", {class: "muted", text: "Locate this event ID in the captured transcript or normalized events below. " +
+          "Benchmark drilldowns do not copy full assistant trajectories."})
+      ]));
+    }
     if (detail.minimal) {
       host.appendChild(el("p", {class: "muted"},
         "This session is excluded, so only its catalog record is published. " +

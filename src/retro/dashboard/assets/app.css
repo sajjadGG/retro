@@ -137,6 +137,22 @@ p.sub { color: var(--ink-dim); margin: 0 0 14px; }
 .banner.ok { background: color-mix(in srgb, var(--good) 12%, var(--bg)); }
 .banner ul { flex-basis: 100%; }
 .banner ul { margin: 4px 0 0; padding-left: 18px; }
+.dismissible-notice { position: relative; }
+.dismissible-notice > .banner, .dismissible-notice > .benchmark-warnings { position: relative; padding-right: 94px; }
+.notice-dismiss { position: absolute; right: 12px; top: 10px; }
+.notice-reopen { margin: 6px 12px; font-size: 12px; }
+.notice-storage-status { font-size: 12px; }
+.experiment-setup { display: grid; gap: 12px; }
+.experiment-setup label { display: grid; gap: 4px; }
+.experiment-setup input[type="number"], .experiment-setup textarea {
+  font: inherit; color: inherit; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; max-width: 100%;
+}
+.experiment-choices { display: grid; gap: 6px; border: 1px solid var(--line); border-radius: 8px; }
+.experiment-choices label { display: flex; gap: 8px; align-items: start; }
+.experiment-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.operator-evidence { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 520px; overflow: auto; }
+.experiment-setup label, .experiment-choices label { overflow-wrap: anywhere; min-width: 0; }
 
 .grid { display: grid; gap: 14px; }
 .cards { grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
@@ -196,6 +212,48 @@ tbody tr:hover { background: var(--panel-2); }
 .filters input[type="search"] { min-width: 220px; }
 .filters input.facet { min-width: 200px; }
 .filters select { max-width: 230px; }
+
+.benchmark-section { margin-top: 14px; }
+.grid.two.benchmark-section { grid-template-columns: repeat(auto-fit, minmax(min(340px, 100%), 1fr)); }
+.benchmark-section > .panel { min-width: 0; }
+.benchmark-value, .benchmark-hash { overflow-wrap: anywhere; min-width: 0; }
+.benchmark-prompt { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, monospace; }
+.benchmark-preview { max-width: 360px; overflow-wrap: anywhere; font-size: 12px; }
+.benchmark-events { display: flex; flex-wrap: wrap; gap: 6px; }
+.benchmark-warning, .benchmark-warnings {
+  border: 1px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  background: var(--panel);
+  overflow-wrap: anywhere;
+}
+.benchmark-warnings { margin-top: 10px; }
+.benchmark-warnings summary { cursor: pointer; font-weight: 600; }
+.benchmark-warnings li { margin: 4px 0; }
+.benchmark-notice { margin: 14px 0; }
+.benchmark-notice h3 { text-transform: none; letter-spacing: 0; color: var(--ink); }
+.benchmark-notice p { margin: 6px 0; }
+.benchmark-history { margin: 18px 0; }
+.benchmark-history > summary { cursor: pointer; font-weight: 600; padding: 10px 0; }
+.benchmark-task-cards { grid-template-columns: repeat(auto-fit, minmax(min(380px, 100%), 1fr)); }
+.benchmark-task-card { display: flex; flex-direction: column; min-width: 0; overflow-wrap: anywhere; }
+.benchmark-task-card h2 { font-size: 17px; line-height: 1.4; margin: 10px 0 4px; }
+.benchmark-task-card h3 { margin: 12px 0 0; }
+.benchmark-task-card p { margin: 6px 0; line-height: 1.5; }
+.benchmark-task-card ul { margin: 8px 0; padding-left: 20px; line-height: 1.5; }
+.benchmark-card-heading, .benchmark-card-actions { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.benchmark-card-actions { margin: auto 0 12px; padding-top: 16px; }
+.benchmark-episode-steps { line-height: 1.7; padding-left: 22px; }
+.benchmark-pagination { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.benchmark-heatmap caption { text-align: left; color: var(--ink-dim); padding: 0 0 10px; }
+.benchmark-heatmap td { min-width: 130px; }
+.benchmark-heatmap td a { display: inline-block; padding: 2px 5px; font-weight: 700; }
+.benchmark-unscored { background: var(--panel-2); }
+.benchmark-score-0 { background: color-mix(in srgb, var(--bad) 14%, var(--panel)); }
+.benchmark-score-1 { background: color-mix(in srgb, var(--warn) 14%, var(--panel)); }
+.benchmark-score-2 { background: color-mix(in srgb, var(--warn) 7%, var(--panel)); }
+.benchmark-score-3 { background: color-mix(in srgb, var(--good) 10%, var(--panel)); }
+.benchmark-score-4 { background: color-mix(in srgb, var(--good) 20%, var(--panel)); }
 
 /* One grid template drives the header and every row; cells carry stable classes
    so a breakpoint can hide a column in both places and keep them aligned. */

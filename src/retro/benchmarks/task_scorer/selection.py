@@ -78,6 +78,7 @@ class SourceCandidate:
     outcome: git_state.OutcomeResolution
     events: Sequence[NormalizedEvent] = ()
     environment: ProjectEnvironment | None = None
+    repo_root_overridden: bool = False
 
     @property
     def base_sha(self) -> str:
@@ -123,6 +124,7 @@ class SourceCandidate:
             "raw_dir": str(self.raw_dir),
             "repo_root": str(self.repo_root),
             "cwd": self.cwd,
+            "repo_root_overridden": self.repo_root_overridden,
             "branch": self.branch,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
@@ -161,6 +163,13 @@ class SourceCandidate:
             "state_confidence": self.base.state_confidence,
             "environment_id": self.environment.environment_id if self.environment else None,
             "environment_validated": self.environment is not None,
+            "captured_cwd": self.cwd,
+            "resolved_repo_root": str(self.repo_root),
+            "repo_root_overridden": self.repo_root_overridden,
+            "started_at": self.started_at,
+            "ended_at": self.ended_at,
+            "base_evidence": dict(self.base.evidence),
+            "outcome_evidence": dict(self.outcome.evidence),
         }
 
 
@@ -242,6 +251,7 @@ def select_source(
     environment_resolver: EnvironmentResolver | None = None,
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+    repo_root: Path | None = None,
     _catalog: Catalog | None = None,
 ) -> tuple[SourceCandidate | None, SourceRejection | None]:
     """Evaluate one rollout against every §5.1 eligibility condition."""
@@ -283,13 +293,23 @@ def select_source(
     cwd_resolution = git_state.resolve_session_cwd(raw_dir=raw_dir, events=events)
     if not cwd_resolution.cwd:
         return reject("NO_REPO_CWD", "no working directory recorded in raw capture or events")
-    if not cwd_resolution.exists:
+    if repo_root is not None:
+        root = git_state.repo_root(Path(repo_root).expanduser())
+        if root is None:
+            return reject(
+                "NOT_GIT_REPOSITORY",
+                "explicit repository checkout is not inside a Git repository",
+                repo_root=str(repo_root),
+                cwd=cwd_resolution.cwd,
+            )
+    elif not cwd_resolution.exists:
         return reject(
             "NO_REPO_CWD",
             "recorded working directory no longer exists",
             cwd=cwd_resolution.cwd,
         )
-    root = cwd_resolution.root
+    else:
+        root = cwd_resolution.root
     if root is None:
         return reject(
             "NOT_GIT_REPOSITORY",
@@ -308,6 +328,7 @@ def select_source(
             events=events,
             captured_start=captured_start,
             session_started_at=started_at,
+            allow_root_relocation=repo_root is not None,
         )
     except git_state.GitError as error:
         return reject("HARNESS_ERROR", f"git failure during base resolution: {error}")
@@ -328,6 +349,7 @@ def select_source(
             captured_end=captured_end,
             user_accepted=_user_accepted(events),
             session_ended_at=ended_at,
+            allow_root_relocation=repo_root is not None,
         )
     except git_state.GitError as error:
         return reject("HARNESS_ERROR", f"git failure during outcome resolution: {error}")
@@ -386,6 +408,7 @@ def select_source(
         base=base,
         outcome=outcome,
         events=events,
+        repo_root_overridden=repo_root is not None,
     )
 
     environment: ProjectEnvironment | None = None
@@ -420,6 +443,7 @@ def select_sources(
     environment_resolver: EnvironmentResolver | None = None,
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+    repo_root: Path | None = None,
 ) -> SelectionResult:
     selected: list[SourceCandidate] = []
     rejections: list[SourceRejection] = []
@@ -433,6 +457,7 @@ def select_sources(
             environment_resolver=environment_resolver,
             require_environment=require_environment,
             stability_horizon_days=stability_horizon_days,
+            repo_root=repo_root,
             _catalog=catalog,
         )
         if candidate is not None:
@@ -706,6 +731,7 @@ def select_taskset(
     require_environment: bool = True,
     branch: str = "HEAD",
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+    repo_root: Path | None = None,
     write: bool = True,
 ) -> TasksetSelection:
     """Select sessions into ``benchmarks/<name>/task-scorer/selection.json``.
@@ -742,6 +768,7 @@ def select_taskset(
         environment_resolver=resolver,
         require_environment=require_environment,
         stability_horizon_days=stability_horizon_days,
+        repo_root=repo_root,
     )
     environment_provenance: dict[str, Any] = {
         "required": require_environment,

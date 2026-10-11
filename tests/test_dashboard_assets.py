@@ -16,6 +16,8 @@ CSS = (ASSETS_DIR / "app.css").read_text(encoding="utf-8")
 VIEWS = (ASSETS_DIR / "views.js").read_text(encoding="utf-8")
 CORE = (ASSETS_DIR / "core.js").read_text(encoding="utf-8")
 APP = (ASSETS_DIR / "app.js").read_text(encoding="utf-8")
+BENCHMARKS = (ASSETS_DIR / "benchmarks.js").read_text(encoding="utf-8")
+EXPERIMENTS = (ASSETS_DIR / "experiments.js").read_text(encoding="utf-8")
 INDEX = (ASSETS_DIR / "index.html").read_text(encoding="utf-8")
 
 
@@ -122,12 +124,17 @@ def test_hidden_elements_cannot_swallow_clicks():
 
 
 def test_assets_never_reach_the_network():
-    for asset in (CSS, VIEWS, CORE, APP, INDEX):
+    for asset in (CSS, VIEWS, CORE, APP, BENCHMARKS, INDEX):
         assert "fetch(" not in asset
         assert "innerHTML" not in asset
         for url in re.findall(r"https?://[^\s\"')]+", asset):
             assert url.startswith("http://www.w3.org/"), url
     assert 'type="module"' not in INDEX
+    assert 'global.fetch("/api/" + path' in EXPERIMENTS
+    assert 'options.headers["X-Retro-Control-Token"] = token' in EXPERIMENTS
+    assert 'global.location.protocol === "http:"' in EXPERIMENTS
+    assert "innerHTML" not in EXPERIMENTS
+    assert not re.findall(r"https?://[^\s\"')]+", EXPERIMENTS)
 
 
 def test_client_constants_match_the_python_fact_table():
@@ -181,6 +188,17 @@ def test_sync_banner_reports_a_past_run_never_a_live_one():
     assert "stages_unfinished" in note
 
 
+def test_benchmark_warnings_do_not_claim_capture_failure():
+    assert 'text: onlyBenchmarks ? "benchmark verification" : "data status"' in APP
+    assert "Some saved benchmark records need verification" in APP
+    assert "This does not mean the latest verified tasks failed" in APP
+    assert "See affected versions and what to do" in APP
+    assert '"capture health"' not in APP
+    assert "C.dismissibleNotice" in APP
+    assert "warning_sha256" in APP
+    assert "retro-dismissed-warnings-v1" in CORE
+
+
 def test_quality_page_explains_a_build_time_report():
     assert "built_during_sync" in VIEWS
     assert "pending at build" in VIEWS
@@ -207,8 +225,22 @@ def test_assets_are_listed_in_the_shell():
 
 def test_asset_payload_stays_small():
     total = sum(path.stat().st_size for path in ASSETS_DIR.iterdir() if path.is_file())
-    assert total < 200 * 1024
+    assert total < 225 * 1024
+    assert (ASSETS_DIR / "experiments.js").stat().st_size < 32 * 1024
     assert (ASSETS_DIR / "index.html").stat().st_size < 8 * 1024
+
+
+def test_benchmark_navigation_and_drilldowns_are_integrated_and_lazy():
+    assert 'href="#/tasks" data-route="tasks">Tasks' in INDEX
+    assert 'href="#/evals" data-route="evals">Evals' in INDEX
+    assert 'href="#/experiments" data-route="experiments">Experiments' in INDEX
+    assert INDEX.index("assets/views.js") < INDEX.index("assets/benchmarks.js") < INDEX.index("assets/app.js")
+    assert "C.loadShard" in BENCHMARKS
+    assert "data/benchmarks/index.js" not in INDEX
+    assert '"benchmark-task": "tasks"' in APP
+    assert '"benchmark-eval": "experiments"' in APP
+    assert 'b: "tasks"' in APP
+    assert "Benchmark source event" in VIEWS
 
 
 def test_paths_can_be_derived_without_the_detail_payload():

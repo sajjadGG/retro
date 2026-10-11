@@ -1,6 +1,11 @@
 # User Task Distribution Benchmark
 
-Status: research design v0.1; time-consistent file-localization slice implemented
+Status: research design v0.1; localization and curated Git-backed terminal-reward slices implemented
+
+The concrete implemented release, split, reward and visualization contracts
+are in [Trajectory-derived environment releases](trajectory_environment_releases.md).
+The future-real predictive-validity, drifting distribution and continual-learning
+protocols below remain research design, not existing measured capabilities.
 
 Working name: UTD-Bench
 

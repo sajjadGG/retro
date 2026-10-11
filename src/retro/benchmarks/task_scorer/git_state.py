@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,12 +66,15 @@ class GitError(RuntimeError):
     """A git invocation failed."""
 
 
-def run_git(cwd: Path, *args: str, check: bool = True) -> str:
+def run_git(
+    cwd: Path, *args: str, check: bool = True, env: Mapping[str, str] | None = None
+) -> str:
     process = subprocess.run(
         ["git", "-C", str(cwd), *args],
         text=True,
         capture_output=True,
         check=False,
+        env=env,
     )
     if process.returncode != 0:
         if check:
@@ -917,10 +920,12 @@ def resolve_base(
     events: Sequence[NormalizedEvent],
     captured_start: RepoStateCapture | None = None,
     session_started_at: str | None = None,
+    allow_root_relocation: bool = False,
 ) -> BaseResolution:
     """Resolve the base commit using only captured or rollout-proved evidence."""
     if captured_start is not None:
-        if Path(captured_start.root).resolve() != root.resolve():
+        relocated = Path(captured_start.root).resolve() != root.resolve()
+        if relocated and not allow_root_relocation:
             return BaseResolution(
                 base_sha=None,
                 base_tree=None,
@@ -980,7 +985,13 @@ def resolve_base(
             base_tree=tree,
             resolution="captured_start",
             state_confidence="exact_clean_commit",
-            evidence={"source": "repo_start.json"},
+            evidence={
+                "source": "repo_start.json",
+                **(
+                    {"captured_root": captured_start.root, "resolved_root": str(root)}
+                    if relocated else {}
+                ),
+            },
         )
 
     mutating_index = first_mutating_index(events)
@@ -1099,6 +1110,7 @@ def resolve_outcome(
     captured_end: RepoStateCapture | None = None,
     user_accepted: bool = False,
     session_ended_at: str | None = None,
+    allow_root_relocation: bool = False,
 ) -> OutcomeResolution:
     """Resolve the accepted outcome commit in the §5.4 priority order."""
     for number in linked_pull_requests(events, root=root):
@@ -1144,7 +1156,8 @@ def resolve_outcome(
                 rejection_code="NO_OUTCOME_SHA",
                 detail="captured end state exists but the user did not explicitly accept it",
             )
-        if Path(captured_end.root).resolve() != root.resolve():
+        relocated = Path(captured_end.root).resolve() != root.resolve()
+        if relocated and not allow_root_relocation:
             return OutcomeResolution(
                 outcome_sha=None,
                 outcome_tree=None,
@@ -1192,7 +1205,13 @@ def resolve_outcome(
             outcome_sha=captured_end.head_sha,
             outcome_tree=tree,
             resolution="captured_end",
-            evidence={"source": "repo_end.json"},
+            evidence={
+                "source": "repo_end.json",
+                **(
+                    {"captured_root": captured_end.root, "resolved_root": str(root)}
+                    if relocated else {}
+                ),
+            },
         )
 
     return OutcomeResolution(
@@ -1235,21 +1254,77 @@ def find_revert(root: Path, sha: str, *, branch: str = "HEAD") -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
+def _snapshot_git_env() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in (
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG_PARAMETERS",
+    ):
+        env.pop(key, None)
+    env.update(
+        GIT_CONFIG_NOSYSTEM="1",
+        GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_CONFIG_COUNT="0",
+        GIT_ATTR_NOSYSTEM="1",
+    )
+    return env
+
+
+def snapshot_tree_sha(snapshot: Path) -> str:
+    """Hash literal snapshot bytes/modes as a Git tree, without hooks or clean filters."""
+    if not snapshot.is_dir():
+        raise GitError(f"snapshot is not a directory: {snapshot}")
+    if any(path.name == ".git" for path in snapshot.rglob("*")):
+        raise GitError("a repository snapshot must not contain Git metadata")
+    env = _snapshot_git_env()
+    with tempfile.TemporaryDirectory(prefix=".tree-check.", dir=snapshot.parent) as scratch:
+        index_repo = Path(scratch)
+        run_git(index_repo, "-c", "init.templateDir=", "init", "--bare", "--quiet", env=env)
+        (index_repo / "info").mkdir(exist_ok=True)
+        (index_repo / "info" / "attributes").write_text(
+            "* -text -filter -ident -working-tree-encoding -crlf -eol\n", encoding="utf-8"
+        )
+        run_git(
+            index_repo, "-c", "core.filemode=true", "-c", "core.autocrlf=false",
+            "--work-tree", str(snapshot.resolve()), "add", "--force", "--all", env=env,
+        )
+        return run_git(index_repo, "write-tree", env=env)
+
+
 def materialize_tree(root: Path, sha: str, dest: Path) -> Path:
     """Materialize *sha* as a detached, ``.git``-free checkout at *dest*."""
     if not commit_exists(root, sha):
         raise GitError(f"commit {sha} does not exist in {root}")
+    if dest.is_symlink() or (dest.exists() and (not dest.is_dir() or any(dest.iterdir()))):
+        raise GitError(f"snapshot destination must be empty: {dest}")
     dest.mkdir(parents=True, exist_ok=True)
     fd, archive_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".tar", dir=dest.parent)
+    os.close(fd)
     archive_path = Path(archive_name)
     try:
-        with os.fdopen(fd, "wb") as handle:
-            process = subprocess.run(
-                ["git", "-C", str(root), "archive", "--format=tar", sha],
-                stdout=handle,
-                stderr=subprocess.PIPE,
-                check=False,
+        env = _snapshot_git_env()
+        with tempfile.TemporaryDirectory(prefix=".archive-git.", dir=dest.parent) as scratch:
+            archive_repo = Path(scratch)
+            run_git(archive_repo, "-c", "init.templateDir=", "init", "--bare", "--quiet", env=env)
+            (archive_repo / "info").mkdir(exist_ok=True)
+            common_dir = Path(run_git(root, "rev-parse", "--git-common-dir"))
+            object_dir = (root / common_dir / "objects").resolve()
+            if "\n" in str(object_dir) or "\r" in str(object_dir):
+                raise GitError("Git object directory cannot contain line breaks")
+            (archive_repo / "objects" / "info" / "alternates").write_text(
+                str(object_dir) + "\n", encoding="utf-8"
             )
+            (archive_repo / "info" / "attributes").write_text(
+                "* -export-ignore -export-subst\n", encoding="utf-8"
+            )
+            with archive_path.open("wb") as handle:
+                process = subprocess.run(
+                    ["git", "-C", str(archive_repo), "archive", "--format=tar", sha],
+                    stdout=handle,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    env=env,
+                )
         if process.returncode != 0:
             raise GitError(f"git archive failed: {process.stderr.decode('utf-8', 'replace').strip()}")
         with tarfile.open(archive_path, "r") as tar:

@@ -639,6 +639,35 @@ def test_materialize_tree_has_no_git_directory(tmp_path: Path, repo):
     assert (dest / "src" / "calc.py").read_text(encoding="utf-8").startswith("def add")
     assert not (dest / ".git").exists()
     assert not (dest / "tests" / "test_divide.py").exists()
+    assert git_state.snapshot_tree_sha(dest) == shas["base_tree"]
+
+
+def test_snapshot_preserves_export_ignored_files_and_literal_blobs(tmp_path: Path, repo):
+    root, _shas = repo
+    (root / ".gitattributes").write_text("hidden.txt export-ignore\nversion.txt export-subst\n")
+    (root / "hidden.txt").write_text("tracked but not part of a release archive\n")
+    (root / "version.txt").write_text("$Format:%H$\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "add archive attributes")
+    sha = git(root, "rev-parse", "HEAD")
+    dest = tmp_path / "checkout"
+    git_state.materialize_tree(root, sha, dest)
+    assert (dest / "hidden.txt").read_text() == "tracked but not part of a release archive\n"
+    assert (dest / "version.txt").read_text() == "$Format:%H$\n"
+    assert git_state.snapshot_tree_sha(dest) == git(root, "rev-parse", "HEAD^{tree}")
+
+
+def test_snapshot_tree_ignores_clean_filters_and_line_ending_attributes(tmp_path: Path, repo):
+    root, _shas = repo
+    (root / ".gitattributes").write_text("literal.txt -text filter=unexpected\n")
+    (root / "literal.txt").write_bytes(b"literal\r\nbytes\r\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-m", "preserve literal bytes")
+    sha = git(root, "rev-parse", "HEAD")
+    dest = tmp_path / "checkout"
+    git_state.materialize_tree(root, sha, dest)
+    assert (dest / "literal.txt").read_bytes() == b"literal\r\nbytes\r\n"
+    assert git_state.snapshot_tree_sha(dest) == git(root, "rev-parse", "HEAD^{tree}")
 
 
 def test_materialize_tree_rejects_symlink_outside_destination(tmp_path: Path):

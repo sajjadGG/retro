@@ -588,6 +588,7 @@ def _reselect(
     resolver: Any,
     require_environment: bool,
     stability_horizon_days: int,
+    repo_root: Path | None = None,
 ) -> tuple[SourceCandidate | None, str | None, str]:
     candidate, rejection = select_source(
         layout=layout,
@@ -597,6 +598,7 @@ def _reselect(
         environment_resolver=resolver,
         require_environment=require_environment,
         stability_horizon_days=stability_horizon_days,
+        repo_root=repo_root,
     )
     if candidate is None:
         code = rejection.code if rejection is not None else "NO_NORMALIZED_ROLLOUT"
@@ -617,6 +619,7 @@ def bundle_taskset(
     require_environment: bool = True,
     branch: str = "HEAD",
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+    repo_root: Path | None = None,
     task_limits: TaskLimits | None = None,
     force: bool = False,
     write: bool = True,
@@ -684,6 +687,11 @@ def bundle_taskset(
             entry_host = str(entry.get("host", ""))
             session_id = str(entry.get("session_id", ""))
             source_id = str(entry.get("source_id") or f"{entry_host}__{session_id}")
+            recorded_override = (
+                Path(str(entry["repo_root"]))
+                if entry.get("repo_root_overridden") is True and isinstance(entry.get("repo_root"), str)
+                else None
+            )
             candidate, code, detail = _reselect(
                 layout=layout,
                 host=entry_host,
@@ -692,6 +700,7 @@ def bundle_taskset(
                 resolver=resolver,
                 require_environment=require_environment,
                 stability_horizon_days=stability_horizon_days,
+                repo_root=repo_root if repo_root is not None else recorded_override,
             )
             if candidate is None:
                 outcomes.append(
@@ -734,6 +743,7 @@ def bundle_taskset(
             require_environment=require_environment,
             branch=branch,
             stability_horizon_days=stability_horizon_days,
+            repo_root=repo_root,
             write=write,
         )
         for rejection in selection.rejections:
@@ -783,12 +793,18 @@ def _selection_drift(entry: Mapping[str, Any], candidate: SourceCandidate) -> st
         "base_tree": recorded_base.get("tree"),
         "outcome_sha": recorded_outcome.get("sha"),
         "outcome_tree": recorded_outcome.get("tree"),
+        "base_resolution": recorded_base.get("resolution"),
+        "state_confidence": recorded_base.get("state_confidence"),
+        "outcome_resolution": recorded_outcome.get("resolution"),
     }
     actual = {
         "base_sha": candidate.base_sha,
         "base_tree": candidate.base_tree,
         "outcome_sha": candidate.outcome_sha,
         "outcome_tree": candidate.outcome_tree,
+        "base_resolution": candidate.base.resolution,
+        "state_confidence": candidate.base.state_confidence,
+        "outcome_resolution": candidate.outcome.resolution,
     }
     differences = [
         f"{key} {expected[key]} -> {actual[key]}"

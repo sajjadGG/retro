@@ -89,6 +89,32 @@ def test_bundle_contents_are_the_two_repository_states(source):
     assert "Guard divide against zero" in transcript
 
 
+def test_bundling_reuses_the_explicit_relocated_checkout(source):
+    layout, candidate, shas = source
+    old_root = candidate.repo_root.parent / "deleted-worktree"
+    install_session(
+        layout,
+        events=rollout_events(base_sha=shas["base_sha"], commit_short=shas["outcome_sha"][:7]),
+        cwd=str(old_root),
+        raw_files={
+            "repo_start.json": repo_state_json(old_root, shas["base_sha"], shas["base_tree"]),
+        },
+    )
+    selection.select_taskset(
+        layout=layout, name="relocated", sessions=[("codex", "session-1")],
+        repo_root=candidate.repo_root, branch="main",
+        environment_resolver=lambda _candidate: candidate.environment,
+    )
+    report = bundle_mod.bundle_taskset(layout=layout, name="relocated")
+    assert len(report.bundled) == 1
+    built = report.bundled[0]
+    assert built.path is not None
+    assert bundle_mod.verify_bundle(built.path)
+    record = json.loads((built.path / "selection.json").read_text())
+    assert record["captured_cwd"] == str(old_root)
+    assert record["repo_root_overridden"] is True
+
+
 def test_identical_inputs_produce_identical_content_hashes(tmp_path: Path, source):
     layout, candidate, _shas = source
     first = bundle_mod.build_source_bundle(candidate, layout=layout, name="pilot")

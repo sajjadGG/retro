@@ -29,6 +29,9 @@ function RETRO_DATA(name, payload) {
     <a href="#/projects" data-route="projects">Projects</a>
     <a href="#/sessions" data-route="sessions">Sessions</a>
     <a href="#/signals" data-route="signals">Signals</a>
+    <a href="#/tasks" data-route="tasks">Tasks</a>
+    <a href="#/evals" data-route="evals">Evals</a>
+    <a href="#/experiments" data-route="experiments">Experiments</a>
     <a href="#/quality" data-route="quality">Data quality</a>
   </nav>
   <div class="topbar-right">
@@ -40,12 +43,14 @@ function RETRO_DATA(name, payload) {
 <main id="view" tabindex="-1"></main>
 <footer class="footer">
   <span id="footer-build"></span>
-  <span class="hint">keys: <kbd>/</kbd> search · <kbd>g</kbd> then <kbd>o p s i q</kbd> · <kbd>t</kbd> theme · <kbd>?</kbd> help</span>
+  <span class="hint">keys: <kbd>/</kbd> search · <kbd>g</kbd> then <kbd>o p s i b e x q</kbd> · <kbd>t</kbd> theme · <kbd>?</kbd> help</span>
 </footer>
 <div id="help" class="modal" hidden role="dialog" aria-modal="true" aria-label="Keyboard help"></div>
 <script src="data/manifest.js"></script>
 <script src="assets/core.js"></script>
 <script src="assets/views.js"></script>
+<script src="assets/benchmarks.js"></script>
+<script src="assets/experiments.js"></script>
 <script src="assets/app.js"></script>
 </body>
 </html>

@@ -16,13 +16,24 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import time
-from collections.abc import Iterable, Mapping, Sequence
+import uuid
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ...archive_health import require_archive_volume
+from ...experiment_traces import (
+    EXPERIMENT_TAG,
+    EXPERIMENT_TAG_PREFIX,
+    MAX_EXPERIMENT_ID_LENGTH,
+    tag_experiment_prompt,
+)
+from ...locking import exclusive_lock
+from ...utils import atomic_write_text
 from .aggregate import (
     ATTEMPT_SCHEMA,
     SCORED_STATUS,
@@ -39,12 +50,15 @@ from .build import (
     BENCHMARK_TASK_SCHEMA,
     TasksetPaths,
     compute_scorer_package_hash,
+    is_git_bundle,
     list_published_tasks,
     resolve_taskset_paths,
     unpack_bundle,
     utc_now,
 )
 from .ghostlab_cli import (
+    ARTIFACT_RUN_SCHEMA,
+    ARTIFACT_RUN_STATUSES,
     SCORER_RUN_REPORT_NAME,
     ArtifactRunRequest,
     GhostlabBinaryError,
@@ -59,13 +73,18 @@ from .ghostlab_cli import (
     sha256_file,
     sha256_json,
     sha256_path,
+    sha256_text,
+    validate_score_report_contract,
     validate_scorer_run_attestation,
     write_json,
 )
+from .git_state import GitError, materialize_tree, snapshot_tree_sha
 from .schema import BenchmarkTask, ProjectEnvironment, SchemaError, ScorerManifest
 
 CANDIDATE_EXPORT_NAME = "candidate-state.tar.zst"
 RESOURCE_USAGE_SCHEMA = "retro-attempt-resources-v1"
+ATTEMPT_METADATA_SCHEMA = "retro-attempt-metadata-v1"
+CANDIDATE_PHASE_SCHEMA = "retro-candidate-phase-v1"
 
 #: ``artifact-run`` status -> attempt status. ``None`` means "keep going".
 ARTIFACT_STATUS_TO_ATTEMPT: Mapping[str, str | None] = {
@@ -746,6 +765,105 @@ class AgentSpec:
     def referenced_asset_hashes(self) -> dict[str, str]:
         return _agent_asset_hashes(self.config_path, self._payload())
 
+    def runtime_labels(self) -> dict[str, str]:
+        """Return only bounded public labels, never commands, environment, or credentials."""
+        payload = self._payload()
+        runtime = payload.get("runtime")
+        runtime = runtime if isinstance(runtime, Mapping) else {}
+        sandbox = payload.get("sandbox")
+        sandbox = sandbox if isinstance(sandbox, Mapping) else {}
+        runner = payload.get("runner") or runtime.get("runner")
+        definition = runner if isinstance(runner, Mapping) else {}
+        labels: dict[str, str] = {}
+        for key, value in (
+            ("model", payload.get("model") or runtime.get("model")),
+            ("backend", runtime.get("backend") or sandbox.get("backend")),
+            ("agent", runtime.get("agent")),
+            ("parser", runtime.get("parser") or definition.get("parser")),
+        ):
+            if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", value):
+                labels[key] = value
+        command = definition.get("command")
+        argv = (
+            command if isinstance(command, list) and command
+            and all(
+                isinstance(part, str) and part and not any(c in part for c in "\0\r\n") for part in command
+            )
+            else []
+        )
+        if argv and (
+            not re.fullmatch(r"[A-Za-z0-9_./~-]{1,200}", argv[0])
+            or Path(argv[0]).name.lower() in {
+                "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+                "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh",
+            }
+            or any(part in {"-c", "--eval", "-e"} for part in argv[1:])
+        ):
+            argv = []
+        if argv:
+            model_values: list[str] = []
+            for index, part in enumerate(argv[1:], start=1):
+                if part == "--":
+                    break
+                if part == "--model":
+                    model_values.append(argv[index + 1] if index + 1 < len(argv) else "")
+                elif part.startswith("--model="):
+                    model_values.append(part[len("--model=") :])
+            if (
+                "model" not in labels and len(model_values) == 1
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model_values[0])
+            ):
+                labels["model"] = model_values[0]
+            executable = Path(argv[0]).name.lower()
+            if len(argv) > 1 and (
+                (
+                    re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", executable)
+                    and Path(argv[1]).suffix in {".py", ".pyw"}
+                )
+                or (executable in {"node", "nodejs"} and Path(argv[1]).suffix in {".js", ".mjs", ".cjs"})
+                or (executable == "ruby" and Path(argv[1]).suffix == ".rb")
+            ) and re.fullmatch(r"[A-Za-z0-9_./~-]{1,200}", argv[1]):
+                labels["script"] = Path(argv[1]).name
+        if isinstance(runner, Mapping):
+            runner = runner.get("executable") or (argv[0] if argv else None)
+        if runner is None:
+            runner = runtime.get("executable")
+        if isinstance(runner, str) and re.fullmatch(r"[A-Za-z0-9_./~-]{1,200}", runner):
+            executable = Path(runner).name
+            if executable not in (".", ".."):
+                labels["runner"] = executable
+        return labels
+
+    def verify_assets(self, expected: Mapping[str, str] | None = None) -> dict[str, str]:
+        """Verify local inputs without exposing the agent's potentially secret configuration."""
+        self.verify()
+        payload = self._payload()
+        hashes = _agent_asset_hashes(self.config_path, payload)
+        required = copy.deepcopy(payload)
+        sandbox = required.get("sandbox")
+        if isinstance(sandbox, dict):
+            sandbox.pop("image", None)
+            sandbox.pop("policy", None)
+        missing = [
+            reference for reference in _referenced_agent_paths(required)
+            if hashes.get(reference) == "<missing>"
+        ]
+        declared_sandbox = payload.get("sandbox")
+        if isinstance(declared_sandbox, Mapping):
+            for key in ("image", "policy"):
+                reference = declared_sandbox.get(key)
+                if not isinstance(reference, str) or hashes.get(reference) != "<missing>":
+                    continue
+                if reference.startswith(("/", "~", "./", "../")) or Path(reference).suffix.lower() in {
+                    ".json", ".yaml", ".yml", ".toml", ".dockerfile",
+                } or "dockerfile" in Path(reference).name.lower():
+                    missing.append(reference)
+        if missing:
+            raise TaskVerificationError(f"agent referenced assets are missing: {missing}")
+        if expected is not None and hashes != dict(expected):
+            raise TaskVerificationError("agent referenced assets changed after the experiment was planned")
+        return hashes
+
     def _local_sandbox_image(
         self, task_image: str
     ) -> tuple[dict[str, Any], Path, Path] | None:
@@ -1111,6 +1229,28 @@ class PublishedTask:
         raise TaskVerificationError(f"task {self.task_id} has no valid scorer timeout")
 
 
+def materialize_task_base(
+    task: PublishedTask, destination: Path
+) -> Path:
+    """Materialize and verify the pinned tree, never exposing Git history to the agent."""
+    if destination.exists() or destination.is_symlink():
+        raise TaskVerificationError(f"base destination already exists: {destination}")
+    repo = task.public_task["repository"]
+    try:
+        if is_git_bundle(task.base_bundle):
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".base-git.", dir=destination.parent) as scratch:
+                checkout = unpack_bundle(task.base_bundle, Path(scratch) / "repo")
+                materialize_tree(checkout, repo["base_sha"], destination)
+        else:
+            unpack_bundle(task.base_bundle, destination)
+        if snapshot_tree_sha(destination) != repo["base_tree"]:
+            raise TaskVerificationError("base bundle does not materialize the declared Git tree")
+    except GitError as exc:
+        raise TaskVerificationError(f"cannot verify task base: {exc}") from exc
+    return destination
+
+
 def verify_published_task(paths: TasksetPaths, task_id: str) -> PublishedTask:
     """Check every published artifact hash before an attempt starts."""
     _validate_safe_id(task_id, "task id")
@@ -1339,6 +1479,197 @@ def _verify_scorer_package(
 
 
 @dataclass(frozen=True)
+class CandidateScore:
+    status: str
+    score: float | None = None
+    passed: bool | None = None
+    components: tuple[dict[str, Any], ...] = ()
+    error: str | None = None
+    warnings: tuple[str, ...] = ()
+    report_path: Path | None = None
+
+
+def score_candidate(
+    task: PublishedTask,
+    ghostlab: GhostlabCli,
+    candidate: Path,
+    *,
+    attempt_id: str,
+    output_dir: Path,
+    seed: int = 0,
+    trace_path: Path | None = None,
+    resource_usage_path: Path | None = None,
+    timeout_seconds: float | None = None,
+    reuse: bool = False,
+) -> CandidateScore:
+    """Return an attested terminal reward, never a numeric infrastructure failure."""
+    _validate_safe_id(attempt_id, "attempt id")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise TaskVerificationError("scorer seed must be a non-negative integer")
+    if timeout_seconds is not None and (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise TaskVerificationError("scorer timeout must be a positive finite number")
+    output = output_dir.resolve()
+    task_root = task.task_dir.resolve()
+    if output_dir.is_symlink() or output == task_root or task_root in output.parents:
+        raise TaskVerificationError("scorer output must not modify immutable task artifacts")
+    candidate_root = candidate.resolve()
+    if candidate.is_dir() and (output == candidate_root or candidate_root in output.parents):
+        raise TaskVerificationError("scorer output must not be inside its read-only candidate")
+    if (output_dir / "scorer").is_symlink():
+        raise TaskVerificationError("scorer output directory must not be a symlink")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    score_report_path = output_dir / "score-report.json"
+    scorer_run_dir = output_dir / "scorer"
+    stage_path = output_dir / "score-stage.json"
+    stage = {
+        "schema_version": "retro-score-stage-v1",
+        "task_id": task.task_id,
+        "attempt_id": attempt_id,
+        "candidate_sha256": sha256_path(candidate),
+        "trace_sha256": sha256_file(trace_path) if trace_path is not None else None,
+        "resource_usage_sha256": (
+            sha256_file(resource_usage_path) if resource_usage_path is not None else None
+        ),
+        "task_sha256": task.public_task_sha256,
+        "scorer_package_sha256": task.scorer_package_sha256,
+        "seed": seed,
+        "timeout_seconds": timeout_seconds if timeout_seconds is not None else task.scorer_timeout_seconds,
+    }
+    if stage_path.is_symlink() or score_report_path.is_symlink():
+        raise TaskVerificationError("scorer evidence must not use symlinks")
+    if reuse and stage_path.is_file() and read_json(stage_path) == stage and score_report_path.is_file():
+        try:
+            report = read_json(score_report_path, label="recoverable score report")
+            if not isinstance(report, Mapping):
+                raise GhostlabContractError("recoverable score report is not a JSON object")
+            validate_score_report_contract(report, score_report_path, run_dir=scorer_run_dir)
+            validate_scorer_run_attestation(
+                scorer_run_dir / SCORER_RUN_REPORT_NAME,
+                task_id=task.task_id,
+                attempt_id=attempt_id,
+                status=str(report.get("status")),
+                task_sha256=task.public_task_sha256,
+                scorer_package_sha256=task.scorer_package_sha256,
+                mode=str(task.scorer_manifest.get("mode", "")),
+            )
+            return _score_report_result(
+                task, attempt_id, report, score_report_path, scorer_run_dir / SCORER_RUN_REPORT_NAME
+            )
+        except GhostlabError:
+            preserved = output_dir / ("interrupted-scorer-" + uuid.uuid4().hex)
+            preserved.mkdir()
+            score_report_path.replace(preserved / score_report_path.name)
+            if scorer_run_dir.exists():
+                scorer_run_dir.replace(preserved / "scorer")
+    score_report_path.unlink(missing_ok=True)
+    if scorer_run_dir.exists():
+        shutil.rmtree(scorer_run_dir)
+    write_json(stage_path, stage)
+    try:
+        scored = ghostlab.scorer_run(
+            ScorerRunRequest(
+                task_path=task.public_task_path,
+                scorer_path=task.scorer_manifest_path,
+                candidate_path=candidate,
+                output_path=score_report_path,
+                attempt_id=attempt_id,
+                trace_path=trace_path,
+                resource_usage_path=resource_usage_path,
+                seed=seed,
+                run_dir=scorer_run_dir,
+                timeout_seconds=(
+                    timeout_seconds if timeout_seconds is not None else task.scorer_timeout_seconds
+                ),
+                label="scorer",
+            )
+        )
+        validate_scorer_run_attestation(
+            scored.run_report_path,
+            task_id=task.task_id,
+            attempt_id=attempt_id,
+            status=scored.status,
+            task_sha256=task.public_task_sha256,
+            scorer_package_sha256=task.scorer_package_sha256,
+            mode=str(task.scorer_manifest.get("mode", "")),
+            run_dir=scorer_run_dir,
+        )
+    except GhostlabTimeoutError as exc:
+        return CandidateScore(status="scorer_timeout", error=str(exc))
+    except (GhostlabBinaryError, GhostlabInvocationError) as exc:
+        return CandidateScore(status="harness_error", error=str(exc))
+    except GhostlabContractError as exc:
+        return CandidateScore(status="invalid_result", error=str(exc))
+    except GhostlabError as exc:
+        return CandidateScore(status="scorer_error", error=str(exc))
+
+    return _score_report_result(task, attempt_id, scored.report, scored.report_path, scored.run_report_path)
+
+
+def _score_report_result(
+    task: PublishedTask,
+    attempt_id: str,
+    report: Mapping[str, Any],
+    report_path: Path,
+    run_report_path: Path,
+) -> CandidateScore:
+    validation = validate_score_report(
+        report,
+        pass_threshold=task.pass_threshold,
+        scorer_manifest=task.scorer_manifest,
+        expected_task_id=task.task_id,
+        expected_attempt_id=attempt_id,
+        expected_scorer_package_sha256=task.scorer_package_sha256,
+    )
+    errors = list(validation.errors)
+    if report.get("status") == "scored":
+        if report.get("valid") is not True:
+            errors.append("scored report must carry valid=true")
+        reported_threshold = report.get("pass_threshold")
+        if (
+            isinstance(reported_threshold, bool)
+            or not isinstance(reported_threshold, (int, float))
+            or not math.isfinite(float(reported_threshold))
+            or abs(float(reported_threshold) - task.pass_threshold) > 1e-9
+        ):
+            errors.append("score report pass_threshold does not match the published scorer")
+        reported_unscored = report.get("unscored_weight")
+        if (
+            isinstance(reported_unscored, bool)
+            or not isinstance(reported_unscored, (int, float))
+            or not math.isfinite(float(reported_unscored))
+            or abs(float(reported_unscored) - validation.unscored_weight) > 1e-9
+        ):
+            errors.append("score report unscored_weight does not match its component results")
+    status = "invalid_result" if errors else str(report["status"])
+    error = "; ".join(errors) if errors else None
+    if status != "scored" and error is None:
+        run_report = read_json(run_report_path, label="scorer failure evidence")
+        failure = run_report.get("error") if isinstance(run_report, Mapping) else None
+        detail = failure.get("detail") if isinstance(failure, Mapping) else None
+        error = (
+            f"scorer reported status={status}: {detail}"
+            if isinstance(detail, str) and detail.strip()
+            else f"scorer reported status={status}"
+        )
+    return CandidateScore(
+        status=status,
+        score=validation.score_total if status == "scored" else None,
+        passed=validation.passed if status == "scored" else None,
+        components=tuple(
+            dict(component) for component in report.get("components", []) if isinstance(component, Mapping)
+        ),
+        error=error,
+        warnings=validation.warnings,
+        report_path=report_path,
+    )
+
+
+@dataclass(frozen=True)
 class RunConfig:
     """Everything one ``retro benchmark taskset run`` invocation needs."""
 
@@ -1349,6 +1680,8 @@ class RunConfig:
     scorer_timeout_seconds: float | None = None
     candidate_export_name: str = CANDIDATE_EXPORT_NAME
     force: bool = False
+    experiment_id: str | None = None
+    expected_agent_asset_hashes: Mapping[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1447,6 +1780,8 @@ def compute_attempt_id(
     scorer_timeout_seconds: float | None = None,
     candidate_export_name: str = CANDIDATE_EXPORT_NAME,
     agent_asset_hashes: Mapping[str, str] | None = None,
+    execution_prompt_sha256: str | None = None,
+    experiment_id: str | None = None,
 ) -> tuple[str, str]:
     """Hash-address one attempt over every input that can change its result."""
     effective_aut_timeout = (
@@ -1479,6 +1814,8 @@ def compute_attempt_id(
             "task_id": task.task_id,
             "public_task_sha256": task.public_task_sha256,
             "prompt_sha256": task.prompt_sha256,
+            "execution_prompt_sha256": execution_prompt_sha256 or task.prompt_sha256,
+            "experiment_id": experiment_id,
             "public_environment_sha256": task.public_environment_sha256,
             "public_environment": dict(task.public_environment),
             "base_bundle_sha256": task.base_bundle_sha256,
@@ -1511,10 +1848,230 @@ def compute_attempt_id(
 
 def _write_attempt(attempt: AttemptResult) -> AttemptResult:
     write_json(attempt.attempt_dir / "attempt.json", attempt.to_dict())
+    metadata_path = attempt.attempt_dir / "attempt-metadata.json"
+    if metadata_path.is_file() and not metadata_path.is_symlink():
+        metadata = read_json(metadata_path)
+        if isinstance(metadata, dict) and metadata.get("attempt_id") == attempt.attempt_id:
+            metadata["attempt_sha256"] = sha256_file(attempt.attempt_dir / "attempt.json")
+            if attempt.score_report is not None:
+                metadata["score_report_sha256"] = sha256_file(Path(attempt.score_report))
+            attestation = attempt.attempt_dir / "scorer" / SCORER_RUN_REPORT_NAME
+            if attestation.is_file() and not attestation.is_symlink():
+                metadata["scorer_run_sha256"] = sha256_file(attestation)
+            write_json(metadata_path, metadata)
     return attempt
 
 
+def _safe_attempt_path(root: Path, path: Path) -> Path:
+    absolute_root = root.absolute()
+    absolute = path.absolute()
+    try:
+        relative = absolute.relative_to(absolute_root)
+    except ValueError as exc:
+        raise TaskVerificationError(f"attempt path escapes its evaluation: {path}") from exc
+    current = absolute_root
+    for part in ("", *relative.parts):
+        current = current / part
+        if current.is_symlink():
+            raise TaskVerificationError(f"attempt artifacts must not use symlinks: {current}")
+    if absolute_root.resolve() not in (absolute.resolve(), *absolute.resolve().parents):
+        raise TaskVerificationError(f"attempt path escapes its evaluation: {path}")
+    return path
+
+
+def cleanup_attempt_workspace(attempt_dir: Path) -> dict[str, Any]:
+    """Remove only an attempt's disposable local inputs, retaining its evidence."""
+    report: dict[str, Any] = {"removed": [], "errors": []}
+    for name in (
+        "workspace",
+        ".runtime-inputs",
+        "scorer/scorer-staging/candidate",
+        "scorer/scorer-staging/repo",
+        "scorer/scorer-staging/repository",
+        "scorer/scorer-staging/reference",
+    ):
+        path = attempt_dir / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        try:
+            _safe_attempt_path(attempt_dir, path)
+            if not path.is_dir():
+                raise TaskVerificationError(f"disposable attempt input is not a directory: {path}")
+            shutil.rmtree(path)
+            report["removed"].append(str(path))
+        except (OSError, TaskVerificationError) as exc:
+            report["errors"].append({"path": str(path), "error": str(exc)})
+    return report
+
+
+def _trace_id(config: RunConfig) -> str:
+    identity = config.experiment_id or config.eval_id
+    if config.experiment_id is None and len(identity) > MAX_EXPERIMENT_ID_LENGTH:
+        identity = identity[: MAX_EXPERIMENT_ID_LENGTH - 21] + "-" + sha256_text(identity)[:20]
+    if len(identity) > MAX_EXPERIMENT_ID_LENGTH:
+        raise TaskVerificationError(f"experiment id must be at most {MAX_EXPERIMENT_ID_LENGTH} characters")
+    return _validate_safe_id(identity, "experiment id")
+
+
+def _candidate_phase(
+    attempt_dir: Path,
+    metadata: Mapping[str, Any],
+    *,
+    wall_time_ms: int = 0,
+) -> dict[str, Any]:
+    agent_dir = _safe_attempt_path(attempt_dir, attempt_dir / "agent")
+    report_path = _safe_attempt_path(agent_dir, agent_dir / "artifact-run.json")
+    report = read_json(report_path, label="recoverable candidate report")
+    if not isinstance(report, Mapping) or report.get("schema_version") != ARTIFACT_RUN_SCHEMA:
+        raise GhostlabContractError("candidate checkpoint has an invalid artifact-run report")
+    status = report.get("status")
+    if status not in ARTIFACT_RUN_STATUSES:
+        raise GhostlabContractError(f"candidate checkpoint has unsupported status {status!r}")
+    for key, expected in (
+        ("agent_config_sha256", metadata.get("execution_config_sha256")),
+        ("prompt_sha256", metadata.get("execution_prompt_sha256")),
+    ):
+        actual = report.get(key)
+        if not isinstance(expected, str) or (
+            (status == "completed" or actual is not None) and actual != expected
+        ):
+            raise GhostlabContractError(f"candidate checkpoint {key} does not match its pinned inputs")
+    reported_workspace = metadata.get("ghostlab_workspace_input_sha256")
+    if (
+        (status == "completed" and not isinstance(report.get("workspace_input_sha256"), str))
+        or (reported_workspace is not None and report.get("workspace_input_sha256") != reported_workspace)
+    ):
+        raise GhostlabContractError("candidate checkpoint workspace identity changed")
+    workspace = _safe_attempt_path(attempt_dir, attempt_dir / "workspace")
+    if workspace.exists() and sha256_path(workspace) != metadata.get("workspace_sha256"):
+        raise GhostlabContractError("candidate checkpoint caller workspace changed")
+    names = metadata.get("workspace_exports")
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        raise GhostlabContractError("candidate checkpoint has no declared workspace exports")
+    exports = report.get("exports", [])
+    if not isinstance(exports, list):
+        raise GhostlabContractError("candidate checkpoint exports must be a list")
+    candidate_exports: list[dict[str, Any]] = []
+    for export in exports:
+        if not isinstance(export, Mapping) or export.get("path") not in names:
+            raise GhostlabContractError("candidate checkpoint contains an undeclared export")
+        path = _safe_attempt_path(agent_dir, agent_dir / str(export["path"]))
+        if not path.is_file():
+            if status == "completed":
+                raise GhostlabContractError(f"candidate checkpoint export is missing: {path}")
+            continue
+        digest = sha256_file(path)
+        if export.get("sha256") not in (None, digest):
+            raise GhostlabContractError(f"candidate checkpoint export changed: {path}")
+        candidate_exports.append({"path": str(path), "sha256": digest})
+    if status == "completed" and not candidate_exports:
+        raise GhostlabContractError("candidate checkpoint has no workspace export")
+    events = report.get("events_path")
+    trace: Path | None = None
+    if isinstance(events, str) and events:
+        trace = _safe_attempt_path(agent_dir, agent_dir / events)
+        if not trace.is_file():
+            trace = None
+    return {
+        "schema_version": CANDIDATE_PHASE_SCHEMA,
+        "attempt_id": metadata["attempt_id"],
+        "input_sha256": metadata["input_sha256"],
+        "status": status,
+        "artifact_run": str(report_path),
+        "artifact_run_sha256": sha256_file(report_path),
+        "candidate_exports": candidate_exports,
+        "trace_path": str(trace) if trace else None,
+        "trace_sha256": sha256_file(trace) if trace else None,
+        "tokens": _normalize_tokens(report),
+        "cost_usd": _cost_usd(report),
+        "wall_time_ms": wall_time_ms,
+    }
+
+
+def _recover_candidate_phase(
+    attempt_dir: Path, metadata: Mapping[str, Any]
+) -> dict[str, Any] | None:
+    phase_path = _safe_attempt_path(attempt_dir, attempt_dir / "candidate-phase.json")
+    report_path = _safe_attempt_path(attempt_dir, attempt_dir / "agent" / "artifact-run.json")
+    if not phase_path.exists() and not report_path.exists():
+        return None
+    cached = read_json(phase_path) if phase_path.exists() else None
+    if cached is not None and (
+        not isinstance(cached, Mapping)
+        or cached.get("schema_version") != CANDIDATE_PHASE_SCHEMA
+        or cached.get("input_sha256") != metadata["input_sha256"]
+        or cached.get("attempt_id") != metadata["attempt_id"]
+    ):
+        raise GhostlabContractError("candidate checkpoint does not match this attempt")
+    phase = _candidate_phase(
+        attempt_dir,
+        metadata,
+        wall_time_ms=int(cached.get("wall_time_ms", 0)) if isinstance(cached, Mapping) else 0,
+    )
+    if cached is not None and cached != phase:
+        raise GhostlabContractError("candidate checkpoint evidence changed after it was persisted")
+    write_json(phase_path, phase)
+    return phase
+
+
 def run_attempt(
+    paths: TasksetPaths,
+    config: RunConfig,
+    task: PublishedTask,
+    agent: AgentSpec,
+    seed: int,
+) -> AttemptResult:
+    """Serialize one attempt and clean local inputs only after persisting its outcome."""
+    _validate_safe_id(config.eval_id, "eval id")
+    _validate_safe_id(task.task_id, "task id")
+    _validate_safe_id(agent.agent_id, "agent id")
+    if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+        raise TaskVerificationError("seed must be a non-negative integer")
+    require_archive_volume(paths.root)
+    eval_dir = _safe_attempt_path(paths.root, paths.eval_dir(config.eval_id))
+    attempt_dir = _safe_attempt_path(
+        eval_dir, paths.attempt_dir(config.eval_id, task.task_id, agent.agent_id, seed)
+    )
+    _safe_attempt_path(attempt_dir, attempt_dir / ".attempt.lock")
+    for name in (
+        "prompt.txt", "resources.json", "candidate-phase.json", "attempt-metadata.json", "cleanup.json",
+    ):
+        _safe_attempt_path(attempt_dir, attempt_dir / name)
+    with exclusive_lock(attempt_dir / ".attempt.lock"):
+        try:
+            return _run_attempt(paths, config, task, agent, seed)
+        finally:
+            retained_error: dict[str, str] | None = None
+            try:
+                metadata_path = attempt_dir / "attempt-metadata.json"
+                if metadata_path.is_file() and not metadata_path.is_symlink():
+                    metadata = read_json(metadata_path)
+                    if isinstance(metadata, dict):
+                        retained: dict[str, Any] = {}
+                        for name in (
+                            "scorer/scorer-staging/input/score-input.json",
+                            "scorer/scorer-staging/input/task.json",
+                            "scorer/scorer-staging/input/resources.json",
+                            "scorer/scorer-staging/input/resource-usage.json",
+                        ):
+                            path = _safe_attempt_path(attempt_dir, attempt_dir / name)
+                            if path.is_file():
+                                retained[name] = {"path": str(path), "sha256": sha256_file(path)}
+                        if retained:
+                            if metadata.get("scorer_inputs", retained) != retained:
+                                raise TaskVerificationError("retained scorer input evidence changed")
+                            metadata["scorer_inputs"] = retained
+                            write_json(metadata_path, metadata)
+            except (OSError, GhostlabError, TaskVerificationError) as exc:
+                retained_error = {"path": str(attempt_dir), "error": str(exc)}
+            cleanup = cleanup_attempt_workspace(attempt_dir)
+            if retained_error is not None:
+                cleanup["errors"].append(retained_error)
+            if cleanup["removed"] or cleanup["errors"]:
+                write_json(attempt_dir / "cleanup.json", {**cleanup, "updated_at": utc_now()})
+
+
+def _run_attempt(
     paths: TasksetPaths,
     config: RunConfig,
     task: PublishedTask,
@@ -1550,6 +2107,17 @@ def run_attempt(
             "binary_sha256": None,
         }
     agent_asset_hashes = agent.referenced_asset_hashes()
+    if (
+        config.expected_agent_asset_hashes is not None
+        and agent_asset_hashes != dict(config.expected_agent_asset_hashes)
+    ):
+        raise TaskVerificationError("agent referenced assets changed after the experiment was planned")
+    prompt = task.prompt_path.read_bytes()
+    if sha256_bytes(prompt) != task.prompt_sha256:
+        raise TaskVerificationError("task prompt changed after it was verified")
+    trace_id = _trace_id(config)
+    execution_prompt = tag_experiment_prompt(prompt.decode("utf-8"), trace_id)
+    execution_prompt_sha256 = sha256_text(execution_prompt)
     attempt_id, input_sha256 = compute_attempt_id(
         task,
         agent,
@@ -1559,9 +2127,39 @@ def run_attempt(
         scorer_timeout_seconds=effective_scorer_timeout,
         candidate_export_name=config.candidate_export_name,
         agent_asset_hashes=agent_asset_hashes,
+        execution_prompt_sha256=execution_prompt_sha256,
+        experiment_id=trace_id,
     )
     attempt_dir = paths.attempt_dir(config.eval_id, task.task_id, agent.agent_id, seed)
-    attempt_path = attempt_dir / "attempt.json"
+    attempt_path = _safe_attempt_path(attempt_dir, attempt_dir / "attempt.json")
+    metadata_path = _safe_attempt_path(attempt_dir, attempt_dir / "attempt-metadata.json")
+    metadata: dict[str, Any] = {
+        "schema_version": ATTEMPT_METADATA_SCHEMA,
+        "attempt_id": attempt_id,
+        "input_sha256": input_sha256,
+        "eval_id": config.eval_id,
+        "experiment_id": trace_id,
+        "experiment_job_id": config.experiment_id,
+        "tags": [EXPERIMENT_TAG, f"{EXPERIMENT_TAG_PREFIX}{trace_id}"],
+        "source_prompt_sha256": task.prompt_sha256,
+        "execution_prompt_sha256": execution_prompt_sha256,
+        "agent_referenced_assets": agent_asset_hashes,
+        "workspace_exports": list(
+            ArtifactRunRequest(
+                agent_config=agent.config_path,
+                workspace=attempt_dir / "workspace",
+                prompt_file=attempt_dir / "prompt.txt",
+                run_dir=attempt_dir / "agent",
+                export_workspace=config.candidate_export_name,
+            ).workspace_exports()
+        ),
+    }
+    previous_metadata = read_json(metadata_path) if metadata_path.is_file() else None
+    same_inputs = isinstance(previous_metadata, Mapping) and all(
+        previous_metadata.get(key) == value for key, value in metadata.items()
+    )
+    if same_inputs and isinstance(previous_metadata, Mapping):
+        metadata.update(previous_metadata)
 
     if attempt_path.is_file() and not config.force:
         payload = read_json(attempt_path, label="attempt record")
@@ -1577,7 +2175,7 @@ def run_attempt(
                 and record.agent_id == agent.agent_id
                 and record.seed == seed
             ):
-                trusted = True
+                trusted = same_inputs and metadata.get("attempt_sha256") == sha256_file(attempt_path)
                 if record.status == "scored":
                     try:
                         validate_scorer_run_attestation(
@@ -1589,14 +2187,48 @@ def run_attempt(
                             scorer_package_sha256=task.scorer_package_sha256,
                             mode=str(task.scorer_manifest.get("mode", "")),
                         )
+                        score_report_path = _safe_attempt_path(
+                            attempt_dir, attempt_dir / "score-report.json"
+                        )
+                        if (
+                            not score_report_path.is_file()
+                            or metadata.get("score_report_sha256") != sha256_file(score_report_path)
+                        ):
+                            trusted = False
                     except GhostlabContractError:
                         trusted = False
-                if trusted:
+                if trusted and same_inputs:
                     return _reuse(payload, attempt_dir)
+
+    if config.experiment_id is not None and not config.force:
+        if (
+            isinstance(previous_metadata, Mapping)
+            and previous_metadata.get("experiment_job_id") is not None
+            and not same_inputs
+        ):
+            raise TaskVerificationError("experiment attempt inputs changed; create a new experiment")
+        if attempt_path.is_file() and same_inputs:
+            raise TaskVerificationError(
+                "persisted experiment attempt evidence is invalid; refusing to replace it"
+            )
 
     attempt_dir.mkdir(parents=True, exist_ok=True)
 
     def failed(status: str, detail: str, **extra: Any) -> AttemptResult:
+        if "candidate_exports" not in metadata:
+            metadata["candidate_exports"] = [
+                {"path": str(path), "sha256": sha256_file(path)}
+                for name in metadata["workspace_exports"]
+                if (path := _safe_attempt_path(attempt_dir, attempt_dir / "agent" / name)).is_file()
+            ]
+        events = _safe_attempt_path(attempt_dir, attempt_dir / "agent" / "events.jsonl")
+        if events.is_file():
+            metadata.update(agent_events_path=str(events), agent_events_sha256=sha256_file(events))
+        artifact_report = _safe_attempt_path(attempt_dir, attempt_dir / "agent" / "artifact-run.json")
+        if artifact_report.is_file():
+            metadata["artifact_run_sha256"] = sha256_file(artifact_report)
+            extra.setdefault("artifact_run", str(artifact_report))
+        write_json(metadata_path, metadata)
         return _write_attempt(
             AttemptResult(
                 attempt_id=attempt_id,
@@ -1617,51 +2249,73 @@ def run_attempt(
         )
 
     if version_error is not None:
+        write_json(metadata_path, metadata)
         return failed("harness_error", str(version_error))
 
-    workspace = attempt_dir / "workspace"
-    if workspace.exists():
-        shutil.rmtree(workspace)
+    write_json(metadata_path, metadata)
     try:
-        unpack_bundle(task.base_bundle, workspace)
-    except Exception as exc:  # noqa: BLE001 - materialization failure is a harness failure
-        return failed("harness_error", f"could not materialize the base repository: {exc}")
-
-    prompt_path = attempt_dir / "prompt.txt"
-    shutil.copyfile(task.prompt_path, prompt_path)
-
-    agent_run_dir = attempt_dir / "agent"
-    if agent_run_dir.exists():
-        shutil.rmtree(agent_run_dir)
-    runtime_inputs = attempt_dir / ".runtime-inputs"
-    try:
-        execution_config, sandbox_image_override = agent.execution_config(
-            task.environment_image,
-            runtime_inputs,
-            expected_asset_hashes=agent_asset_hashes,
-        )
-    except Exception:
-        if runtime_inputs.exists():
-            shutil.rmtree(runtime_inputs)
-        raise
-    artifact_request = ArtifactRunRequest(
-        agent_config=execution_config,
-        workspace=workspace,
-        prompt_file=prompt_path,
-        run_dir=agent_run_dir,
-        export_workspace=config.candidate_export_name,
-        timeout_seconds=effective_aut_timeout,
-        sandbox_image=sandbox_image_override,
-        setup_commands=task.setup_commands,
-        label="candidate-agent",
-    )
-    started = time.monotonic()
-    try:
-        try:
+        phase = _recover_candidate_phase(attempt_dir, metadata) if same_inputs and not config.force else None
+        if phase is None:
+            workspace = _safe_attempt_path(attempt_dir, attempt_dir / "workspace")
+            if workspace.exists():
+                shutil.rmtree(workspace)
+            try:
+                materialize_task_base(task, workspace)
+            except Exception as exc:
+                return failed("harness_error", f"could not materialize the base repository: {exc}")
+            if not config.force:
+                for stale_name in (
+                    "agent", "scorer", "score-report.json", "score-stage.json", "candidate-phase.json",
+                ):
+                    stale = _safe_attempt_path(attempt_dir, attempt_dir / stale_name)
+                    if not stale.exists():
+                        continue
+                    interrupted = _safe_attempt_path(
+                        attempt_dir, attempt_dir / ("interrupted-" + uuid.uuid4().hex)
+                    )
+                    interrupted.mkdir()
+                    stale.replace(interrupted / stale.name)
+            prompt_path = _safe_attempt_path(attempt_dir, attempt_dir / "prompt.txt")
+            atomic_write_text(prompt_path, execution_prompt)
+            agent_run_dir = _safe_attempt_path(attempt_dir, attempt_dir / "agent")
+            if agent_run_dir.exists():
+                shutil.rmtree(agent_run_dir)
+            runtime_inputs = _safe_attempt_path(attempt_dir, attempt_dir / ".runtime-inputs")
+            execution_config, sandbox_image_override = agent.execution_config(
+                task.environment_image,
+                runtime_inputs,
+                expected_asset_hashes=agent_asset_hashes,
+            )
+            metadata.update(
+                execution_config_sha256=sha256_file(execution_config),
+                workspace_sha256=sha256_path(workspace),
+            )
+            write_json(metadata_path, metadata)
+            artifact_request = ArtifactRunRequest(
+                agent_config=execution_config,
+                workspace=workspace,
+                prompt_file=prompt_path,
+                run_dir=agent_run_dir,
+                export_workspace=config.candidate_export_name,
+                timeout_seconds=effective_aut_timeout,
+                sandbox_image=sandbox_image_override,
+                setup_commands=task.setup_commands,
+                label="candidate-agent",
+            )
+            started = time.monotonic()
             run = config.ghostlab.artifact_run(artifact_request)
-        finally:
-            if runtime_inputs.exists():
-                shutil.rmtree(runtime_inputs)
+            metadata["ghostlab_workspace_input_sha256"] = run.workspace_input_sha256
+            phase = _candidate_phase(
+                attempt_dir, metadata, wall_time_ms=int((time.monotonic() - started) * 1000)
+            )
+            write_json(attempt_dir / "candidate-phase.json", phase)
+        metadata.update(
+            candidate_exports=phase["candidate_exports"],
+            agent_events_path=phase["trace_path"],
+            agent_events_sha256=phase["trace_sha256"],
+            artifact_run_sha256=phase["artifact_run_sha256"],
+        )
+        write_json(metadata_path, metadata)
     except GhostlabTimeoutError as exc:
         return failed("agent_timeout", str(exc))
     except (GhostlabBinaryError, GhostlabInvocationError) as exc:
@@ -1670,43 +2324,25 @@ def run_attempt(
         return failed("harness_error", str(exc))
     except GhostlabError as exc:
         return failed("agent_error", str(exc))
+    except Exception as exc:
+        return failed("harness_error", f"could not prepare or run candidate: {exc}")
 
-    wall_time_ms = int((time.monotonic() - started) * 1000)
-    tokens = _normalize_tokens(run.report)
-    cost = _cost_usd(run.report)
-    mapped = ARTIFACT_STATUS_TO_ATTEMPT.get(run.status, "harness_error")
+    wall_time_ms = phase["wall_time_ms"]
+    tokens = phase["tokens"]
+    cost = phase["cost_usd"]
+    mapped = ARTIFACT_STATUS_TO_ATTEMPT.get(phase["status"], "harness_error")
     if mapped is not None:
         return failed(
             mapped,
-            f"candidate artifact-run reported status={run.status}: "
-            f"{run.stderr_tail or '<no stderr>'}",
+            f"candidate artifact-run reported status={phase['status']}",
             tokens=tokens,
             wall_time_ms=wall_time_ms,
             cost_usd=cost,
-            artifact_run=str(run.report_path),
+            artifact_run=phase["artifact_run"],
         )
 
-    candidate = next(
-        (
-            path
-            for name in artifact_request.workspace_exports()
-            if (path := run.export_path(name)) is not None
-        ),
-        None,
-    )
-    if candidate is None:
-        return failed(
-            "harness_error",
-            "candidate artifact-run exported no workspace archive matching "
-            f"{artifact_request.workspace_exports()}",
-            tokens=tokens,
-            wall_time_ms=wall_time_ms,
-            cost_usd=cost,
-            artifact_run=str(run.report_path),
-        )
-    candidate_sha256 = run.export_sha256.get(config.candidate_export_name) or sha256_path(
-        candidate, excludes=()
-    )
+    candidate = Path(phase["candidate_exports"][0]["path"])
+    candidate_sha256 = phase["candidate_exports"][0]["sha256"]
 
     resources_path = attempt_dir / "resources.json"
     write_json(
@@ -1721,116 +2357,30 @@ def run_attempt(
         },
     )
 
-    trace = run.events_path if run.events_path and run.events_path.is_file() else None
-    score_report_path = attempt_dir / "score-report.json"
-    scorer_run_dir = attempt_dir / "scorer"
-    score_report_path.unlink(missing_ok=True)
-    if scorer_run_dir.exists():
-        shutil.rmtree(scorer_run_dir)
+    trace = Path(phase["trace_path"]) if phase["trace_path"] else None
     try:
-        scored = config.ghostlab.scorer_run(
-            ScorerRunRequest(
-                task_path=task.public_task_path,
-                scorer_path=task.scorer_manifest_path,
-                candidate_path=candidate,
-                output_path=score_report_path,
-                attempt_id=attempt_id,
-                trace_path=trace,
-                resource_usage_path=resources_path,
-                seed=seed,
-                run_dir=scorer_run_dir,
-                timeout_seconds=effective_scorer_timeout,
-                label="scorer",
-            )
-        )
-        validate_scorer_run_attestation(
-            scored.run_report_path,
-            task_id=task.task_id,
+        scored = score_candidate(
+            task,
+            config.ghostlab,
+            candidate,
             attempt_id=attempt_id,
-            status=scored.status,
-            task_sha256=task.public_task_sha256,
-            scorer_package_sha256=task.scorer_package_sha256,
-            mode=str(task.scorer_manifest.get("mode", "")),
-            run_dir=scorer_run_dir,
+            output_dir=attempt_dir,
+            trace_path=trace,
+            resource_usage_path=resources_path,
+            seed=seed,
+            timeout_seconds=effective_scorer_timeout,
+            reuse=not config.force,
         )
-    except GhostlabTimeoutError as exc:
-        return failed(
-            "scorer_timeout",
-            str(exc),
-            candidate_state_sha256=candidate_sha256,
-            tokens=tokens,
-            wall_time_ms=wall_time_ms,
-            cost_usd=cost,
-            artifact_run=str(run.report_path),
-        )
-    except (GhostlabBinaryError, GhostlabInvocationError) as exc:
+    except Exception as exc:
         return failed(
             "harness_error",
-            str(exc),
+            f"could not score candidate: {exc}",
             candidate_state_sha256=candidate_sha256,
+            artifact_run=phase["artifact_run"],
             tokens=tokens,
             wall_time_ms=wall_time_ms,
             cost_usd=cost,
-            artifact_run=str(run.report_path),
         )
-    except GhostlabContractError as exc:
-        return failed(
-            "invalid_result",
-            str(exc),
-            candidate_state_sha256=candidate_sha256,
-            tokens=tokens,
-            wall_time_ms=wall_time_ms,
-            cost_usd=cost,
-            artifact_run=str(run.report_path),
-        )
-    except GhostlabError as exc:
-        return failed(
-            "scorer_error",
-            str(exc),
-            candidate_state_sha256=candidate_sha256,
-            tokens=tokens,
-            wall_time_ms=wall_time_ms,
-            cost_usd=cost,
-            artifact_run=str(run.report_path),
-        )
-
-    validation = validate_score_report(
-        scored.report,
-        pass_threshold=task.pass_threshold,
-        scorer_manifest=task.scorer_manifest,
-        expected_task_id=task.task_id,
-        expected_attempt_id=attempt_id,
-        expected_scorer_package_sha256=task.scorer_package_sha256,
-    )
-    status = scored.status
-    report_errors = list(validation.errors)
-    if scored.status == "scored":
-        if scored.report.get("valid") is not True:
-            report_errors.append("scored report must carry valid=true")
-        reported_threshold = scored.report.get("pass_threshold")
-        if (
-            isinstance(reported_threshold, bool)
-            or not isinstance(reported_threshold, (int, float))
-            or not math.isfinite(float(reported_threshold))
-            or abs(float(reported_threshold) - task.pass_threshold) > 1e-9
-        ):
-            report_errors.append(
-                "score report pass_threshold does not match the published scorer"
-            )
-        reported_unscored = scored.report.get("unscored_weight")
-        if (
-            isinstance(reported_unscored, bool)
-            or not isinstance(reported_unscored, (int, float))
-            or not math.isfinite(float(reported_unscored))
-            or abs(float(reported_unscored) - validation.unscored_weight) > 1e-9
-        ):
-            report_errors.append(
-                "score report unscored_weight does not match its component results"
-            )
-    error: str | None = None
-    if report_errors:
-        status = "invalid_result"
-        error = "; ".join(report_errors)
 
     return _write_attempt(
         AttemptResult(
@@ -1838,7 +2388,7 @@ def run_attempt(
             task_id=task.task_id,
             agent_id=agent.agent_id,
             seed=seed,
-            status=status,
+            status=scored.status,
             attempt_dir=attempt_dir,
             input_sha256=input_sha256,
             agent_config_sha256=agent.config_sha256,
@@ -1846,17 +2396,17 @@ def run_attempt(
             scorer_package_sha256=task.scorer_package_sha256,
             source_id=task.source_id,
             candidate_state_sha256=candidate_sha256,
-            score=validation.score_total if status == "scored" else None,
-            passed=validation.passed if status == "scored" else None,
+            score=scored.score,
+            passed=scored.passed,
             pass_threshold=task.pass_threshold,
-            components=tuple(dict(component) for component in scored.components),
+            components=scored.components,
             tokens=tokens,
             wall_time_ms=wall_time_ms,
             cost_usd=cost,
-            error=error,
-            warnings=validation.warnings,
-            artifact_run=str(run.report_path),
-            score_report=str(scored.report_path),
+            error=scored.error,
+            warnings=scored.warnings,
+            artifact_run=phase["artifact_run"],
+            score_report=str(scored.report_path) if scored.report_path is not None else None,
         )
     )
 
@@ -1945,16 +2495,22 @@ def run_agent(
     *,
     token_budgets: Sequence[float] = (),
     wall_time_budgets_ms: Sequence[float] = (),
+    task_paths: TasksetPaths | None = None,
+    on_attempt: Callable[[AttemptResult], None] | None = None,
 ) -> EvalResult:
     """Evaluate one agent over the published task set at every requested seed."""
     _validate_safe_id(config.eval_id, "eval id")
     agent.verify()
-    resolved = sorted(task_ids) if task_ids is not None else list_published_tasks(paths)
+    snapshot_paths = task_paths or paths
+    resolved = sorted(task_ids) if task_ids is not None else list_published_tasks(snapshot_paths)
     attempts: list[AttemptResult] = []
     for task_id in resolved:
-        task = verify_published_task(paths, task_id)
+        task = verify_published_task(snapshot_paths, task_id)
         for seed in config.seeds:
-            attempts.append(run_attempt(paths, config, task, agent, seed))
+            attempt = run_attempt(paths, config, task, agent, seed)
+            attempts.append(attempt)
+            if on_attempt is not None:
+                on_attempt(attempt)
     aggregate = collect_eval_report(
         paths,
         config.eval_id,
@@ -2006,27 +2562,80 @@ def collect_eval_report(
     token_budgets: Sequence[float] = (),
     wall_time_budgets_ms: Sequence[float] = (),
 ) -> BenchmarkAggregate:
+    """Publish one aggregate under an evaluation-local cross-process lock."""
+    _validate_safe_id(eval_id, "eval id")
+    require_archive_volume(paths.root)
+    eval_dir = _safe_attempt_path(paths.root, paths.eval_dir(eval_id))
+    with exclusive_lock(_safe_attempt_path(eval_dir, eval_dir / ".results.lock")):
+        return _collect_eval_report(
+            paths, eval_id, token_budgets=token_budgets, wall_time_budgets_ms=wall_time_budgets_ms,
+        )
+
+
+def _collect_eval_report(
+    paths: TasksetPaths,
+    eval_id: str,
+    *,
+    token_budgets: Sequence[float] = (),
+    wall_time_budgets_ms: Sequence[float] = (),
+) -> BenchmarkAggregate:
     """Aggregate every attempt written under one eval and publish ``results.json``."""
     eval_dir = paths.eval_dir(eval_id)
     records = load_attempts(eval_dir) if eval_dir.is_dir() else []
+    from .suite import load_evaluation_cohort
+
+    cohort = load_evaluation_cohort(paths, eval_id)
+    sources = cohort["task_sources"] if cohort is not None else task_source_index(paths)
+    requested: dict[str, int] | None = None
+    if cohort is not None:
+        sources = cohort["task_sources"]
+        for record in records:
+            if (
+                record.task_id not in cohort["task_ids"]
+                or record.seed not in cohort["seeds"]
+                or record.source_id != sources[record.task_id]
+            ):
+                raise TaskVerificationError("attempt does not belong to its frozen evaluation cohort")
+            artifacts = cohort["task_artifacts"][record.task_id]
+            if (
+                record.base_bundle_sha256 != artifacts["base_bundle_sha256"]
+                or record.scorer_package_sha256 != artifacts["scorer_package_sha256"]
+                or record.pass_threshold != artifacts["pass_threshold"]
+            ):
+                raise TaskVerificationError(
+                    "attempt artifact hashes differ from its frozen evaluation cohort"
+                )
+        count = len(cohort["task_ids"]) * len(cohort["seeds"])
+        requested = {record.agent_id: count for record in records}
     aggregate = aggregate_attempts(
         records,
         name=paths.name,
         eval_id=eval_id,
-        task_sources=task_source_index(paths),
+        task_sources=sources,
+        requested_attempts=requested,
         token_budgets=token_budgets,
         wall_time_budgets_ms=wall_time_budgets_ms,
         generated_at=utc_now(),
     )
+    if cohort is not None:
+        aggregate = BenchmarkAggregate(
+            name=aggregate.name,
+            eval_id=aggregate.eval_id,
+            agents=aggregate.agents,
+            generated_at=aggregate.generated_at,
+            cohort=cohort,
+        )
     write_aggregate(paths.results_path(eval_id), aggregate)
     return aggregate
 
 
 __all__ = [
     "ARTIFACT_STATUS_TO_ATTEMPT",
+    "ATTEMPT_METADATA_SCHEMA",
     "CANDIDATE_EXPORT_NAME",
     "RESOURCE_USAGE_SCHEMA",
     "AgentSpec",
+    "CandidateScore",
     "AttemptResult",
     "EvalResult",
     "PublishedTask",
@@ -2035,9 +2644,11 @@ __all__ = [
     "TasksetReportSummary",
     "TasksetRunSummary",
     "collect_eval_report",
+    "cleanup_attempt_workspace",
     "compute_attempt_id",
     "default_eval_id",
     "list_evals",
+    "materialize_task_base",
     "parse_seeds",
     "report_taskset",
     "resolve_eval_id",
@@ -2045,6 +2656,7 @@ __all__ = [
     "run_agent",
     "unique_eval_id",
     "run_attempt",
+    "score_candidate",
     "run_taskset",
     "summarize_run",
     "task_source_index",
@@ -2284,6 +2896,11 @@ def run_taskset(
     aut_timeout_seconds: float | None = None,
     scorer_timeout_seconds: float | None = None,
     candidate_export_name: str = CANDIDATE_EXPORT_NAME,
+    suite_id: str | None = None,
+    split: str | None = None,
+    experiment_id: str | None = None,
+    expected_agent_asset_hashes: Mapping[str, str] | None = None,
+    on_attempt: Callable[[AttemptResult], None] | None = None,
 ) -> TasksetRunSummary:
     """Run ``retro benchmark taskset run`` (spec sections 15 and 20).
 
@@ -2292,6 +2909,7 @@ def run_taskset(
     fingerprint may reuse ``attempt.json`` unless ``force=True``.
     """
     paths = resolve_taskset_paths(layout, name)
+    require_archive_volume(paths.root)
     if agent is None:
         raise TaskVerificationError("--agent is required")
     spec = (
@@ -2302,6 +2920,27 @@ def run_taskset(
         )
     )
     resolved_seeds = parse_seeds(seeds)
+    snapshot_paths: TasksetPaths | None = None
+    if suite_id is not None:
+        from .suite import bind_evaluation_cohort, load_suite
+
+        suite = load_suite(paths, suite_id)
+        selected_split = split if split is not None else "test"
+        selected_ids = sorted(set(task_ids)) if task_ids is not None else suite.task_ids(selected_split)
+        requested_eval = eval_id if eval_id is not None else f"{suite.suite_id}-{selected_split}"
+        eval_id = resolve_run_eval_id(paths, requested_eval)
+        eval_dir = _safe_attempt_path(paths.root, paths.eval_dir(eval_id))
+        with exclusive_lock(_safe_attempt_path(eval_dir, eval_dir / ".cohort.lock")):
+            bind_evaluation_cohort(paths, eval_id, suite, selected_split, selected_ids, resolved_seeds)
+        snapshot_paths = suite.paths
+        task_ids = selected_ids
+    elif split is not None:
+        raise TaskVerificationError("--split requires a curated --suite")
+    else:
+        resolved_eval = resolve_run_eval_id(paths, eval_id)
+        if (paths.eval_dir(resolved_eval) / "cohort.json").exists():
+            raise TaskVerificationError("this evaluation is frozen; pass its --suite or use --eval new")
+        eval_id = resolved_eval
     config = RunConfig(
         ghostlab=ghostlab or GhostlabCli(ghostlab_bin, env=ghostlab_env),
         eval_id=resolve_run_eval_id(paths, eval_id),
@@ -2310,6 +2949,8 @@ def run_taskset(
         scorer_timeout_seconds=scorer_timeout_seconds,
         candidate_export_name=candidate_export_name,
         force=force,
+        experiment_id=experiment_id,
+        expected_agent_asset_hashes=expected_agent_asset_hashes,
     )
     result = run_agent(
         paths,
@@ -2318,6 +2959,8 @@ def run_taskset(
         task_ids,
         token_budgets=token_budgets,
         wall_time_budgets_ms=wall_time_budgets_ms,
+        task_paths=snapshot_paths,
+        on_attempt=on_attempt,
     )
     return summarize_run(paths, result)
 

@@ -12,6 +12,10 @@ _MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _INLINE_CODE_RE = re.compile(r"(`+).*?\1")
+_QUOTED_TEXT_RE = re.compile(
+    r""""(?:\\.|[^"\\])*"|(?<!\w)(?:[rubf]{1,2})?'(?:\\.|[^'\\])*'|“[^”]*”|‘[^’]*’""",
+    re.IGNORECASE,
+)
 
 
 def parse_markers(text: str, *, event_id: str | None) -> list[dict[str, Any]]:
@@ -43,15 +47,19 @@ def _marker_visible_text(text: str) -> str:
     fence: str | None = None
     for line in (text or "").splitlines():
         stripped = line.lstrip()
-        fence_match = re.match(r"(`{3,}|~{3,})", stripped)
+        fence_match = re.match(r"(`{3,}|~{3,})(.*)$", stripped)
         if fence_match:
-            token = fence_match.group(1)[0]
+            token, remainder = fence_match.groups()
             if fence is None:
                 fence = token
-            elif fence == token:
+            elif (
+                fence[0] == token[0]
+                and len(token) >= len(fence)
+                and not remainder.strip()
+            ):
                 fence = None
             continue
-        if fence is not None or stripped.startswith(">"):
+        if fence is not None or stripped.startswith(">") or line.startswith(("    ", "\t")):
             continue
-        visible.append(_INLINE_CODE_RE.sub("", line))
+        visible.append(_QUOTED_TEXT_RE.sub("", _INLINE_CODE_RE.sub("", line)))
     return "\n".join(visible)

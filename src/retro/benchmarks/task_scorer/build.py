@@ -70,6 +70,7 @@ TASK_DEFINITIONS_SCHEMA = "retro-task-definitions-v1"
 SCORER_SCHEMA = "retro-scorer-v1"
 VALIDATION_CASES_SCHEMA = "retro-scorer-validation-cases-v1"
 SCORER_VALIDATION_SCHEMA = "retro-scorer-validation-v1"
+SCORER_VALIDATION_EVIDENCE_VERSION = 2
 BENCHMARK_TASK_SCHEMA = "retro-benchmark-task-v1"
 PROVENANCE_SCHEMA = "retro-task-provenance-v1"
 ENVIRONMENT_SCHEMA = "retro-project-environment-v1"
@@ -1645,6 +1646,7 @@ class ValidationCaseResult:
     runs: int
     code: str | None = None
     detail: str = ""
+    targeted_component: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1659,6 +1661,7 @@ class ValidationCaseResult:
             "runs": self.runs,
             "code": self.code,
             "detail": self.detail,
+            "targeted_component": self.targeted_component,
         }
 
 
@@ -1787,6 +1790,7 @@ def evaluate_validation_case(
             runs=len(reports),
             code=VALIDATION_CASE_CODES.get(kind, "SCORER_OVERFIT"),
             detail=detail,
+            targeted_component=targeted_component,
         )
 
     if status != "scored":
@@ -1802,6 +1806,7 @@ def evaluate_validation_case(
             runs=len(reports),
             code="BUILDER_CONTRACT_ERROR",
             detail=f"validation case {case_id!r} returned status={status!r} instead of 'scored'",
+            targeted_component=targeted_component,
         )
     if total is None:
         return fail(f"validation case {case_id!r} produced no numeric score_total")
@@ -1866,6 +1871,7 @@ def evaluate_validation_case(
         hard_gate_failures=failures,
         component_values=values,
         runs=len(reports),
+        targeted_component=targeted_component,
     )
 
 
@@ -2656,6 +2662,7 @@ def _stage_scorer_validated(
     fingerprint = sha256_json(
         {
             "stage": "scorer_validated",
+            "evidence_version": SCORER_VALIDATION_EVIDENCE_VERSION,
             "package": package_sha256,
             "cases": sha256_file(cases_path),
             "case_inputs": _validation_input_hashes(ctx, cases, export_root),
@@ -3159,6 +3166,10 @@ def _stage_published(
                 "source_dir": str(ctx.source_dir),
                 "manifest_sha256": sha256_file(ctx.source_dir / "manifest.json"),
                 "repo": dict(repo),
+                "selection": (
+                    read_json(ctx.source_dir / "selection.json", label="source selection proof")
+                    if (ctx.source_dir / "selection.json").is_file() else None
+                ),
             },
         )
         write_json(
@@ -3205,6 +3216,10 @@ def _load_validation(payload: Mapping[str, Any]) -> ScorerValidation:
             runs=int(item.get("runs") or 0),
             code=item.get("code") if isinstance(item.get("code"), str) else None,
             detail=str(item.get("detail", "")),
+            targeted_component=(
+                item.get("targeted_component")
+                if isinstance(item.get("targeted_component"), str) else None
+            ),
         )
         for item in payload.get("cases") or ()
         if isinstance(item, Mapping)

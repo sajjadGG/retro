@@ -857,6 +857,69 @@ have network disabled. Dependency builds also default to no network; an
 allowlist is accepted only when paired with a named, externally egress-filtered
 container network.
 
+#### Curated benchmark releases and training episodes
+
+Freeze the published candidate pool before comparing agents or exporting
+training data:
+
+```bash
+# Default: exact-provenance, deterministic, evaluation-only release.
+retro benchmark taskset curate --name personal-git-v1 --suite release-v1
+
+retro benchmark taskset run --name personal-git-v1 --suite release-v1 \
+  --agent candidate-agents/codex.json --seeds 0,1,2 --eval heldout-v1
+retro benchmark taskset run --name personal-git-v1 --suite release-v1 \
+  --agent candidate-agents/custom-script.json --seeds 0,1,2 --eval heldout-v1
+```
+
+`curate --policy /outside/repo/curation.json` can explicitly create
+train/validation/test splits, group related task families, exclude candidates
+with reasons and assign training-sampling priorities. Repository grouping is
+the default; insufficient independent groups are rejected rather than split
+randomly by task. Anchored historical reconstructions require an explicit
+`allow_reconstructed` policy and are never labelled exact replay. Moved or
+deleted worktrees can be reconnected with `select --repo-root /current/checkout`;
+the original Git evidence is still required and raw captures are not changed.
+
+For a suite with a populated training split:
+
+```bash
+retro benchmark taskset export --name personal-git-v1 --suite training-v1 \
+  --split train --out /path/to/train-export --include-rewards
+retro benchmark taskset reset --name personal-git-v1 --suite training-v1 \
+  --task-id <id> --out /path/to/episode-1
+retro benchmark taskset reward --name personal-git-v1 --suite training-v1 \
+  --task-id <id> --candidate /path/to/candidate-state.tar.zst \
+  --out /path/to/reward-1 --ghostlab-bin /path/to/ghostlab
+```
+
+The actor gets only public prompt/environment and an exact Git-free repository
+tree. Optional hidden verifiers are exported separately under `private/` for
+the trusted harness, never the actor. Container images are digest references,
+not bundled layers. Reset does not run setup or agent code on the host.
+Terminal rewards reuse the benchmark scorer: observed task failure is numeric
+zero; infrastructure failure is `null`, persisted with an error and a nonzero
+CLI exit. This is an environment/export interface, not an included RL optimizer
+or a Gymnasium action loop.
+
+Curated runs bind the suite hash, split, task IDs, scorer/base hashes and seeds.
+Missing attempts reduce coverage rather than disappear. Reports include
+source-normalized scored rewards, valid coverage, per-task seed spread,
+conditional pass@k and source-bootstrap intervals; incomplete coverage is not
+a finished leaderboard result. The dashboard's **Tasks** view opens with
+cards for the current verified tasks: the goal, isolated repository environment
+and what the hidden grader requires. Click a task for its full instructions,
+reset/work/grade contract and success criteria; exact versions, source evidence
+and validation are expandable. **Creation history & older versions** retains
+candidate yield/rejections and prior releases. Warnings explain which saved
+records cannot be compared and why; they do not imply that the current tasks
+failed. **Evals** contains frozen task datasets, not model scores.
+**Experiments** owns job setup, agent results and per-trial grading evidence;
+results remain scoped to each evaluation cohort.
+
+See [the release design and research rationale](specs/learning/trajectory_environment_releases.md)
+for the exact policy schema, numerical gates, split algorithm and limitations.
+
 ---
 
 ## Memory backend
@@ -924,8 +987,10 @@ Optional embeddings are still intentionally out of the core path for now; keywor
 
 ## Dashboard
 
-A static, offline dashboard over the session catalog and the signal store — no server, no
-bundler, no network. It opens straight from disk.
+A static, offline dashboard over the session catalog and the signal store. It
+opens straight from disk without a server, bundler or network. An opt-in
+localhost server adds experiment controls and private grader inspection; exported
+dashboards stay read-only.
 
 | Page | Answers |
 | --- | --- |
@@ -934,12 +999,22 @@ bundler, no network. It opens straight from disk.
 | Sessions | Every captured session, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable and virtualized for tens of thousands of rows, with toggles for excluded sessions and subagent roll-up |
 | Session | One session: header, tags and why each was applied, inline markers, signals grouped by category with evidence event ids, the subagent tree, and links to the transcript, normalized events and raw capture in the archive |
 | Signals | Every signal in `signals/definitions.json` with its distribution, compared across agents, clients, projects, models or work kinds with a minimum-sample guard |
+| Tasks | Task/environment cards, full instructions, declared grader input/output contract, source evidence and expandable validation/audit; no agent results |
+| Evals | Current verified frozen task datasets, splits, exact versions and their tasks; older versions remain available separately |
+| Experiments | Frozen job setup, candidate models/scripts, seeds, explicit starts, cohort-bound results and every trial's grade, failure evidence and cleanup record |
 | Data quality | Why sessions were excluded (by tag and rule, with examples), interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run with its failures |
 
-The build reads only derived files — `catalog/sessions.jsonl`, `signals/definitions.json`,
-`signals/sessions.jsonl` and the newest `sync/runs/*.json` — never the normalized event
-stream, so it stays fast as the archive grows. Rendered transcripts are linked in place and
-never copied.
+The build reads only published files — catalog, signal and sync contracts plus
+benchmark taskset/release/evaluation metadata — never the normalized event
+stream. It does not embed hidden scorer source, accepted patches or candidate
+code. Rendered transcripts are linked in place and never copied. Private grader
+source, judge prompts and actual saved input/output JSON are available only
+through authenticated, on-demand localhost inspection, never static exports.
+Deterministic graders have code and input artifacts, not an LLM prompt.
+
+Warning panels have **Dismiss** and **Show dismissed warning** buttons. Dismissal
+is browser-local and applies to the exact warning set; new warnings reappear.
+Dismissal does not repair old records or permit otherwise invalid comparisons.
 
 Session rows are shipped as a compact fact table in `data/sessions-*.js` shards; the browser
 does the slicing and aggregation. Per-session detail lives in hashed buckets that are rebuilt
@@ -975,6 +1050,56 @@ atomically, keeping at most two generations.
 ```bash
 retro dashboard view     # the same data in the terminal
 ```
+
+### Experiments and local controls
+
+```bash
+# Register trusted candidate configurations, then open the printed localhost URL.
+# This starts no agent/model jobs.
+retro dashboard serve \
+  --agent /path/to/candidate-a.json \
+  --agent /path/to/candidate-b.json
+
+# CLI alternative: freeze a plan, then explicitly start it.
+retro experiment create --id comparison-1 --title "Candidate comparison" \
+  --description "Which candidate preserves the requested behavior?" \
+  --dataset pilot/personal-v1/test \
+  --agent /path/to/candidate-a.json --agent /path/to/candidate-b.json \
+  --seeds 0,1,2
+retro experiment run comparison-1
+retro experiment show comparison-1 --json
+retro dashboard build
+
+# Optional finished-job export cleanup; task bundles and grade evidence stay intact.
+retro experiment cleanup comparison-1 --prune-artifacts
+```
+
+Repeat `--dataset` to include multiple frozen datasets. Each dataset has its own
+cohort; its agents share the exact tasks, split and seeds. Setup pins the suite
+hash, agent configuration hash and referenced assets. Changing those inputs
+after planning fails explicitly rather than using a different setup.
+
+The server binds only `127.0.0.1`, checks request origin/Host and a per-process
+control token, and accepts only registered agent IDs. UI-created jobs default to
+at most 100 requested trials and 3600-second timeout overrides; configure the
+trial cap with `--max-attempts`. Saving/viewing a plan never calls a model.
+Starting it is a separate explicit action and may incur charges. Ghostlab's
+configured sandbox backend must be available. The server stays open until an
+active job has finished and cleaned up.
+
+Jobs live in `rollout-memory/experiments/<id>/setup.json` and `job.json`, separate
+from frozen task datasets. Every candidate evaluation prompt carries
+`#retro:ignore` and experiment tags; the default catalog also recognizes proven
+historical Ghostlab provenance and its recorded descendants. Experiment traces
+remain inspectable but do not feed normal learning/mining/analysis workflows.
+Explicit inspection APIs and intentional catalog overrides remain available.
+
+Local duplicate workspaces/runtime inputs and known scorer staging copies are
+cleaned after a trial. Saved grades, attestations, input JSON and compact
+evidence remain; bulky exported candidates can be pruned explicitly after a job
+finishes. Ghostlab owns sandbox teardown. Retro never globally prunes Docker,
+OpenShell, task bundles or captured raw data. Automatic archive TTL is not
+implemented; Docker execution alone does not remove exported files on disk.
 
 ### Cost computation
 
