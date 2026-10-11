@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -21,10 +22,16 @@ def published(tmp_path: Path) -> PublishedFixture:
 
 
 @pytest.mark.parametrize("command", ["curate", "export", "reset", "reward"])
-def test_environment_commands_have_help(command: str):
-    result = runner.invoke(app, ["benchmark", "taskset", command, "--help"])
+@pytest.mark.parametrize("color", [False, True], ids=["plain", "colored"])
+def test_environment_commands_have_help(command: str, color: bool):
+    env = {
+        "FORCE_COLOR": "1" if color else None,
+        "NO_COLOR": None if color else "1",
+        "TERM": "xterm-256color" if color else "dumb",
+    }
+    result = runner.invoke(app, ["benchmark", "taskset", command, "--help"], color=color, env=env)
     assert result.exit_code == 0, result.output
-    assert "--suite" in result.output
+    assert "--suite" in click.unstyle(result.output)
 
 
 def test_cli_curates_exports_resets_and_grades_a_real_candidate(
