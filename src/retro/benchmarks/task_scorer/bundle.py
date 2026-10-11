@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ...renderer import render_markdown
-from ...schema import read_events
+from ...schema import NormalizedEvent, RawRef, read_events, write_events
 from ...storage import Layout
 from ...utils import atomic_write_text
 from . import git_state
@@ -413,6 +413,43 @@ def _write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write("\n")
 
 
+def _commit_request_events(candidate: SourceCandidate) -> list[NormalizedEvent]:
+    """One user event carrying the commit message of an unlinked commit source.
+
+    A commit with no linked session still has a user-authored request: its own
+    message. Without it the rollout is empty, every replay task fails the
+    ``NO_STABLE_GOAL`` lint for missing user-event provenance, and commit-message
+    back-translation -- the documented fallback -- cannot produce a task at all.
+    """
+    provenance = candidate.provenance or {}
+    prompt_provenance = provenance.get("prompt_provenance")
+    if not isinstance(prompt_provenance, Mapping):
+        return []
+    if prompt_provenance.get("mode") != "commit_message":
+        return []
+    text = str(prompt_provenance.get("prompt") or "").strip()
+    if not text:
+        return []
+    commit = provenance.get("commit")
+    commit_map: Mapping[str, Any] = commit if isinstance(commit, Mapping) else {}
+    sha = str(commit_map.get("sha") or candidate.outcome_sha)
+    timestamp = commit_map.get("authored_at") or commit_map.get("committed_at")
+    return [
+        NormalizedEvent(
+            event_id=f"commit-message:{sha}",
+            session_id=candidate.session_id,
+            host=candidate.host,
+            sequence=1,
+            actor="user",
+            event_type="message",
+            summary="commit message (no captured session)",
+            raw_ref=RawRef(path="repo/git-log.jsonl", line=1),
+            timestamp=str(timestamp) if timestamp else None,
+            payload={"text": text, "provenance": "commit_message", "commit": sha},
+        )
+    ]
+
+
 def _populate(
     staging: Path,
     *,
@@ -430,7 +467,7 @@ def _populate(
     if candidate.normalized_path is not None and candidate.normalized_path.is_file():
         shutil.copyfile(candidate.normalized_path, events_path)
     else:
-        events_path.write_text("", encoding="utf-8")
+        write_events(events_path, _commit_request_events(candidate))
     transcript = render_markdown(read_events(events_path))
     (rollout_dir / "transcript.md").write_text(transcript, encoding="utf-8")
 

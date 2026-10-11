@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from retro.benchmarks.task_scorer import bundle as bundle_mod
-from retro.benchmarks.task_scorer import commit_sources, selection
+from retro.benchmarks.task_scorer import commit_sources, selection, task_lint
 from retro.benchmarks.task_scorer.schema import ProjectEnvironment, SourceBundleManifest
+from retro.schema import read_events
 from retro.storage import Layout
+from retro.utils import event_text
 from tests.task_scorer_helpers import (
     event,
     git,
@@ -431,7 +433,16 @@ def test_commit_source_bundles_match_the_bundle_contract(archive: Layout, mined)
     assert manifest.repo.state_confidence == "exact_clean_commit"
     assert manifest.provenance is not None
     assert manifest.outcome_labels is not None
-    assert (built.path / "rollout" / "events.jsonl").read_text(encoding="utf-8") == ""
+    rollout = [
+        json.loads(line)
+        for line in (built.path / "rollout" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [record["payload"]["text"] for record in rollout] == [
+        "fix: guard divide against zero"
+    ]
 
     provenance = json.loads(
         (built.path / "context" / "source-provenance.json").read_text(encoding="utf-8")
@@ -452,6 +463,27 @@ def test_linked_commit_bundles_carry_the_session_rollout(archive: Layout, mined)
     built = bundle_mod.build_source_bundle(candidate, layout=archive, name="mined")
     events = (built.path / "rollout" / "events.jsonl").read_text(encoding="utf-8")
     assert "Make divide reject a zero denominator." in events
+    assert bundle_mod.verify_bundle(built.path)
+
+
+def test_unlinked_commit_bundles_carry_the_commit_message_as_a_user_event(
+    archive: Layout, mined
+):
+    """Commit-message back-translation needs a user event; an empty rollout
+    would fail the replay lint's user-provenance gate for every task."""
+    root, shas = mined
+    candidate, _rejection = commit_sources.select_commit_source(
+        layout=archive, root=root, sha=shas["feature"], branch="main"
+    )
+    assert candidate is not None
+    assert (candidate.provenance or {})["prompt_provenance"]["mode"] == "commit_message"
+    built = bundle_mod.build_source_bundle(candidate, layout=archive, name="mined")
+    events = list(read_events(built.path / "rollout" / "events.jsonl"))
+    assert len(events) == 1
+    assert events[0].actor == "user" and events[0].event_type == "message"
+    assert "guard divide against zero" in event_text(events[0])
+    facts = task_lint.BundleFacts.from_bundle(built.path)
+    assert facts.user_event_ids == {events[0].event_id}
     assert bundle_mod.verify_bundle(built.path)
 
 
