@@ -188,6 +188,49 @@ trees twice with network disabled. Image builds use no network unless both a
 destination `--build-network-allowlist` and an externally egress-filtered
 `--build-network-name` are supplied.
 
+### Source kinds and sampling
+
+`taskset select --sources sessions|commits|both` chooses where sources come
+from. `sessions` (default) uses captured rollouts, which need clean-start proof.
+`commits` mines non-merge commits from the repositories in your catalog (or the
+repeatable `--commit-repo`): the first parent is an exact base, so commit
+sources never fail with `NO_EXACT_BASE_SHA`. Mining is read-only — `rev-list`,
+`show`, `diff` and `cat-file` only, never a checkout in your working tree.
+
+```bash
+retro benchmark taskset select --name personal-git-v1 \
+  --sources both --commit-window-days 180 \
+  --commit-max-files 50 --commit-max-lines 2000 \
+  --strategy stratified --seed 0 --limit 40 --max-per-repo 10
+```
+
+Commit gates: a commit must change a non-test source file and must not be a
+merge (`--commit-include-merges` opts in, anchored on the first parent), a
+revert, a docs/lockfile/vendored-only change, or larger than
+`--commit-max-files`/`--commit-max-lines`. Rejections use
+`COMMIT_MERGE_COMMIT`, `COMMIT_REVERT_COMMIT`, `COMMIT_NO_SOURCE_CHANGE`,
+`COMMIT_TOO_LARGE` and `OUTCOME_NOT_DURABLE`. When a captured session ran in the
+same repository, overlaps or precedes the commit by at most
+`--commit-link-window-hours` (default 6), and edited files the commit changed,
+Retro links it and uses the user's real first prompt as prompt provenance;
+otherwise the commit message is the provenance (`mode: commit_message`).
+
+Selection is sampled, not sorted: `--strategy stratified` (default) walks
+(repository, work kind, diff-size) strata round-robin with a seeded order that
+puts informative outcomes — corrected and failed-then-fixed sources — ahead of
+clean successes, which rank ahead of unlabeled ones. `--seed` makes that order
+reproducible, `--max-per-repo` caps one repository's share (defaulting to 25% of
+`--limit` when limiting), and `--limit` caps the selection. Sources dropped by a
+cap are recorded as `SAMPLED_OUT` with their stratum. `--strategy
+lexicographic` restores the original `source_id` ordering. With neither
+`--limit` nor `--max-per-repo`, sampling only reorders and drops nothing.
+
+Each selected source records `outcome_labels` with evidence: whether its outcome
+commit survived in the branch history, pushback proxies (`friction.*` signals
+and human turns after the first edit), and the heuristic `outcome.status`.
+`selection.json` reports yield as counts by source kind, outcome label and
+rejection code.
+
 During `taskset run`, Retro passes the published digest-pinned image and setup
 argument array to Ghostlab. A candidate agent without its own runtime image runs
 directly in that image. A local candidate-runtime Dockerfile may add the pinned

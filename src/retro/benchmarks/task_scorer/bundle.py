@@ -45,6 +45,7 @@ BUNDLE_REPORT_SCHEMA = "retro-taskset-bundles-v1"
 BUNDLE_INPUT_SCHEMA = "retro-source-bundle-input-v1"
 MANIFEST_NAME = "manifest.json"
 SELECTION_RECORD_NAME = "selection.json"
+SOURCE_PROVENANCE_NAME = "source-provenance.json"
 BUNDLE_LAYOUT = (
     "manifest.json",
     "selection.json",
@@ -58,6 +59,8 @@ BUNDLE_LAYOUT = (
     "context/project-files.json",
     "context/test-commands.json",
 )
+# Only commit-mined sources carry prompt provenance that is not in the rollout.
+COMMIT_BUNDLE_EXTRAS = (f"context/{SOURCE_PROVENANCE_NAME}",)
 
 PROJECT_FILE_NAMES = (
     "AGENTS.md",
@@ -152,6 +155,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _rollout_events_digest(path: Path | None) -> str:
+    """Digest of the rollout stream; commit sources without a linked session hash empty."""
+    if path is None or not path.is_file():
+        return hashlib.sha256(b"").hexdigest()
+    return file_sha256(path)
+
+
 def _normalized_executable_mode(mode: int) -> str:
     return "0755" if mode & 0o111 else "0644"
 
@@ -216,6 +226,11 @@ def _source_manifest(
         rollout_events_sha256=rollout_events_sha256,
         repo=candidate.repo_anchor(),
         task_limits=task_limits,
+        source_kind=candidate.kind,
+        provenance=dict(candidate.provenance) if candidate.provenance is not None else None,
+        outcome_labels=(
+            dict(candidate.outcome_labels) if candidate.outcome_labels is not None else None
+        ),
     )
 
 
@@ -241,7 +256,7 @@ def _current_input_fingerprint(
     manifest = _source_manifest(
         candidate,
         task_limits,
-        file_sha256(candidate.normalized_path),
+        _rollout_events_digest(candidate.normalized_path),
     )
     environment = candidate.environment.to_dict() if candidate.environment is not None else None
     return _input_fingerprint(
@@ -412,7 +427,10 @@ def _populate(
     rollout_dir = staging / "rollout"
     rollout_dir.mkdir(parents=True, exist_ok=True)
     events_path = rollout_dir / "events.jsonl"
-    shutil.copyfile(candidate.normalized_path, events_path)
+    if candidate.normalized_path is not None and candidate.normalized_path.is_file():
+        shutil.copyfile(candidate.normalized_path, events_path)
+    else:
+        events_path.write_text("", encoding="utf-8")
     transcript = render_markdown(read_events(events_path))
     (rollout_dir / "transcript.md").write_text(transcript, encoding="utf-8")
 
@@ -446,10 +464,12 @@ def _populate(
     )
     if environment is not None:
         _write_json(context_dir / "environment.json", environment.to_dict())
+    if candidate.provenance is not None:
+        _write_json(context_dir / SOURCE_PROVENANCE_NAME, dict(candidate.provenance))
 
     _write_json(staging / SELECTION_RECORD_NAME, candidate.selection_record())
 
-    manifest = _source_manifest(candidate, task_limits, file_sha256(events_path))
+    manifest = _source_manifest(candidate, task_limits, _rollout_events_digest(events_path))
     _write_json(staging / MANIFEST_NAME, manifest.to_dict())
     manifest = manifest.with_content_hash(compute_content_hash(staging))
     _write_json(staging / MANIFEST_NAME, manifest.to_dict())
@@ -609,6 +629,55 @@ def _reselect(
     return candidate, None, ""
 
 
+def _commit_limits_from_selection(recorded: Any) -> Any:
+    """Re-prove commit sources with the gates their selection recorded."""
+    from . import commit_sources
+
+    limits = recorded.get("limits") if isinstance(recorded, Mapping) else None
+    return commit_sources.limits_from_dict(limits if isinstance(limits, Mapping) else None)
+
+
+def _reselect_commit(
+    *,
+    layout: Layout,
+    entry: Mapping[str, Any],
+    branch: str,
+    resolver: Any,
+    require_environment: bool,
+    stability_horizon_days: int,
+    commit_limits: Any = None,
+) -> tuple[SourceCandidate | None, str | None, str]:
+    """Re-prove a commit-mined source from Git before bundling it."""
+    from . import commit_sources
+
+    candidate, code, detail = commit_sources.reselect_commit_entry(
+        layout=layout,
+        entry=entry,
+        branch=branch,
+        limits=commit_limits,
+        stability_horizon_days=stability_horizon_days,
+    )
+    if candidate is None:
+        return None, code, detail
+    environment: ProjectEnvironment | None = None
+    if resolver is not None:
+        try:
+            environment = resolver(candidate)
+        except (OSError, RuntimeError, ValueError) as error:
+            return None, "ENVIRONMENT_UNAVAILABLE", f"environment resolution failed: {error}"
+    if environment is not None and environment.base_sha != candidate.base_sha:
+        environment = None
+    if environment is None and require_environment:
+        return (
+            None,
+            "ENVIRONMENT_UNAVAILABLE",
+            "no validated project environment for this repository state",
+        )
+    if environment is not None:
+        candidate = dataclasses.replace(candidate, environment=environment)
+    return candidate, None, ""
+
+
 def bundle_taskset(
     *,
     layout: Layout,
@@ -626,6 +695,13 @@ def bundle_taskset(
     task_limits: TaskLimits | None = None,
     force: bool = False,
     write: bool = True,
+    sources: str = "sessions",
+    strategy: str = "stratified",
+    seed: int = 0,
+    max_per_repo: int | None = None,
+    limit: int | None = None,
+    commit_repos: Sequence[Path] | None = None,
+    commit_limits: Any = None,
 ) -> TasksetBundleReport:
     """Bundle a taskset's sources for ``retro benchmark taskset bundle``.
 
@@ -684,6 +760,17 @@ def bundle_taskset(
                 return embedded_environments.get(candidate.base_sha)
 
             resolver = resolve_embedded
+        recorded_sampling = payload.get("sampling")
+        recorded_commits = (
+            recorded_sampling.get("commits")
+            if isinstance(recorded_sampling, Mapping)
+            else None
+        )
+        recorded_commit_limits = (
+            commit_limits
+            if commit_limits is not None
+            else _commit_limits_from_selection(recorded_commits)
+        )
         for entry in entries:
             if not isinstance(entry, Mapping):
                 raise BundleError("selection.json selected entries must be objects")
@@ -695,19 +782,31 @@ def bundle_taskset(
                 if entry.get("repo_root_overridden") is True and isinstance(entry.get("repo_root"), str)
                 else None
             )
-            candidate, code, detail = _reselect(
-                layout=layout,
-                host=entry_host,
-                session_id=session_id,
-                branch=str(entry.get("branch") or branch),
-                resolver=resolver,
-                require_environment=require_environment,
-                stability_horizon_days=stability_horizon_days,
-                repo_root=repo_root if repo_root is not None else recorded_override,
-                allow_reconstruction=(
-                    isinstance(entry.get("base"), Mapping)
-                    and entry["base"].get("resolution") == "anchored_reconstruction"
-                ),
+            candidate, code, detail = (
+                _reselect_commit(
+                    layout=layout,
+                    entry=entry,
+                    branch=branch,
+                    resolver=resolver,
+                    require_environment=require_environment,
+                    stability_horizon_days=stability_horizon_days,
+                    commit_limits=recorded_commit_limits,
+                )
+                if str(entry.get("source_kind") or "session") == "commit"
+                else _reselect(
+                    layout=layout,
+                    host=entry_host,
+                    session_id=session_id,
+                    branch=str(entry.get("branch") or branch),
+                    resolver=resolver,
+                    require_environment=require_environment,
+                    stability_horizon_days=stability_horizon_days,
+                    repo_root=repo_root if repo_root is not None else recorded_override,
+                    allow_reconstruction=(
+                        isinstance(entry.get("base"), Mapping)
+                        and entry["base"].get("resolution") == "anchored_reconstruction"
+                    ),
+                )
             )
             if candidate is None:
                 outcomes.append(
@@ -753,6 +852,13 @@ def bundle_taskset(
             repo_root=repo_root,
             allow_reconstruction=allow_reconstruction,
             write=write,
+            sources=sources,
+            strategy=strategy,
+            seed=seed,
+            max_per_repo=max_per_repo,
+            limit=limit,
+            commit_repos=commit_repos,
+            commit_limits=commit_limits,
         )
         for rejection in selection.rejections:
             outcomes.append(

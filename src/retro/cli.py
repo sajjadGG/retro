@@ -35,6 +35,7 @@ from .benchmarks.task_scorer.build import (
     resolve_taskset_paths,
 )
 from .benchmarks.task_scorer.bundle import BundleError, bundle_taskset
+from .benchmarks.task_scorer.commit_sources import CommitLimits, CommitSourceError
 from .benchmarks.task_scorer.environment import DockerContainerRuntime, resolve_environment
 from .benchmarks.task_scorer.episodes import (
     EpisodeError,
@@ -1099,6 +1100,20 @@ def _included_mining_targets(
 # ---- benchmark ---------------------------------------------------------------
 
 
+def _print_selection_yield(counts: dict[str, Any]) -> None:
+    """Yield is a pipeline metric: report selected kinds, labels and rejections."""
+    for title, key in (
+        ("by kind", "by_kind"),
+        ("by outcome", "by_label"),
+        ("rejected", "by_code"),
+    ):
+        values = counts.get(key) or {}
+        if not values:
+            continue
+        rendered = ", ".join(f"{name}={value}" for name, value in values.items())
+        console.print(f"  {title}: {rendered}")
+
+
 @taskset_app.command("select")
 def taskset_select_cmd(
     name: str = typer.Option(..., "--name", help="Taskset name"),
@@ -1184,9 +1199,60 @@ def taskset_select_cmd(
         min=0,
         help="Days an outcome must survive without a revert",
     ),
+    sources: str = typer.Option(
+        "sessions",
+        "--sources",
+        help="sessions|commits|both; commits mine your own Git history for task sources",
+    ),
+    strategy: str = typer.Option(
+        "stratified",
+        "--strategy",
+        help="stratified (repo/work-kind/size strata, outcome-informed) or lexicographic",
+    ),
+    seed: int = typer.Option(0, "--seed", min=0, help="Seed for deterministic stratified sampling"),
+    max_per_repo: Optional[int] = typer.Option(
+        None,
+        "--max-per-repo",
+        min=1,
+        help="Cap on selected sources per repository; defaults to 25% of --limit when limiting",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum number of selected sources"
+    ),
+    commit_repo: Optional[list[Path]] = typer.Option(
+        None,
+        "--commit-repo",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Repository to mine commits from; repeatable, defaults to catalog repositories",
+    ),
+    commit_window_days: int = typer.Option(
+        180, "--commit-window-days", min=1, help="Only mine commits from the last N days"
+    ),
+    commit_max_files: int = typer.Option(
+        50, "--commit-max-files", min=1, help="Skip commits touching more files than this"
+    ),
+    commit_max_lines: int = typer.Option(
+        2000, "--commit-max-lines", min=1, help="Skip commits changing more lines than this"
+    ),
+    commit_scan_limit: int = typer.Option(
+        200, "--commit-scan-limit", min=1, help="Commits examined per repository"
+    ),
+    commit_link_window_hours: float = typer.Option(
+        6.0,
+        "--commit-link-window-hours",
+        min=0.0,
+        help="Link a captured session to a commit it precedes by at most this many hours",
+    ),
+    commit_include_merges: bool = typer.Option(
+        False,
+        "--commit-include-merges",
+        help="Also mine merge commits, anchored on their first parent",
+    ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
-    """Select proven Git-backed rollouts and record every rejection."""
+    """Select proven Git-backed sources and record every rejection."""
     lay = _layout(root)
     resolved_host = (
         None
@@ -1239,8 +1305,22 @@ def taskset_select_cmd(
             stability_horizon_days=stability_horizon_days,
             repo_root=repo_root,
             allow_reconstruction=allow_reconstruction,
+            sources=sources,
+            strategy=strategy,
+            seed=seed,
+            max_per_repo=max_per_repo,
+            limit=limit,
+            commit_repos=list(commit_repo or []) or None,
+            commit_limits=CommitLimits(
+                window_days=commit_window_days,
+                max_files=commit_max_files,
+                max_lines=commit_max_lines,
+                scan_limit=commit_scan_limit,
+                link_window_hours=commit_link_window_hours,
+                include_merges=commit_include_merges,
+            ),
         )
-    except (SelectionError, SchemaError) as exc:
+    except (SelectionError, SchemaError, CommitSourceError) as exc:
         console.print(f"[red]taskset selection failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     counts = result.result.to_dict()["counts"]
@@ -1248,6 +1328,7 @@ def taskset_select_cmd(
         f"[green]selected {counts['selected']} source(s); "
         f"rejected {counts['rejected']}[/green]"
     )
+    _print_selection_yield(counts)
     if result.path is not None:
         console.print(f"  selection: {result.path}")
 

@@ -14,7 +14,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -53,22 +53,44 @@ REJECTION_CODES: tuple[str, ...] = (
     "SCORER_UNSAFE",
     "BUILDER_CONTRACT_ERROR",
     "HARNESS_ERROR",
+    "COMMIT_MERGE_COMMIT",
+    "COMMIT_NO_SOURCE_CHANGE",
+    "COMMIT_REVERT_COMMIT",
+    "COMMIT_TOO_LARGE",
+    "SAMPLED_OUT",
 )
+
+SOURCE_KINDS: tuple[str, ...] = ("session", "commit")
+PROMPT_PROVENANCE_MODES: tuple[str, ...] = ("linked_session", "commit_message")
 
 BASE_RESOLUTIONS: tuple[str, ...] = (
     "captured_start",
     "rollout_command",
     "first_commit_parent",
     "anchored_reconstruction",
+    "commit_parent",
     "unresolved",
 )
-USABLE_BASE_RESOLUTIONS: tuple[str, ...] = BASE_RESOLUTIONS[:4]
+USABLE_BASE_RESOLUTIONS: tuple[str, ...] = (
+    "captured_start",
+    "rollout_command",
+    "first_commit_parent",
+    "anchored_reconstruction",
+    "commit_parent",
+)
 STATE_CONFIDENCES: tuple[str, ...] = ("exact_clean_commit", "approximate")
 OUTCOME_RESOLUTIONS: tuple[str, ...] = (
     "linked_pr_merge",
     "rollout_commit",
     "captured_end",
+    "mined_commit",
     "unresolved",
+)
+USABLE_OUTCOME_RESOLUTIONS: tuple[str, ...] = (
+    "linked_pr_merge",
+    "rollout_commit",
+    "captured_end",
+    "mined_commit",
 )
 TASK_KINDS: tuple[str, ...] = ("replay", "adjacent")
 ADJACENCY_OPERATORS: tuple[str, ...] = (
@@ -613,9 +635,9 @@ class RepoAnchor:
                 f"{where}.base_resolution must be one of {USABLE_BASE_RESOLUTIONS}, "
                 f"got {self.base_resolution!r}"
             )
-        if self.outcome_resolution not in OUTCOME_RESOLUTIONS[:3]:
+        if self.outcome_resolution not in USABLE_OUTCOME_RESOLUTIONS:
             raise SchemaError(
-                f"{where}.outcome_resolution must be one of {OUTCOME_RESOLUTIONS[:3]}, "
+                f"{where}.outcome_resolution must be one of {USABLE_OUTCOME_RESOLUTIONS}, "
                 f"got {self.outcome_resolution!r}"
             )
         if self.state_confidence not in STATE_CONFIDENCES:
@@ -786,11 +808,18 @@ class SourceBundleManifest:
     repo: RepoAnchor
     task_limits: TaskLimits = field(default_factory=TaskLimits)
     content_sha256: str | None = None
+    source_kind: str = "session"
+    provenance: dict[str, Any] | None = None
+    outcome_labels: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         require_sha256_hex(self.rollout_events_sha256, "rollout_events_sha256")
         if self.content_sha256 is not None:
             require_sha256_hex(self.content_sha256, "content_sha256")
+        if self.source_kind not in SOURCE_KINDS:
+            raise SchemaError(
+                f"source_kind must be one of {SOURCE_KINDS}, got {self.source_kind!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -798,27 +827,22 @@ class SourceBundleManifest:
             "source_id": self.source_id,
             "host": self.host,
             "session_id": self.session_id,
+            "source_kind": self.source_kind,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "rollout_events_sha256": self.rollout_events_sha256,
             "repo": self.repo.to_dict(),
             "task_limits": self.task_limits.to_dict(),
+            "provenance": dict(self.provenance) if self.provenance is not None else None,
+            "outcome_labels": (
+                dict(self.outcome_labels) if self.outcome_labels is not None else None
+            ),
             "content_sha256": self.content_sha256,
         }
 
     def with_content_hash(self, digest: str) -> SourceBundleManifest:
         require_sha256_hex(digest, "content_sha256")
-        return SourceBundleManifest(
-            source_id=self.source_id,
-            host=self.host,
-            session_id=self.session_id,
-            started_at=self.started_at,
-            ended_at=self.ended_at,
-            rollout_events_sha256=self.rollout_events_sha256,
-            repo=self.repo,
-            task_limits=self.task_limits,
-            content_sha256=digest,
-        )
+        return replace(self, content_sha256=digest)
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "manifest") -> SourceBundleManifest:
@@ -831,11 +855,14 @@ class SourceBundleManifest:
                 "source_id",
                 "host",
                 "session_id",
+                "source_kind",
                 "started_at",
                 "ended_at",
                 "rollout_events_sha256",
                 "repo",
                 "task_limits",
+                "provenance",
+                "outcome_labels",
                 "content_sha256",
             ),
             where,
@@ -852,6 +879,21 @@ class SourceBundleManifest:
                 payload.get("task_limits", {}), f"{where}.task_limits"
             ),
             content_sha256=_optional_string(payload, "content_sha256", where),
+            source_kind=(
+                _enum(payload, "source_kind", SOURCE_KINDS, where)
+                if payload.get("source_kind") is not None
+                else "session"
+            ),
+            provenance=(
+                _mapping(payload.get("provenance"), f"{where}.provenance")
+                if payload.get("provenance") is not None
+                else None
+            ),
+            outcome_labels=(
+                _mapping(payload.get("outcome_labels"), f"{where}.outcome_labels")
+                if payload.get("outcome_labels") is not None
+                else None
+            ),
         )
 
 
@@ -2456,6 +2498,7 @@ __all__ = [
     "OBSERVABLE_IMPORTANCES",
     "OUTCOME_RESOLUTIONS",
     "PROJECT_ENVIRONMENT_SCHEMA",
+    "PROMPT_PROVENANCE_MODES",
     "REJECTION_CODES",
     "SCORER_MODES",
     "SCORER_SCHEMA",
@@ -2463,10 +2506,12 @@ __all__ = [
     "SCORE_REPORT_SCHEMA",
     "SCORE_STATUSES",
     "SOURCE_BUNDLE_SCHEMA",
+    "SOURCE_KINDS",
     "STATE_CONFIDENCES",
     "TASK_DEFINITIONS_SCHEMA",
     "TASK_KINDS",
     "USABLE_BASE_RESOLUTIONS",
+    "USABLE_OUTCOME_RESOLUTIONS",
     "WEIGHT_TOLERANCE",
     "Adjacency",
     "BenchmarkAttempt",

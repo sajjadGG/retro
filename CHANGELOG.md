@@ -18,7 +18,24 @@
   `capture-hooks.log` in the Retro log directory.
 - `retro doctor` now reports per-host capture hook installation and
   start-capture coverage over Git-backed sessions from the last 30 days.
-
+- Commit-mined benchmark task sources: `retro benchmark taskset select
+  --sources sessions|commits|both` turns non-merge commits from your own
+  repositories into task sources whose base is the commit's first parent, so
+  they never fail with `NO_EXACT_BASE_SHA`. Mining is read-only Git plumbing and
+  never touches your working tree. Commits are gated on touching non-test source
+  files, size (`--commit-max-files`, `--commit-max-lines`), merges, reverts,
+  docs/lockfile/vendored-only changes and the revert stability horizon, and
+  record whether tests were touched. A captured session that overlaps or
+  precedes the commit and edited the same files is linked, contributing its real
+  first prompt as prompt provenance; otherwise the commit message is used.
+- Outcome-informed, deterministic stratified source selection: sources carry
+  evidence-linked `outcome_labels` (commit survival, user pushback proxies,
+  signal outcome), and `--strategy stratified` (default) samples across
+  repository/work-kind/diff-size strata with `--seed`, `--max-per-repo` and
+  `--limit`, prioritizing corrected and failed-then-fixed sources alongside
+  surviving successes. `--strategy lexicographic` keeps the previous ordering.
+  `selection.json` and the selection summary now report yield by source kind,
+  outcome label and rejection code, including `SAMPLED_OUT` drops.
 - Frozen trajectory-derived benchmark suites with evidence-gated curation,
   related-task/repository grouping, explicit train/validation/test splits,
   exact-replay versus opted-in anchored-reconstruction provenance, and

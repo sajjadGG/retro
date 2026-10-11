@@ -402,6 +402,8 @@ def test_select_sources_reports_counts_and_writes_atomically(archive: Layout, re
         "selected": 1,
         "rejected": 1,
         "by_code": {"NO_NORMALIZED_ROLLOUT": 1},
+        "by_kind": {"session": 1},
+        "by_label": {"successful_surviving": 1},
     }
     assert payload["selected"][0]["normalized_path"] == (
         "normalized/codex/session-1.events.jsonl"
