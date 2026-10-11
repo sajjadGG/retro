@@ -4,6 +4,38 @@
 
 ### Added
 
+- `retro capture hooks install|uninstall|status` and `retro setup
+  --capture-hooks` (opt-in, off by default): user-level agent-host session
+  hooks that run `retro capture start|end` automatically for Claude Code
+  (`~/.claude/settings.json`), Codex CLI (`~/.codex/hooks.json`) and GitHub
+  Copilot CLI (`~/.copilot/hooks/retro-capture.json`), so Git-backed task
+  selection gets the exact-base `repo_start.json` / `repo_end.json` evidence it
+  requires. Installs merge into existing configuration, back each edited file
+  up to a timestamped `.bak`, write atomically, are idempotent, and uninstall
+  removes only Retro's own entries. The hidden `retro capture hook` entry point
+  parses each host's stdin payload and is fail-open: never a non-zero exit,
+  never stdout, silent outside Git repositories, with errors appended to
+  `capture-hooks.log` in the Retro log directory.
+- `retro doctor` now reports per-host capture hook installation and
+  start-capture coverage over Git-backed sessions from the last 30 days.
+- Commit-mined benchmark task sources: `retro benchmark taskset select
+  --sources sessions|commits|both` turns non-merge commits from your own
+  repositories into task sources whose base is the commit's first parent, so
+  they never fail with `NO_EXACT_BASE_SHA`. Mining is read-only Git plumbing and
+  never touches your working tree. Commits are gated on touching non-test source
+  files, size (`--commit-max-files`, `--commit-max-lines`), merges, reverts,
+  docs/lockfile/vendored-only changes and the revert stability horizon, and
+  record whether tests were touched. A captured session that overlaps or
+  precedes the commit and edited the same files is linked, contributing its real
+  first prompt as prompt provenance; otherwise the commit message is used.
+- Outcome-informed, deterministic stratified source selection: sources carry
+  evidence-linked `outcome_labels` (commit survival, user pushback proxies,
+  signal outcome), and `--strategy stratified` (default) samples across
+  repository/work-kind/diff-size strata with `--seed`, `--max-per-repo` and
+  `--limit`, prioritizing corrected and failed-then-fixed sources alongside
+  surviving successes. `--strategy lexicographic` keeps the previous ordering.
+  `selection.json` and the selection summary now report yield by source kind,
+  outcome label and rejection code, including `SAMPLED_OUT` drops.
 - Frozen trajectory-derived benchmark suites with evidence-gated curation,
   related-task/repository grouping, explicit train/validation/test splits,
   exact-replay versus opted-in anchored-reconstruction provenance, and
@@ -23,6 +55,11 @@
   owned-artifact cleanup without pruning task bundles or global Docker data.
 - Explicit relocated-checkout support for task selection and bundling without
   mutating historical captures or inventing missing start-state proof.
+- Opt-in `taskset select --allow-reconstruction` recovery for historical
+  sessions without exact start proof, using time-bounded Git anchors, isolated
+  normalized-edit replay, full touched-path pre/post verification, explicit
+  reconstruction rejection codes, and per-file provenance in selection and
+  source-bundle manifests.
 
 - Session catalog (`catalog/sessions.jsonl`): one record per archived session with
   agent, client surface (e.g. `codex-exec`, `copilot-vscode-agent`, `claude-cli`),

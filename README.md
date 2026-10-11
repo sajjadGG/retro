@@ -54,6 +54,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 
 - [Install](#install)
 - [Global setup and periodic capture](#global-setup-and-periodic-capture)
+- [Session capture hooks](#session-capture-hooks)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Source extensions](#source-extensions)
 - [Storage layout](#storage-layout)
@@ -194,6 +195,59 @@ retro archive cutover --plan /path/to/plan.json --link-path /path/to/legacy/roll
 Cutover is allowed only after a successful derived rebuild and a newer
 verification. The original legacy archive is moved to a retained source-backup
 directory before its old path becomes a compatibility symlink.
+
+---
+
+## Session capture hooks
+
+`retro capture start|end` writes the immutable `repo_start.json` /
+`repo_end.json` sidecars that Git-backed task selection requires as exact-base
+proof. Install them as agent-host session hooks so every session gets them
+without a manual step:
+
+```bash
+retro capture hooks status                 # per-host installation state
+retro capture hooks install --dry-run      # report planned edits only
+retro capture hooks install                # all supported hosts
+retro capture hooks install --host claude --host codex
+retro capture hooks uninstall              # remove only Retro's entries
+```
+
+| Host | User-level file | Events | Reference |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (honours `CLAUDE_CONFIG_DIR`) | `SessionStart`, `SessionEnd` | [hooks reference](https://code.claude.com/docs/en/hooks) |
+| Codex CLI | `~/.codex/hooks.json` (honours `CODEX_HOME`) | `SessionStart`, `SessionEnd` | [hooks guide](https://developers.openai.com/codex/hooks) |
+| GitHub Copilot CLI | `~/.copilot/hooks/retro-capture.json` (honours `COPILOT_HOME`) | `sessionStart`, `sessionEnd` | [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference) |
+
+Installation is opt-in, never implicit: it is off by default in `retro setup`
+and is enabled with `retro setup --capture-hooks`, because it edits agent
+configuration outside the archive. Each edited file is copied to a timestamped
+`.bak` first and rewritten atomically. Other hooks in the same file are
+preserved, Retro's own entries are replaced rather than duplicated on
+re-install, and `uninstall` removes only the entries Retro added, deleting a
+file only when nothing else is left in it.
+
+The installed command runs the hidden `retro capture hook` entry point. It
+reads the host's JSON payload on stdin, takes the session id (`session_id` or
+`sessionId`) and `cwd`, and writes the sidecar under
+`raw/<host>/<session-id>/`. It is fail-open by design: it never exits non-zero,
+never writes to stdout (Claude Code injects `SessionStart` stdout into the model
+context), returns immediately when `cwd` is not inside a Git repository, skips
+an already-captured phase instead of rewriting evidence, and appends failures to
+`capture-hooks.log` in the Retro log directory. Set `RETRO_HOOK_COMMAND` to
+override the resolved interpreter or console-script path recorded in the hook.
+
+The Copilot file covers Copilot CLI and Copilot sessions on the VS Code Agent
+Host, which share the same hook implementation; the VS Code *Local* harness
+reads the same user-level directory but has no `SessionEnd` event, so only the
+start capture can fire there. Two host limits apply to the end capture only:
+Claude Code treats `SessionEnd` as observational and does not wait for it, and
+Codex caps `SessionEnd` hooks at three seconds. The start capture, which task
+selection needs as exact-base proof, is unaffected.
+
+`retro doctor` reports the per-host hook state and start-capture coverage: the
+share of sessions started in the last 30 days, in a Git repository, that carry
+`repo_start.json`.
 
 ---
 
@@ -823,10 +877,17 @@ retro capture start --host codex --session-id <session-id> --cwd /path/to/repo
 retro capture end --host codex --session-id <session-id> --cwd /path/to/repo
 ```
 
+Install those two calls as session hooks once instead of running them per
+session (see [Session capture hooks](#session-capture-hooks)):
+
+```bash
+retro capture hooks install
+```
+
 The capture records `HEAD`, its tree, porcelain-v2 status, and recursive
-submodule status. Existing files are never overwritten. Historical rollouts are
-accepted only when equivalent base evidence exists in the rollout; Retro never
-uses a commit selected only by timestamp.
+submodule status. Existing files are never overwritten. By default, historical
+rollouts are accepted only when equivalent exact base evidence exists in the
+rollout.
 
 Construct and run a taskset through Ghostlab's public artifact and scorer
 commands:
@@ -860,6 +921,30 @@ retro benchmark taskset report \
   --eval latest
 ```
 
+Historical sessions without exact clean-start proof have a separate, opt-in
+lane:
+
+```bash
+retro benchmark taskset select \
+  --name reconstructed-v1 \
+  --session-file sessions.txt \
+  --allow-reconstruction \
+  --environment-config /outside/repo/retro-environment.json
+```
+
+Reconstruction first tries the parent of the rollout's first commit, then a
+recorded rollout `HEAD`, then the last commit at or before the session start on
+the branch recorded in session metadata. It never reads reflogs. Retro expands
+that anchor into an isolated, Git-free scratch snapshot, replays normalized
+`apply_patch`, edit, write, and create operations, and compares every touched
+path with the durable outcome. A source is accepted only when every path has
+matching pre-edit evidence, every replayed post-state matches the outcome, no
+shell or otherwise unverifiable edit remains, and reconstruction confidence is
+at least `0.8` (full verification currently yields `1.0`). Failures remain
+visible as `RECONSTRUCTION_PRE_MISMATCH`, `RECONSTRUCTION_POST_MISMATCH`, or
+`RECONSTRUCTION_UNVERIFIABLE_EDIT`. The selection and source-bundle manifests
+record the anchor method and per-file verification.
+
 Every stage is content-addressed and resumable. The evaluated agent receives
 only the prompt, immutable base repository, and public environment contract.
 `taskset run` overrides the agent's sandbox image with that contract's pinned
@@ -870,6 +955,46 @@ macro-average tasks within each rollout source and then sources within the
 benchmark, so sources that yield multiple tasks do not receive extra weight.
 Agent failure, harness failure, scorer failure, and a correctly observed task
 failure remain distinct statuses.
+
+#### Commit-mined sources and outcome-informed sampling
+
+Most historical rollouts never captured clean-start proof, so they are rejected
+with `NO_EXACT_BASE_SHA`. A commit does not have that problem: its first parent
+*is* the pre-change state. `--sources commits` (or `both`) mines non-merge
+commits from the repositories Retro already saw in your catalog, or from the
+repeatable `--commit-repo`:
+
+```bash
+retro benchmark taskset select \
+  --name personal-git-v1 \
+  --sources both \
+  --commit-window-days 180 \
+  --strategy stratified --seed 0 --limit 40 --max-per-repo 10 \
+  --environment-config /outside/repo/retro-environment.json
+```
+
+Mining is read-only: Retro runs `git rev-list`, `git show`, `git diff` and
+`git cat-file` and never checks anything out in your working tree. A commit is
+eligible when it changes a non-test source file, is not a merge, revert, or a
+docs/lockfile/vendored-only change, stays inside `--commit-max-files`
+(default 50) and `--commit-max-lines` (default 2000), and was not reverted
+inside the stability horizon. The bundle records whether the commit touched
+tests. When a captured session ran in the same repository, overlaps or precedes
+the commit by at most `--commit-link-window-hours` (default 6) and edited files
+the commit changed, Retro links it, keeps the rollout in the bundle, and uses
+your real first prompt as prompt provenance; otherwise the commit message is the
+provenance, marked `commit_message`, for the TaskDefiner to back-translate.
+
+Selection is sampled rather than sorted. The default `--strategy stratified`
+walks (repository, work kind, diff size) strata round-robin with a seeded order
+that puts informative outcomes first: sources you corrected or that failed and
+were fixed rank above clean surviving successes, which rank above unlabeled
+ones. `--seed` reproduces an ordering exactly, `--max-per-repo` stops one
+repository from dominating (default 25% of `--limit` when limiting), and
+`--strategy lexicographic` restores the original ordering. Every selected source
+carries `outcome_labels` — commit survival, pushback proxies, signal outcome,
+each with evidence references — and the command prints yield by source kind,
+outcome label and rejection code.
 
 The environment resolver prioritizes an explicit external config, then a
 project Dockerfile/devcontainer declaration, validated CI commands, and an

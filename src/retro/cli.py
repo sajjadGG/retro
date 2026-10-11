@@ -16,7 +16,7 @@ import shutil
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import typer
 from rich.console import Console
@@ -35,6 +35,7 @@ from .benchmarks.task_scorer.build import (
     resolve_taskset_paths,
 )
 from .benchmarks.task_scorer.bundle import BundleError, bundle_taskset
+from .benchmarks.task_scorer.commit_sources import CommitLimits, CommitSourceError
 from .benchmarks.task_scorer.environment import DockerContainerRuntime, resolve_environment
 from .benchmarks.task_scorer.episodes import (
     EpisodeError,
@@ -107,6 +108,9 @@ from .signals import (
 )
 from .storage import Layout, default_layout
 
+if TYPE_CHECKING:
+    from .capture_hooks import HookChange
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
@@ -120,6 +124,12 @@ capture_app = typer.Typer(
     help="Capture immutable repository state at coding-session boundaries.",
 )
 app.add_typer(capture_app, name="capture")
+
+capture_hooks_app = typer.Typer(
+    no_args_is_help=True,
+    help="Install agent-host session hooks that run capture automatically.",
+)
+capture_app.add_typer(capture_hooks_app, name="hooks")
 
 signal_app = typer.Typer(
     no_args_is_help=True,
@@ -248,6 +258,130 @@ def _capture_session_repo_state(
         console.print(f"[red]repository state capture failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     console.print(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True))
+
+
+# ---- capture hooks -----------------------------------------------------------
+
+
+def _hook_hosts(values: Optional[list[str]]) -> Optional[list[str]]:
+    if not values:
+        return None
+    return [value for value in values if value.strip()] or None
+
+
+def _render_hook_changes(changes: list[HookChange]) -> None:
+    table = Table(title="Retro capture hooks")
+    table.add_column("host")
+    table.add_column("action")
+    table.add_column("path")
+    table.add_column("detail")
+    failures = 0
+    for change in changes:
+        if change.action == "error":
+            failures += 1
+        detail_parts = [part for part in (change.message,) if part]
+        if change.backup:
+            detail_parts.append(f"backup: {change.backup}")
+        if change.dry_run and change.changed:
+            detail_parts.append("dry run: nothing written")
+        table.add_row(
+            change.label,
+            change.action,
+            change.path,
+            "; ".join(detail_parts) or "-",
+        )
+    console.print(table)
+    if failures:
+        raise typer.Exit(1)
+
+
+@capture_hooks_app.command("install")
+def capture_hooks_install(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned edits without writing anything"
+    ),
+    root: Optional[Path] = typer.Option(
+        None, help="rollout-memory root recorded in the installed hook command"
+    ),
+) -> None:
+    """Install session start/end hooks that run `retro capture` automatically."""
+    from .capture_hooks import install_hooks
+
+    try:
+        changes = install_hooks(_hook_hosts(host), dry_run=dry_run, root=root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _render_hook_changes(changes)
+
+
+@capture_hooks_app.command("uninstall")
+def capture_hooks_uninstall(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned edits without writing anything"
+    ),
+) -> None:
+    """Remove Retro's session capture hooks, preserving every other hook."""
+    from .capture_hooks import uninstall_hooks
+
+    try:
+        changes = uninstall_hooks(_hook_hosts(host), dry_run=dry_run)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _render_hook_changes(changes)
+
+
+@capture_hooks_app.command("status")
+def capture_hooks_status(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable status"),
+) -> None:
+    """Show where capture hooks are installed for each agent host."""
+    from .capture_hooks import hook_status
+
+    try:
+        statuses = hook_status(_hook_hosts(host))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if as_json:
+        console.print_json(data=[status.to_dict() for status in statuses])
+        return
+    table = Table(title="Retro capture hooks")
+    table.add_column("host")
+    table.add_column("state")
+    table.add_column("start")
+    table.add_column("end")
+    table.add_column("path")
+    table.add_column("detail")
+    for status in statuses:
+        table.add_row(
+            status.label,
+            status.summary(),
+            "yes" if status.start_installed else "no",
+            "yes" if status.end_installed else "no",
+            status.path,
+            status.message or status.docs_url or "-",
+        )
+    console.print(table)
+
+
+@capture_app.command("hook", hidden=True)
+def capture_hook_cmd(
+    host: str = typer.Option("", "--host", help="claude|codex|copilot"),
+    event: str = typer.Option("", "--event", help="start|end"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Capture repository state from a host hook payload on stdin (never fails)."""
+    from .capture_hooks import run_hook_entry
+
+    run_hook_entry(host, event, root=root)
 
 
 # ---- list -------------------------------------------------------------------
@@ -966,6 +1100,20 @@ def _included_mining_targets(
 # ---- benchmark ---------------------------------------------------------------
 
 
+def _print_selection_yield(counts: dict[str, Any]) -> None:
+    """Yield is a pipeline metric: report selected kinds, labels and rejections."""
+    for title, key in (
+        ("by kind", "by_kind"),
+        ("by outcome", "by_label"),
+        ("rejected", "by_code"),
+    ):
+        values = counts.get(key) or {}
+        if not values:
+            continue
+        rendered = ", ".join(f"{name}={value}" for name, value in values.items())
+        console.print(f"  {title}: {rendered}")
+
+
 @taskset_app.command("select")
 def taskset_select_cmd(
     name: str = typer.Option(..., "--name", help="Taskset name"),
@@ -1039,6 +1187,11 @@ def taskset_select_cmd(
         "--allow-unvalidated-environment",
         help="Record source eligibility without publishing buildable tasks",
     ),
+    allow_reconstruction: bool = typer.Option(
+        False,
+        "--allow-reconstruction",
+        help="Opt in to fully verified anchored reconstruction when exact start proof is absent",
+    ),
     branch: str = typer.Option("HEAD", "--branch", help="Project branch containing durable outcomes"),
     stability_horizon_days: int = typer.Option(
         7,
@@ -1046,9 +1199,60 @@ def taskset_select_cmd(
         min=0,
         help="Days an outcome must survive without a revert",
     ),
+    sources: str = typer.Option(
+        "sessions",
+        "--sources",
+        help="sessions|commits|both; commits mine your own Git history for task sources",
+    ),
+    strategy: str = typer.Option(
+        "stratified",
+        "--strategy",
+        help="stratified (repo/work-kind/size strata, outcome-informed) or lexicographic",
+    ),
+    seed: int = typer.Option(0, "--seed", min=0, help="Seed for deterministic stratified sampling"),
+    max_per_repo: Optional[int] = typer.Option(
+        None,
+        "--max-per-repo",
+        min=1,
+        help="Cap on selected sources per repository; defaults to 25% of --limit when limiting",
+    ),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", min=1, help="Maximum number of selected sources"
+    ),
+    commit_repo: Optional[list[Path]] = typer.Option(
+        None,
+        "--commit-repo",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Repository to mine commits from; repeatable, defaults to catalog repositories",
+    ),
+    commit_window_days: int = typer.Option(
+        180, "--commit-window-days", min=1, help="Only mine commits from the last N days"
+    ),
+    commit_max_files: int = typer.Option(
+        50, "--commit-max-files", min=1, help="Skip commits touching more files than this"
+    ),
+    commit_max_lines: int = typer.Option(
+        2000, "--commit-max-lines", min=1, help="Skip commits changing more lines than this"
+    ),
+    commit_scan_limit: int = typer.Option(
+        200, "--commit-scan-limit", min=1, help="Commits examined per repository"
+    ),
+    commit_link_window_hours: float = typer.Option(
+        6.0,
+        "--commit-link-window-hours",
+        min=0.0,
+        help="Link a captured session to a commit it precedes by at most this many hours",
+    ),
+    commit_include_merges: bool = typer.Option(
+        False,
+        "--commit-include-merges",
+        help="Also mine merge commits, anchored on their first parent",
+    ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
-    """Select exact, clean Git-backed rollouts and record every rejection."""
+    """Select proven Git-backed sources and record every rejection."""
     lay = _layout(root)
     resolved_host = (
         None
@@ -1100,8 +1304,23 @@ def taskset_select_cmd(
             branch=branch,
             stability_horizon_days=stability_horizon_days,
             repo_root=repo_root,
+            allow_reconstruction=allow_reconstruction,
+            sources=sources,
+            strategy=strategy,
+            seed=seed,
+            max_per_repo=max_per_repo,
+            limit=limit,
+            commit_repos=list(commit_repo or []) or None,
+            commit_limits=CommitLimits(
+                window_days=commit_window_days,
+                max_files=commit_max_files,
+                max_lines=commit_max_lines,
+                scan_limit=commit_scan_limit,
+                link_window_hours=commit_link_window_hours,
+                include_merges=commit_include_merges,
+            ),
         )
-    except (SelectionError, SchemaError) as exc:
+    except (SelectionError, SchemaError, CommitSourceError) as exc:
         console.print(f"[red]taskset selection failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     counts = result.result.to_dict()["counts"]
@@ -1109,6 +1328,7 @@ def taskset_select_cmd(
         f"[green]selected {counts['selected']} source(s); "
         f"rejected {counts['rejected']}[/green]"
     )
+    _print_selection_yield(counts)
     if result.path is not None:
         console.print(f"  selection: {result.path}")
 
@@ -2080,6 +2300,14 @@ def setup_cmd(
         help="Minimum interval between scheduled signal/dashboard rebuilds",
     ),
     no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
+    capture_hooks: bool = typer.Option(
+        False,
+        "--capture-hooks/--no-capture-hooks",
+        help=(
+            "Also install agent-host session hooks that run `retro capture` "
+            "(edits ~/.claude, ~/.codex and ~/.copilot configuration)"
+        ),
+    ),
 ) -> None:
     """Configure global storage and optionally install periodic capture."""
     from .archive_health import archive_access
@@ -2114,6 +2342,16 @@ def setup_cmd(
     if not no_schedule:
         plist = install_schedule(interval)
         console.print(f"  schedule:  {plist}  (every {interval}s)")
+    if capture_hooks:
+        from .capture_hooks import install_hooks
+
+        for change in install_hooks():
+            console.print(f"  hook {change.host}: {change.action}  {change.path}")
+    else:
+        console.print(
+            "  hooks:     not installed "
+            "(run `retro capture hooks install` for start/end repository state)"
+        )
 
 
 @archive_app.command("plan")
@@ -2286,6 +2524,7 @@ def doctor_cmd() -> None:
         duplicate_volume_mounts,
         scheduled_archive_access,
     )
+    from .capture_hooks import capture_coverage, hook_status
     from .schedule import schedule_status
     from .sync import STAGE_NAMES
 
@@ -2340,6 +2579,18 @@ def doctor_cmd() -> None:
             else 0
         )
         table.add_row("normalized sessions", str(normalized_count))
+        coverage = capture_coverage(layout)
+        table.add_row(
+            f"capture coverage ({coverage.days}d)",
+            f"{coverage.summary()} [{coverage.source}]",
+        )
+        if coverage.sessions and coverage.with_start == 0:
+            message = (
+                "no recent session has repo_start.json; run "
+                "`retro capture hooks install` so benchmarks get an exact base state"
+            )
+            warnings.append(message)
+            table.add_row("capture coverage detail", f"WARNING: {message}")
         try:
             sync_state = json.loads(
                 layout.sync_state_path().read_text(encoding="utf-8")
@@ -2392,6 +2643,8 @@ def doctor_cmd() -> None:
     table.add_row("schedule installed", str(status.get("installed")))
     table.add_row("schedule loaded", str(status.get("loaded")))
     table.add_row("schedule logs", str(user_log_dir()))
+    for hook in hook_status():
+        table.add_row(f"capture hook {hook.host}", f"{hook.summary()}  {hook.path}")
     for warning in warnings:
         table.add_row("warning", warning)
     console.print(table)

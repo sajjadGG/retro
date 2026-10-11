@@ -264,7 +264,7 @@ def test_reconstruction_requires_opt_in_and_is_never_labelled_exact(published: P
     path = published.paths.task_dir(published.task_id) / "private" / "source-link.json"
     source = json.loads(path.read_text())
     source["repo"]["state_confidence"] = "approximate"
-    source["repo"]["base_resolution"] = "first_commit_parent"
+    source["repo"]["base_resolution"] = "anchored_reconstruction"
     write_json(path, source)
     with pytest.raises(SuiteError, match="APPROXIMATE_START_STATE"):
         curate_taskset(published.layout, "pilot")

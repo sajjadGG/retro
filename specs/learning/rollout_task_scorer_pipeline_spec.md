@@ -231,6 +231,49 @@ Reject when:
 - outcome resolution depends on a later unrelated branch state;
 - required secrets or live external state are necessary to verify the result.
 
+### 5.5a Commit-mined sources (implemented)
+
+`select --sources sessions|commits|both` (default `sessions`) adds a second
+source kind. A `commit` source anchors `base_sha` on the commit's first parent,
+so `base_resolution = commit_parent` with `state_confidence = exact_clean_commit`
+and `outcome_resolution = mined_commit`; it never produces `NO_EXACT_BASE_SHA`.
+Enumeration is read-only Git plumbing (`rev-list`, `show`, `diff`, `cat-file`)
+over the repositories in the catalog or an explicit `--commit-repo`, bounded by
+`--commit-window-days` (180) and `--commit-scan-limit` (200 per repository). A
+commit is rejected with `COMMIT_MERGE_COMMIT` (unless `--commit-include-merges`),
+`COMMIT_REVERT_COMMIT`, `COMMIT_NO_SOURCE_CHANGE` (no non-test source file, or a
+docs/lockfile/vendored-only change) or `COMMIT_TOO_LARGE`
+(`--commit-max-files` 50, `--commit-max-lines` 2000), and reuses
+`OUTCOME_NOT_DURABLE` for the §5.5 revert horizon. The manifest gains
+`source_kind`, `provenance` and `outcome_labels`; `retro-source-bundle-v1` stays
+compatible because all three are optional and default to the session shape.
+Prompt provenance is the user's real first prompt when a captured session in the
+same repository overlaps or precedes the commit by at most
+`--commit-link-window-hours` (6) and edited files the commit changed; otherwise
+it is the commit message, marked `commit_message`. Linked bundles keep that
+session's rollout; unlinked bundles have an empty `rollout/events.jsonl` and a
+`context/source-provenance.json` carrying the commit evidence and
+`touches_tests`.
+
+### 5.5b Outcome labels and stratified sampling (implemented)
+
+Selection labels each source from evidence Retro already holds — outcome-commit
+survival in the branch history, pushback proxies (`friction.user_corrections`,
+`friction.interruptions`, `friction.edit_churn`, human turns after the first
+edit that are not plain acceptances) and `outcome.status` — producing
+`successful_surviving`, `corrected`, `failed_then_fixed` or `unlabeled` with
+evidence references in `selection.json` and the bundle manifest.
+
+Ordering is no longer lexicographic. `--strategy stratified` (default) walks
+(repo_id, work kind, diff-size bucket) strata round-robin; inside a stratum the
+order is `(label priority, seeded hash, source_id)`, where corrected and
+failed-then-fixed rank first, surviving successes second and unlabeled last, so
+both ends of the outcome distribution are represented. `--seed` fixes the order,
+`--max-per-repo` caps one repository (default `ceil(0.25 × --limit)` when
+`--limit` is set), and dropped sources are recorded as `SAMPLED_OUT` with their
+stratum and reason. Without `--limit` or `--max-per-repo` the sampler only
+reorders. `--strategy lexicographic` restores the original behavior.
+
 ### 5.6 Project environment resolution
 
 Environment resolution runs once per `(repo_id, environment_fingerprint)`, before TaskDefiner. It is not left to each candidate agent.
@@ -1254,6 +1297,16 @@ SCORER_OVERFIT
 SCORER_UNSAFE
 BUILDER_CONTRACT_ERROR
 HARNESS_ERROR
+```
+
+Commit-mined sources and sampling add:
+
+```text
+COMMIT_MERGE_COMMIT
+COMMIT_NO_SOURCE_CHANGE
+COMMIT_REVERT_COMMIT
+COMMIT_TOO_LARGE
+SAMPLED_OUT
 ```
 
 The report includes counts and source IDs for every rejection. Yield is itself a pipeline metric.

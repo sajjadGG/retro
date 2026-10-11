@@ -14,7 +14,7 @@ import math
 import re
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -35,6 +35,9 @@ REJECTION_CODES: tuple[str, ...] = (
     "NO_REPO_CWD",
     "NOT_GIT_REPOSITORY",
     "NO_EXACT_BASE_SHA",
+    "RECONSTRUCTION_PRE_MISMATCH",
+    "RECONSTRUCTION_POST_MISMATCH",
+    "RECONSTRUCTION_UNVERIFIABLE_EDIT",
     "DIRTY_START_STATE",
     "NO_OUTCOME_SHA",
     "OUTCOME_NOT_DURABLE",
@@ -50,21 +53,44 @@ REJECTION_CODES: tuple[str, ...] = (
     "SCORER_UNSAFE",
     "BUILDER_CONTRACT_ERROR",
     "HARNESS_ERROR",
+    "COMMIT_MERGE_COMMIT",
+    "COMMIT_NO_SOURCE_CHANGE",
+    "COMMIT_REVERT_COMMIT",
+    "COMMIT_TOO_LARGE",
+    "SAMPLED_OUT",
 )
+
+SOURCE_KINDS: tuple[str, ...] = ("session", "commit")
+PROMPT_PROVENANCE_MODES: tuple[str, ...] = ("linked_session", "commit_message")
 
 BASE_RESOLUTIONS: tuple[str, ...] = (
     "captured_start",
     "rollout_command",
     "first_commit_parent",
+    "anchored_reconstruction",
+    "commit_parent",
     "unresolved",
 )
-USABLE_BASE_RESOLUTIONS: tuple[str, ...] = BASE_RESOLUTIONS[:3]
+USABLE_BASE_RESOLUTIONS: tuple[str, ...] = (
+    "captured_start",
+    "rollout_command",
+    "first_commit_parent",
+    "anchored_reconstruction",
+    "commit_parent",
+)
 STATE_CONFIDENCES: tuple[str, ...] = ("exact_clean_commit", "approximate")
 OUTCOME_RESOLUTIONS: tuple[str, ...] = (
     "linked_pr_merge",
     "rollout_commit",
     "captured_end",
+    "mined_commit",
     "unresolved",
+)
+USABLE_OUTCOME_RESOLUTIONS: tuple[str, ...] = (
+    "linked_pr_merge",
+    "rollout_commit",
+    "captured_end",
+    "mined_commit",
 )
 TASK_KINDS: tuple[str, ...] = ("replay", "adjacent")
 ADJACENCY_OPERATORS: tuple[str, ...] = (
@@ -596,6 +622,7 @@ class RepoAnchor:
     subdir: str = "."
     environment_id: str | None = None
     outcome_resolution: str = "rollout_commit"
+    reconstruction: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         where = "repo"
@@ -608,9 +635,9 @@ class RepoAnchor:
                 f"{where}.base_resolution must be one of {USABLE_BASE_RESOLUTIONS}, "
                 f"got {self.base_resolution!r}"
             )
-        if self.outcome_resolution not in OUTCOME_RESOLUTIONS[:3]:
+        if self.outcome_resolution not in USABLE_OUTCOME_RESOLUTIONS:
             raise SchemaError(
-                f"{where}.outcome_resolution must be one of {OUTCOME_RESOLUTIONS[:3]}, "
+                f"{where}.outcome_resolution must be one of {USABLE_OUTCOME_RESOLUTIONS}, "
                 f"got {self.outcome_resolution!r}"
             )
         if self.state_confidence not in STATE_CONFIDENCES:
@@ -618,8 +645,92 @@ class RepoAnchor:
                 f"{where}.state_confidence must be one of {STATE_CONFIDENCES}, "
                 f"got {self.state_confidence!r}"
             )
-        if self.base_resolution == "first_commit_parent" and self.state_confidence != "approximate":
-            raise SchemaError("first_commit_parent bases must declare state_confidence=approximate")
+        if (
+            self.base_resolution in ("first_commit_parent", "anchored_reconstruction")
+            and self.state_confidence != "approximate"
+        ):
+            raise SchemaError(
+                f"{self.base_resolution} bases must declare state_confidence=approximate"
+            )
+        if self.base_resolution == "anchored_reconstruction":
+            if not isinstance(self.reconstruction, Mapping):
+                raise SchemaError("anchored_reconstruction bases require reconstruction evidence")
+            evidence = self.reconstruction
+            _known_keys(
+                evidence,
+                (
+                    "anchor_sha",
+                    "anchor_method",
+                    "files_touched",
+                    "files_verified_pre",
+                    "files_verified_post",
+                    "unverifiable_edits",
+                    "pre_mismatches",
+                    "post_mismatches",
+                    "changed_paths",
+                    "per_file",
+                    "touched_paths_clean",
+                    "confidence",
+                ),
+                f"{where}.reconstruction",
+            )
+            if evidence.get("anchor_sha") != self.base_sha:
+                raise SchemaError("repo.reconstruction.anchor_sha must equal repo.base_sha")
+            if evidence.get("anchor_method") not in (
+                "first_commit_parent",
+                "rollout_head",
+                "branch_before_session",
+            ):
+                raise SchemaError("repo.reconstruction.anchor_method is invalid")
+            touched = _string_list(evidence, "files_touched", f"{where}.reconstruction")
+            verified_pre = _string_list(
+                evidence, "files_verified_pre", f"{where}.reconstruction"
+            )
+            verified_post = _string_list(
+                evidence, "files_verified_post", f"{where}.reconstruction"
+            )
+            if not touched or set(touched) != set(verified_pre) or set(touched) != set(
+                verified_post
+            ):
+                raise SchemaError(
+                    "repo.reconstruction must verify every touched file before and after replay"
+                )
+            for key in ("unverifiable_edits", "pre_mismatches", "post_mismatches"):
+                if _list(evidence, key, f"{where}.reconstruction"):
+                    raise SchemaError(f"repo.reconstruction.{key} must be empty")
+            if not _bool(
+                evidence,
+                "touched_paths_clean",
+                f"{where}.reconstruction",
+            ):
+                raise SchemaError("repo.reconstruction must prove touched paths plausibly clean")
+            confidence = _number(
+                evidence,
+                "confidence",
+                f"{where}.reconstruction",
+                minimum=0,
+                maximum=1,
+            )
+            if confidence < 0.8:
+                raise SchemaError("repo.reconstruction.confidence must be at least 0.8")
+            per_file = _mapping(
+                evidence.get("per_file"), f"{where}.reconstruction.per_file"
+            )
+            if set(per_file) != set(touched):
+                raise SchemaError("repo.reconstruction.per_file must cover every touched path")
+            for path, verification in per_file.items():
+                row = _mapping(
+                    verification,
+                    f"{where}.reconstruction.per_file.{path}",
+                )
+                if row.get("pre_verified") is not True or row.get("post_verified") is not True:
+                    raise SchemaError(
+                        "repo.reconstruction.per_file entries must verify pre and post state"
+                    )
+        elif self.reconstruction is not None:
+            raise SchemaError(
+                "repo.reconstruction is only valid for anchored_reconstruction bases"
+            )
         if self.base_tree == self.outcome_tree:
             raise SchemaError("repo.base_tree and repo.outcome_tree must differ")
         if self.environment_id is not None:
@@ -638,6 +749,9 @@ class RepoAnchor:
             "state_confidence": self.state_confidence,
             "subdir": self.subdir,
             "environment_id": self.environment_id,
+            "reconstruction": (
+                dict(self.reconstruction) if self.reconstruction is not None else None
+            ),
         }
 
     @classmethod
@@ -657,6 +771,7 @@ class RepoAnchor:
                 "state_confidence",
                 "subdir",
                 "environment_id",
+                "reconstruction",
             ),
             where,
         )
@@ -674,6 +789,11 @@ class RepoAnchor:
             state_confidence=_string(payload, "state_confidence", where),
             subdir=_string(payload, "subdir", where) if "subdir" in payload else ".",
             environment_id=_optional_string(payload, "environment_id", where),
+            reconstruction=(
+                dict(_mapping(payload.get("reconstruction"), f"{where}.reconstruction"))
+                if payload.get("reconstruction") is not None
+                else None
+            ),
         )
 
 
@@ -688,11 +808,18 @@ class SourceBundleManifest:
     repo: RepoAnchor
     task_limits: TaskLimits = field(default_factory=TaskLimits)
     content_sha256: str | None = None
+    source_kind: str = "session"
+    provenance: dict[str, Any] | None = None
+    outcome_labels: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         require_sha256_hex(self.rollout_events_sha256, "rollout_events_sha256")
         if self.content_sha256 is not None:
             require_sha256_hex(self.content_sha256, "content_sha256")
+        if self.source_kind not in SOURCE_KINDS:
+            raise SchemaError(
+                f"source_kind must be one of {SOURCE_KINDS}, got {self.source_kind!r}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -700,27 +827,22 @@ class SourceBundleManifest:
             "source_id": self.source_id,
             "host": self.host,
             "session_id": self.session_id,
+            "source_kind": self.source_kind,
             "started_at": self.started_at,
             "ended_at": self.ended_at,
             "rollout_events_sha256": self.rollout_events_sha256,
             "repo": self.repo.to_dict(),
             "task_limits": self.task_limits.to_dict(),
+            "provenance": dict(self.provenance) if self.provenance is not None else None,
+            "outcome_labels": (
+                dict(self.outcome_labels) if self.outcome_labels is not None else None
+            ),
             "content_sha256": self.content_sha256,
         }
 
     def with_content_hash(self, digest: str) -> SourceBundleManifest:
         require_sha256_hex(digest, "content_sha256")
-        return SourceBundleManifest(
-            source_id=self.source_id,
-            host=self.host,
-            session_id=self.session_id,
-            started_at=self.started_at,
-            ended_at=self.ended_at,
-            rollout_events_sha256=self.rollout_events_sha256,
-            repo=self.repo,
-            task_limits=self.task_limits,
-            content_sha256=digest,
-        )
+        return replace(self, content_sha256=digest)
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "manifest") -> SourceBundleManifest:
@@ -733,11 +855,14 @@ class SourceBundleManifest:
                 "source_id",
                 "host",
                 "session_id",
+                "source_kind",
                 "started_at",
                 "ended_at",
                 "rollout_events_sha256",
                 "repo",
                 "task_limits",
+                "provenance",
+                "outcome_labels",
                 "content_sha256",
             ),
             where,
@@ -754,6 +879,21 @@ class SourceBundleManifest:
                 payload.get("task_limits", {}), f"{where}.task_limits"
             ),
             content_sha256=_optional_string(payload, "content_sha256", where),
+            source_kind=(
+                _enum(payload, "source_kind", SOURCE_KINDS, where)
+                if payload.get("source_kind") is not None
+                else "session"
+            ),
+            provenance=(
+                _mapping(payload.get("provenance"), f"{where}.provenance")
+                if payload.get("provenance") is not None
+                else None
+            ),
+            outcome_labels=(
+                _mapping(payload.get("outcome_labels"), f"{where}.outcome_labels")
+                if payload.get("outcome_labels") is not None
+                else None
+            ),
         )
 
 
@@ -2358,6 +2498,7 @@ __all__ = [
     "OBSERVABLE_IMPORTANCES",
     "OUTCOME_RESOLUTIONS",
     "PROJECT_ENVIRONMENT_SCHEMA",
+    "PROMPT_PROVENANCE_MODES",
     "REJECTION_CODES",
     "SCORER_MODES",
     "SCORER_SCHEMA",
@@ -2365,10 +2506,12 @@ __all__ = [
     "SCORE_REPORT_SCHEMA",
     "SCORE_STATUSES",
     "SOURCE_BUNDLE_SCHEMA",
+    "SOURCE_KINDS",
     "STATE_CONFIDENCES",
     "TASK_DEFINITIONS_SCHEMA",
     "TASK_KINDS",
     "USABLE_BASE_RESOLUTIONS",
+    "USABLE_OUTCOME_RESOLUTIONS",
     "WEIGHT_TOLERANCE",
     "Adjacency",
     "BenchmarkAttempt",

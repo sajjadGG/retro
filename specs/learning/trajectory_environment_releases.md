@@ -74,11 +74,37 @@ An exact replay requires a captured clean start or a successful, pre-mutation
 HEAD observation paired with clean porcelain status. Timestamp-selected commits
 and current HEAD are never evidence of a historical initial state.
 
-An explicitly opted-in anchored reconstruction uses the parent of a commit
-observed in the trajectory, plus a clean-status observation. It defines a
-new task at that immutable commit; it does not assert that all of the
-developer's original pre-commit editor state has been recovered. It must still
-pass environment, prompt, scorer, alternative-solution and audit gates.
+An explicitly opted-in anchored reconstruction follows the
+[Terminal-Universe](https://arxiv.org/abs/2609.04148) reverse/forward replay
+recipe. Anchor candidates must have a commit timestamp at or before the session
+start and are tried in this order:
+
+1. parent of the first commit created by the rollout;
+2. `HEAD` recorded by the rollout;
+3. `git rev-list -1 --before=<session-start>` on the branch recorded in session
+   metadata.
+
+Reflogs and the checkout's ambient current `HEAD` are not evidence. Retro
+materializes the anchor with `git archive` into an isolated scratch directory;
+it never edits the source checkout. Normalized `apply_patch`, old/new-string,
+write and create operations are replayed in event order. For every touched path,
+patch context or old content must match the anchor (new files must be absent),
+and the replayed path bytes, type and executable mode must match the durable
+outcome. Outcome paths without replayable edit evidence, including shell-made
+changes, are unverifiable.
+
+Acceptance requires non-empty and identical `files_touched`,
+`files_verified_pre` and `files_verified_post` sets, no unverifiable edits or
+pre/post mismatches, plausible cleanliness for every touched path, and numeric
+reconstruction confidence of at least `0.8`; full verification currently
+produces `1.0`. The base resolution is `anchored_reconstruction` with
+`state_confidence=approximate`, and selection/source-bundle manifests retain
+the anchor method plus per-file evidence. Failures use
+`RECONSTRUCTION_PRE_MISMATCH`, `RECONSTRUCTION_POST_MISMATCH`, or
+`RECONSTRUCTION_UNVERIFIABLE_EDIT`. Exact clean-start proof is always attempted
+first and remains the default when reconstruction is not explicitly enabled.
+Reconstructed tasks must still pass environment, prompt, scorer,
+alternative-solution and audit gates.
 
 Suite tasks carry:
 
@@ -87,8 +113,11 @@ Suite tasks carry:
 - `adjacent_synthesis`: an explicitly generated adjacent task, not historical
   user behavior.
 
-`allow_reconstructed` defaults to false. Dirty-start replay is still rejected.
-The distinction is visible in both the suite manifest and dashboard.
+`select --allow-reconstruction` and the API's `allow_reconstruction=True`
+enable source recovery. `allow_reconstructed` separately defaults to false in
+suite curation, so reconstructed sources form an explicit cohort and are never
+labelled exact replay. Observed dirty starts are still rejected. The distinction
+is visible in both the suite manifest and dashboard.
 
 `select --repo-root` reconnects old worktree paths to an explicit current
 checkout. It preserves the original path and capture files, rechecks commit and
