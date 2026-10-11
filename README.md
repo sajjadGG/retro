@@ -15,6 +15,28 @@ This project answers two questions that "another memory store" doesn't:
 1. **How did this rollout actually go?** (signals: activity, outcome, cost, risk)
 2. **What can the next session reuse from it?** (mining: skills, procedures, failure triggers)
 
+![Retro dashboard overview](assets/dashboard-overview.png)
+
+### What it does
+
+- **Capture** — one global, per-user archive of Codex, Claude Code and VS Code
+  Copilot Chat sessions (plus installed source extensions), refreshed by
+  `retro sync` or a periodic schedule, with immutable raw copies.
+- **Catalog** — consolidates worktrees, clones and symlinked paths into one
+  project, tags scratch/automated/eval noise with explainable rules, and rolls
+  subagents up under their parent.
+- **Signals** — 50 evidence-linked readings per session across activity,
+  collaboration, efficiency, friction, outcome, risk, usage/cost, work kind and
+  data quality.
+- **Memory** — mines reusable skills, procedures and failure triggers into a
+  SQLite/FTS index for prompt-time retrieval.
+- **Tasks and evals** — turns real trajectories into frozen, time-consistent
+  benchmark tasks with isolated repository environments and hidden graders.
+- **Experiments** — freezes agent/model/seed configurations, runs them through
+  Ghostlab on demand, and records every trial's grade and failure evidence.
+- **Dashboard** — a static, offline dashboard over all of the above, plus an
+  opt-in localhost server for experiment controls and private grader inspection.
+
 The full design is split across specs in [`specs/`](specs/). The headline ones:
 
 - [`full_rollout_capture_feature_spec.md`](specs/full_rollout_capture_feature_spec.md) — the capture contract.
@@ -1022,9 +1044,21 @@ only when a session's catalog fingerprint changes. `index.html` is a two-kilobyt
 
 ### Preview
 
-![Retro dashboard overview](assets/dashboard%20top.png)
+**Session** — one rollout with its provenance, first prompt and every signal grouped by category:
 
-![Retro dashboard session drill-down](assets/dashboard_bottom.png)
+![Retro dashboard session drill-down](assets/dashboard-session.png)
+
+**Tasks** — frozen task environments mined from real sessions and how each hidden grader decides success:
+
+![Retro dashboard tasks](assets/dashboard-tasks.png)
+
+**Experiments** — saved agent runs bound to exact dataset versions, with verification status and explained warnings:
+
+![Retro dashboard experiments](assets/dashboard-experiments.png)
+
+**Data quality** — what the archive contains, why sessions were excluded and capture health per host:
+
+![Retro dashboard data quality](assets/dashboard-quality.png)
 
 ### Build
 
