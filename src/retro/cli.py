@@ -16,7 +16,7 @@ import shutil
 from collections import Counter
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import typer
 from rich.console import Console
@@ -107,6 +107,9 @@ from .signals import (
 )
 from .storage import Layout, default_layout
 
+if TYPE_CHECKING:
+    from .capture_hooks import HookChange
+
 app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
@@ -120,6 +123,12 @@ capture_app = typer.Typer(
     help="Capture immutable repository state at coding-session boundaries.",
 )
 app.add_typer(capture_app, name="capture")
+
+capture_hooks_app = typer.Typer(
+    no_args_is_help=True,
+    help="Install agent-host session hooks that run capture automatically.",
+)
+capture_app.add_typer(capture_hooks_app, name="hooks")
 
 signal_app = typer.Typer(
     no_args_is_help=True,
@@ -248,6 +257,130 @@ def _capture_session_repo_state(
         console.print(f"[red]repository state capture failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     console.print(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True))
+
+
+# ---- capture hooks -----------------------------------------------------------
+
+
+def _hook_hosts(values: Optional[list[str]]) -> Optional[list[str]]:
+    if not values:
+        return None
+    return [value for value in values if value.strip()] or None
+
+
+def _render_hook_changes(changes: list[HookChange]) -> None:
+    table = Table(title="Retro capture hooks")
+    table.add_column("host")
+    table.add_column("action")
+    table.add_column("path")
+    table.add_column("detail")
+    failures = 0
+    for change in changes:
+        if change.action == "error":
+            failures += 1
+        detail_parts = [part for part in (change.message,) if part]
+        if change.backup:
+            detail_parts.append(f"backup: {change.backup}")
+        if change.dry_run and change.changed:
+            detail_parts.append("dry run: nothing written")
+        table.add_row(
+            change.label,
+            change.action,
+            change.path,
+            "; ".join(detail_parts) or "-",
+        )
+    console.print(table)
+    if failures:
+        raise typer.Exit(1)
+
+
+@capture_hooks_app.command("install")
+def capture_hooks_install(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned edits without writing anything"
+    ),
+    root: Optional[Path] = typer.Option(
+        None, help="rollout-memory root recorded in the installed hook command"
+    ),
+) -> None:
+    """Install session start/end hooks that run `retro capture` automatically."""
+    from .capture_hooks import install_hooks
+
+    try:
+        changes = install_hooks(_hook_hosts(host), dry_run=dry_run, root=root)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _render_hook_changes(changes)
+
+
+@capture_hooks_app.command("uninstall")
+def capture_hooks_uninstall(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Report the planned edits without writing anything"
+    ),
+) -> None:
+    """Remove Retro's session capture hooks, preserving every other hook."""
+    from .capture_hooks import uninstall_hooks
+
+    try:
+        changes = uninstall_hooks(_hook_hosts(host), dry_run=dry_run)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _render_hook_changes(changes)
+
+
+@capture_hooks_app.command("status")
+def capture_hooks_status(
+    host: Optional[list[str]] = typer.Option(
+        None, "--host", help="Limit to claude|codex|copilot (repeatable)"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable status"),
+) -> None:
+    """Show where capture hooks are installed for each agent host."""
+    from .capture_hooks import hook_status
+
+    try:
+        statuses = hook_status(_hook_hosts(host))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if as_json:
+        console.print_json(data=[status.to_dict() for status in statuses])
+        return
+    table = Table(title="Retro capture hooks")
+    table.add_column("host")
+    table.add_column("state")
+    table.add_column("start")
+    table.add_column("end")
+    table.add_column("path")
+    table.add_column("detail")
+    for status in statuses:
+        table.add_row(
+            status.label,
+            status.summary(),
+            "yes" if status.start_installed else "no",
+            "yes" if status.end_installed else "no",
+            status.path,
+            status.message or status.docs_url or "-",
+        )
+    console.print(table)
+
+
+@capture_app.command("hook", hidden=True)
+def capture_hook_cmd(
+    host: str = typer.Option("", "--host", help="claude|codex|copilot"),
+    event: str = typer.Option("", "--event", help="start|end"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Capture repository state from a host hook payload on stdin (never fails)."""
+    from .capture_hooks import run_hook_entry
+
+    run_hook_entry(host, event, root=root)
 
 
 # ---- list -------------------------------------------------------------------
@@ -2080,6 +2213,14 @@ def setup_cmd(
         help="Minimum interval between scheduled signal/dashboard rebuilds",
     ),
     no_schedule: bool = typer.Option(False, "--no-schedule", help="Save config without launchd"),
+    capture_hooks: bool = typer.Option(
+        False,
+        "--capture-hooks/--no-capture-hooks",
+        help=(
+            "Also install agent-host session hooks that run `retro capture` "
+            "(edits ~/.claude, ~/.codex and ~/.copilot configuration)"
+        ),
+    ),
 ) -> None:
     """Configure global storage and optionally install periodic capture."""
     from .archive_health import archive_access
@@ -2114,6 +2255,16 @@ def setup_cmd(
     if not no_schedule:
         plist = install_schedule(interval)
         console.print(f"  schedule:  {plist}  (every {interval}s)")
+    if capture_hooks:
+        from .capture_hooks import install_hooks
+
+        for change in install_hooks():
+            console.print(f"  hook {change.host}: {change.action}  {change.path}")
+    else:
+        console.print(
+            "  hooks:     not installed "
+            "(run `retro capture hooks install` for start/end repository state)"
+        )
 
 
 @archive_app.command("plan")
@@ -2286,6 +2437,7 @@ def doctor_cmd() -> None:
         duplicate_volume_mounts,
         scheduled_archive_access,
     )
+    from .capture_hooks import capture_coverage, hook_status
     from .schedule import schedule_status
     from .sync import STAGE_NAMES
 
@@ -2340,6 +2492,18 @@ def doctor_cmd() -> None:
             else 0
         )
         table.add_row("normalized sessions", str(normalized_count))
+        coverage = capture_coverage(layout)
+        table.add_row(
+            f"capture coverage ({coverage.days}d)",
+            f"{coverage.summary()} [{coverage.source}]",
+        )
+        if coverage.sessions and coverage.with_start == 0:
+            message = (
+                "no recent session has repo_start.json; run "
+                "`retro capture hooks install` so benchmarks get an exact base state"
+            )
+            warnings.append(message)
+            table.add_row("capture coverage detail", f"WARNING: {message}")
         try:
             sync_state = json.loads(
                 layout.sync_state_path().read_text(encoding="utf-8")
@@ -2392,6 +2556,8 @@ def doctor_cmd() -> None:
     table.add_row("schedule installed", str(status.get("installed")))
     table.add_row("schedule loaded", str(status.get("loaded")))
     table.add_row("schedule logs", str(user_log_dir()))
+    for hook in hook_status():
+        table.add_row(f"capture hook {hook.host}", f"{hook.summary()}  {hook.path}")
     for warning in warnings:
         table.add_row("warning", warning)
     console.print(table)

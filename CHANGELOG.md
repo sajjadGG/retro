@@ -4,6 +4,21 @@
 
 ### Added
 
+- `retro capture hooks install|uninstall|status` and `retro setup
+  --capture-hooks` (opt-in, off by default): user-level agent-host session
+  hooks that run `retro capture start|end` automatically for Claude Code
+  (`~/.claude/settings.json`), Codex CLI (`~/.codex/hooks.json`) and GitHub
+  Copilot CLI (`~/.copilot/hooks/retro-capture.json`), so Git-backed task
+  selection gets the exact-base `repo_start.json` / `repo_end.json` evidence it
+  requires. Installs merge into existing configuration, back each edited file
+  up to a timestamped `.bak`, write atomically, are idempotent, and uninstall
+  removes only Retro's own entries. The hidden `retro capture hook` entry point
+  parses each host's stdin payload and is fail-open: never a non-zero exit,
+  never stdout, silent outside Git repositories, with errors appended to
+  `capture-hooks.log` in the Retro log directory.
+- `retro doctor` now reports per-host capture hook installation and
+  start-capture coverage over Git-backed sessions from the last 30 days.
+
 - Frozen trajectory-derived benchmark suites with evidence-gated curation,
   related-task/repository grouping, explicit train/validation/test splits,
   exact-replay versus opted-in anchored-reconstruction provenance, and

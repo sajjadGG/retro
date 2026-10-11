@@ -54,6 +54,7 @@ The full design is split across specs in [`specs/`](specs/). The headline ones:
 
 - [Install](#install)
 - [Global setup and periodic capture](#global-setup-and-periodic-capture)
+- [Session capture hooks](#session-capture-hooks)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Source extensions](#source-extensions)
 - [Storage layout](#storage-layout)
@@ -194,6 +195,59 @@ retro archive cutover --plan /path/to/plan.json --link-path /path/to/legacy/roll
 Cutover is allowed only after a successful derived rebuild and a newer
 verification. The original legacy archive is moved to a retained source-backup
 directory before its old path becomes a compatibility symlink.
+
+---
+
+## Session capture hooks
+
+`retro capture start|end` writes the immutable `repo_start.json` /
+`repo_end.json` sidecars that Git-backed task selection requires as exact-base
+proof. Install them as agent-host session hooks so every session gets them
+without a manual step:
+
+```bash
+retro capture hooks status                 # per-host installation state
+retro capture hooks install --dry-run      # report planned edits only
+retro capture hooks install                # all supported hosts
+retro capture hooks install --host claude --host codex
+retro capture hooks uninstall              # remove only Retro's entries
+```
+
+| Host | User-level file | Events | Reference |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (honours `CLAUDE_CONFIG_DIR`) | `SessionStart`, `SessionEnd` | [hooks reference](https://code.claude.com/docs/en/hooks) |
+| Codex CLI | `~/.codex/hooks.json` (honours `CODEX_HOME`) | `SessionStart`, `SessionEnd` | [hooks guide](https://developers.openai.com/codex/hooks) |
+| GitHub Copilot CLI | `~/.copilot/hooks/retro-capture.json` (honours `COPILOT_HOME`) | `sessionStart`, `sessionEnd` | [hooks reference](https://docs.github.com/en/copilot/reference/hooks-reference) |
+
+Installation is opt-in, never implicit: it is off by default in `retro setup`
+and is enabled with `retro setup --capture-hooks`, because it edits agent
+configuration outside the archive. Each edited file is copied to a timestamped
+`.bak` first and rewritten atomically. Other hooks in the same file are
+preserved, Retro's own entries are replaced rather than duplicated on
+re-install, and `uninstall` removes only the entries Retro added, deleting a
+file only when nothing else is left in it.
+
+The installed command runs the hidden `retro capture hook` entry point. It
+reads the host's JSON payload on stdin, takes the session id (`session_id` or
+`sessionId`) and `cwd`, and writes the sidecar under
+`raw/<host>/<session-id>/`. It is fail-open by design: it never exits non-zero,
+never writes to stdout (Claude Code injects `SessionStart` stdout into the model
+context), returns immediately when `cwd` is not inside a Git repository, skips
+an already-captured phase instead of rewriting evidence, and appends failures to
+`capture-hooks.log` in the Retro log directory. Set `RETRO_HOOK_COMMAND` to
+override the resolved interpreter or console-script path recorded in the hook.
+
+The Copilot file covers Copilot CLI and Copilot sessions on the VS Code Agent
+Host, which share the same hook implementation; the VS Code *Local* harness
+reads the same user-level directory but has no `SessionEnd` event, so only the
+start capture can fire there. Two host limits apply to the end capture only:
+Claude Code treats `SessionEnd` as observational and does not wait for it, and
+Codex caps `SessionEnd` hooks at three seconds. The start capture, which task
+selection needs as exact-base proof, is unaffected.
+
+`retro doctor` reports the per-host hook state and start-capture coverage: the
+share of sessions started in the last 30 days, in a Git repository, that carry
+`repo_start.json`.
 
 ---
 
@@ -821,6 +875,13 @@ agent action and after the final action:
 ```bash
 retro capture start --host codex --session-id <session-id> --cwd /path/to/repo
 retro capture end --host codex --session-id <session-id> --cwd /path/to/repo
+```
+
+Install those two calls as session hooks once instead of running them per
+session (see [Session capture hooks](#session-capture-hooks)):
+
+```bash
+retro capture hooks install
 ```
 
 The capture records `HEAD`, its tree, porcelain-v2 status, and recursive

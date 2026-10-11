@@ -130,6 +130,38 @@ retro capture start --host codex --session-id <id> --cwd /path/to/repo
 retro capture end --host codex --session-id <id> --cwd /path/to/repo
 ```
 
+Install those calls as agent-host session hooks instead of running them by
+hand. Installation is opt-in because it edits agent configuration outside the
+archive; every edited file is backed up to a timestamped `.bak` first and
+rewritten atomically.
+
+```bash
+retro capture hooks status                 # per-host installation state
+retro capture hooks install --dry-run      # report planned edits only
+retro capture hooks install                # all supported hosts
+retro capture hooks install --host claude  # one host (repeatable)
+retro capture hooks uninstall              # remove only Retro's entries
+retro setup --capture-hooks                # opt in during global setup
+```
+
+| Host | File | Events |
+| --- | --- | --- |
+| Claude Code | `~/.claude/settings.json` (`CLAUDE_CONFIG_DIR`) | `SessionStart`, `SessionEnd` |
+| Codex CLI | `~/.codex/hooks.json` (`CODEX_HOME`) | `SessionStart`, `SessionEnd` |
+| GitHub Copilot CLI | `~/.copilot/hooks/retro-capture.json` (`COPILOT_HOME`) | `sessionStart`, `sessionEnd` |
+
+Hook entries are merged into existing configuration, identified by the
+`retro capture` command they run, and replaced rather than duplicated on
+re-install. The installed command invokes the hidden `retro capture hook`
+entry point, which reads the host's JSON payload on stdin, extracts the session
+id and working directory, and writes the sidecar. It is fail-open: it never
+exits non-zero, never writes to stdout (Claude Code injects `SessionStart`
+stdout into the model context), skips directories outside a Git repository, and
+appends failures to `capture-hooks.log` in the Retro log directory.
+
+`retro doctor` reports the per-host hook state and the share of recent
+Git-backed sessions that carry `repo_start.json`.
+
 Build and evaluate a taskset:
 
 ```bash
