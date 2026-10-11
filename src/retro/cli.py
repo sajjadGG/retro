@@ -1039,6 +1039,11 @@ def taskset_select_cmd(
         "--allow-unvalidated-environment",
         help="Record source eligibility without publishing buildable tasks",
     ),
+    allow_reconstruction: bool = typer.Option(
+        False,
+        "--allow-reconstruction",
+        help="Opt in to fully verified anchored reconstruction when exact start proof is absent",
+    ),
     branch: str = typer.Option("HEAD", "--branch", help="Project branch containing durable outcomes"),
     stability_horizon_days: int = typer.Option(
         7,
@@ -1048,7 +1053,7 @@ def taskset_select_cmd(
     ),
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
 ) -> None:
-    """Select exact, clean Git-backed rollouts and record every rejection."""
+    """Select proven Git-backed rollouts and record every rejection."""
     lay = _layout(root)
     resolved_host = (
         None
@@ -1100,6 +1105,7 @@ def taskset_select_cmd(
             branch=branch,
             stability_horizon_days=stability_horizon_days,
             repo_root=repo_root,
+            allow_reconstruction=allow_reconstruction,
         )
     except (SelectionError, SchemaError) as exc:
         console.print(f"[red]taskset selection failed: {exc}[/red]")

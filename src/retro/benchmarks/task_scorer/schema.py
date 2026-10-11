@@ -35,6 +35,9 @@ REJECTION_CODES: tuple[str, ...] = (
     "NO_REPO_CWD",
     "NOT_GIT_REPOSITORY",
     "NO_EXACT_BASE_SHA",
+    "RECONSTRUCTION_PRE_MISMATCH",
+    "RECONSTRUCTION_POST_MISMATCH",
+    "RECONSTRUCTION_UNVERIFIABLE_EDIT",
     "DIRTY_START_STATE",
     "NO_OUTCOME_SHA",
     "OUTCOME_NOT_DURABLE",
@@ -56,9 +59,10 @@ BASE_RESOLUTIONS: tuple[str, ...] = (
     "captured_start",
     "rollout_command",
     "first_commit_parent",
+    "anchored_reconstruction",
     "unresolved",
 )
-USABLE_BASE_RESOLUTIONS: tuple[str, ...] = BASE_RESOLUTIONS[:3]
+USABLE_BASE_RESOLUTIONS: tuple[str, ...] = BASE_RESOLUTIONS[:4]
 STATE_CONFIDENCES: tuple[str, ...] = ("exact_clean_commit", "approximate")
 OUTCOME_RESOLUTIONS: tuple[str, ...] = (
     "linked_pr_merge",
@@ -596,6 +600,7 @@ class RepoAnchor:
     subdir: str = "."
     environment_id: str | None = None
     outcome_resolution: str = "rollout_commit"
+    reconstruction: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         where = "repo"
@@ -618,8 +623,92 @@ class RepoAnchor:
                 f"{where}.state_confidence must be one of {STATE_CONFIDENCES}, "
                 f"got {self.state_confidence!r}"
             )
-        if self.base_resolution == "first_commit_parent" and self.state_confidence != "approximate":
-            raise SchemaError("first_commit_parent bases must declare state_confidence=approximate")
+        if (
+            self.base_resolution in ("first_commit_parent", "anchored_reconstruction")
+            and self.state_confidence != "approximate"
+        ):
+            raise SchemaError(
+                f"{self.base_resolution} bases must declare state_confidence=approximate"
+            )
+        if self.base_resolution == "anchored_reconstruction":
+            if not isinstance(self.reconstruction, Mapping):
+                raise SchemaError("anchored_reconstruction bases require reconstruction evidence")
+            evidence = self.reconstruction
+            _known_keys(
+                evidence,
+                (
+                    "anchor_sha",
+                    "anchor_method",
+                    "files_touched",
+                    "files_verified_pre",
+                    "files_verified_post",
+                    "unverifiable_edits",
+                    "pre_mismatches",
+                    "post_mismatches",
+                    "changed_paths",
+                    "per_file",
+                    "touched_paths_clean",
+                    "confidence",
+                ),
+                f"{where}.reconstruction",
+            )
+            if evidence.get("anchor_sha") != self.base_sha:
+                raise SchemaError("repo.reconstruction.anchor_sha must equal repo.base_sha")
+            if evidence.get("anchor_method") not in (
+                "first_commit_parent",
+                "rollout_head",
+                "branch_before_session",
+            ):
+                raise SchemaError("repo.reconstruction.anchor_method is invalid")
+            touched = _string_list(evidence, "files_touched", f"{where}.reconstruction")
+            verified_pre = _string_list(
+                evidence, "files_verified_pre", f"{where}.reconstruction"
+            )
+            verified_post = _string_list(
+                evidence, "files_verified_post", f"{where}.reconstruction"
+            )
+            if not touched or set(touched) != set(verified_pre) or set(touched) != set(
+                verified_post
+            ):
+                raise SchemaError(
+                    "repo.reconstruction must verify every touched file before and after replay"
+                )
+            for key in ("unverifiable_edits", "pre_mismatches", "post_mismatches"):
+                if _list(evidence, key, f"{where}.reconstruction"):
+                    raise SchemaError(f"repo.reconstruction.{key} must be empty")
+            if not _bool(
+                evidence,
+                "touched_paths_clean",
+                f"{where}.reconstruction",
+            ):
+                raise SchemaError("repo.reconstruction must prove touched paths plausibly clean")
+            confidence = _number(
+                evidence,
+                "confidence",
+                f"{where}.reconstruction",
+                minimum=0,
+                maximum=1,
+            )
+            if confidence < 0.8:
+                raise SchemaError("repo.reconstruction.confidence must be at least 0.8")
+            per_file = _mapping(
+                evidence.get("per_file"), f"{where}.reconstruction.per_file"
+            )
+            if set(per_file) != set(touched):
+                raise SchemaError("repo.reconstruction.per_file must cover every touched path")
+            for path, verification in per_file.items():
+                row = _mapping(
+                    verification,
+                    f"{where}.reconstruction.per_file.{path}",
+                )
+                if row.get("pre_verified") is not True or row.get("post_verified") is not True:
+                    raise SchemaError(
+                        "repo.reconstruction.per_file entries must verify pre and post state"
+                    )
+        elif self.reconstruction is not None:
+            raise SchemaError(
+                "repo.reconstruction is only valid for anchored_reconstruction bases"
+            )
         if self.base_tree == self.outcome_tree:
             raise SchemaError("repo.base_tree and repo.outcome_tree must differ")
         if self.environment_id is not None:
@@ -638,6 +727,9 @@ class RepoAnchor:
             "state_confidence": self.state_confidence,
             "subdir": self.subdir,
             "environment_id": self.environment_id,
+            "reconstruction": (
+                dict(self.reconstruction) if self.reconstruction is not None else None
+            ),
         }
 
     @classmethod
@@ -657,6 +749,7 @@ class RepoAnchor:
                 "state_confidence",
                 "subdir",
                 "environment_id",
+                "reconstruction",
             ),
             where,
         )
@@ -674,6 +767,11 @@ class RepoAnchor:
             state_confidence=_string(payload, "state_confidence", where),
             subdir=_string(payload, "subdir", where) if "subdir" in payload else ".",
             environment_id=_optional_string(payload, "environment_id", where),
+            reconstruction=(
+                dict(_mapping(payload.get("reconstruction"), f"{where}.reconstruction"))
+                if payload.get("reconstruction") is not None
+                else None
+            ),
         )
 
 

@@ -23,6 +23,11 @@
   owned-artifact cleanup without pruning task bundles or global Docker data.
 - Explicit relocated-checkout support for task selection and bundling without
   mutating historical captures or inventing missing start-state proof.
+- Opt-in `taskset select --allow-reconstruction` recovery for historical
+  sessions without exact start proof, using time-bounded Git anchors, isolated
+  normalized-edit replay, full touched-path pre/post verification, explicit
+  reconstruction rejection codes, and per-file provenance in selection and
+  source-bundle manifests.
 
 - Session catalog (`catalog/sessions.jsonl`): one record per archived session with
   agent, client surface (e.g. `codex-exec`, `copilot-vscode-agent`, `claude-cli`),

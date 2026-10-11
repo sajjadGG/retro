@@ -331,6 +331,8 @@ def test_taskset_command_help_exposes_complete_pipeline():
         assert result.exit_code == 0, result.output
         parameter = inspect.signature(callback).parameters[parameter_name]
         assert option in parameter.default.param_decls
+    reconstruction = inspect.signature(taskset_select_cmd).parameters["allow_reconstruction"]
+    assert "--allow-reconstruction" in reconstruction.default.param_decls
 
 
 def test_taskset_build_accepts_a_path_command_name(monkeypatch, tmp_path):

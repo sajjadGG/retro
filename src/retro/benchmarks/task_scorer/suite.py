@@ -249,7 +249,10 @@ def _evidence_failure(task: PublishedTask, policy: CurationPolicy) -> tuple[str,
     if repo.get("state_confidence") != "exact_clean_commit" and not (
         policy.allow_reconstructed
         and repo.get("state_confidence") == "approximate"
-        and repo.get("base_resolution") == "first_commit_parent"
+        and repo.get("base_resolution") in (
+            "first_commit_parent",
+            "anchored_reconstruction",
+        )
     ):
         return (
             "APPROXIMATE_START_STATE",
