@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import click
 import pytest
+from rich.text import Text
 from typer.testing import CliRunner
 
 from retro.benchmarks.task_scorer.suite import CurationPolicy, curate_taskset
@@ -31,7 +31,7 @@ def test_environment_commands_have_help(command: str, color: bool):
     }
     result = runner.invoke(app, ["benchmark", "taskset", command, "--help"], color=color, env=env)
     assert result.exit_code == 0, result.output
-    assert "--suite" in click.unstyle(result.output)
+    assert "--suite" in Text.from_ansi(result.output).plain
 
 
 def test_cli_curates_exports_resets_and_grades_a_real_candidate(
