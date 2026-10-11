@@ -2,7 +2,7 @@
 
 ![retro logo](assets/retro_logo.png)
 
-`retro` captures Codex and Claude Code agent sessions, normalizes them into durable local artifacts, scores them with signals, mines reusable memory, and builds a static dashboard.
+`retro` captures Codex, Claude Code and VS Code Copilot Chat agent sessions, normalizes them into durable local artifacts, scores them with signals, mines reusable memory, turns trajectories into frozen benchmark tasks and experiments, and builds a static dashboard.
 
 This site is the onboarding hub for users and contributors.
 
@@ -27,9 +27,15 @@ Each stage reads from disk and can be re-run independently. Flat files remain ca
 
 ## Dashboard Preview
 
-![Retro dashboard overview](assets/dashboard-top.png)
+![Retro dashboard overview](assets/dashboard-overview.png)
 
-![Retro dashboard session drill-down](assets/dashboard-bottom.png)
+![Retro dashboard session drill-down](assets/dashboard-session.png)
+
+![Retro dashboard tasks](assets/dashboard-tasks.png)
+
+![Retro dashboard experiments](assets/dashboard-experiments.png)
+
+![Retro dashboard data quality](assets/dashboard-quality.png)
 
 ## Source Documents
 

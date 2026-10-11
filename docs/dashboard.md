@@ -19,6 +19,9 @@ reused, the output size and the build time.
 | Sessions | Everything captured, filterable by text, agent, client, project, tag, outcome, work kind, model, interactive/automated and date; sortable, virtualized, with a toggle for excluded sessions and for rolling subagents up under their parent. Facet lists show only values present in the current scope with their counts; project and model use a type-ahead so an archive with 30,000 scratch projects stays usable |
 | Session | One session: header, tags and why they were applied, inline markers, every signal grouped by category with evidence event ids, subagent tree, and links to the transcript, normalized events and raw capture in the archive |
 | Signals | Every signal in `signals/definitions.json` with its distribution, and comparisons by agent, client, project, model or work kind with a minimum-sample guard |
+| Tasks | Task/environment cards, full instructions, declared grader input/output contract, source evidence and expandable validation/audit; no agent results |
+| Evals | Current verified frozen task datasets, splits, exact versions and their tasks; older versions remain available separately |
+| Experiments | Frozen job setup, candidate models/scripts, seeds, explicit starts, cohort-bound results and every trial's grade, failure evidence and cleanup record |
 | Data quality | Why sessions were excluded (by tag and rule, with examples), cost coverage, interactive vs automated share, unknown-event rate per host, missing or stale signals, and the latest sync run stage by stage |
 
 ## Cost is an estimate, and sometimes there is none

@@ -86,7 +86,27 @@ a:hover { text-decoration: underline; }
   flex-wrap: wrap;
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; letter-spacing: 0.02em; }
-.logo { color: var(--accent); }
+.logo { display: inline-flex; gap: 0; width: 12px; height: 14px; }
+.logo i {
+  width: 50%;
+  height: 50%;
+  background: var(--accent);
+  animation: logo-down 1.6s ease-in-out infinite;
+}
+.logo i:nth-child(2) { animation-name: logo-up; }
+@keyframes logo-down {
+  0%, 15%, 100% { transform: translateY(0); }
+  50%, 65% { transform: translateY(100%); }
+}
+@keyframes logo-up {
+  0%, 15%, 100% { transform: translateY(100%); }
+  50%, 65% { transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .logo i { animation: none; }
+  .logo i:nth-child(2) { transform: translateY(100%); }
+}
+
 .nav { display: flex; gap: 4px; flex-wrap: wrap; }
 .nav a {
   padding: 6px 12px;
