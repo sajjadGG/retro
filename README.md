@@ -885,9 +885,9 @@ retro capture hooks install
 ```
 
 The capture records `HEAD`, its tree, porcelain-v2 status, and recursive
-submodule status. Existing files are never overwritten. Historical rollouts are
-accepted only when equivalent base evidence exists in the rollout; Retro never
-uses a commit selected only by timestamp.
+submodule status. Existing files are never overwritten. By default, historical
+rollouts are accepted only when equivalent exact base evidence exists in the
+rollout.
 
 Construct and run a taskset through Ghostlab's public artifact and scorer
 commands:
@@ -920,6 +920,30 @@ retro benchmark taskset report \
   --name personal-git-v1 \
   --eval latest
 ```
+
+Historical sessions without exact clean-start proof have a separate, opt-in
+lane:
+
+```bash
+retro benchmark taskset select \
+  --name reconstructed-v1 \
+  --session-file sessions.txt \
+  --allow-reconstruction \
+  --environment-config /outside/repo/retro-environment.json
+```
+
+Reconstruction first tries the parent of the rollout's first commit, then a
+recorded rollout `HEAD`, then the last commit at or before the session start on
+the branch recorded in session metadata. It never reads reflogs. Retro expands
+that anchor into an isolated, Git-free scratch snapshot, replays normalized
+`apply_patch`, edit, write, and create operations, and compares every touched
+path with the durable outcome. A source is accepted only when every path has
+matching pre-edit evidence, every replayed post-state matches the outcome, no
+shell or otherwise unverifiable edit remains, and reconstruction confidence is
+at least `0.8` (full verification currently yields `1.0`). Failures remain
+visible as `RECONSTRUCTION_PRE_MISMATCH`, `RECONSTRUCTION_POST_MISMATCH`, or
+`RECONSTRUCTION_UNVERIFIABLE_EDIT`. The selection and source-bundle manifests
+record the anchor method and per-file verification.
 
 Every stage is content-addressed and resumable. The evaluated agent receives
 only the prompt, immutable base repository, and public environment contract.

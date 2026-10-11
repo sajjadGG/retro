@@ -18,7 +18,7 @@ from ...catalog import Catalog, load_catalog
 from ...schema import BUILTIN_HOSTS, Host, NormalizedEvent, read_events
 from ...storage import Layout
 from ...utils import atomic_write_text
-from . import git_state
+from . import git_state, reconstruction
 from .schema import ProjectEnvironment, RepoAnchor, SchemaError, require_rejection_code
 
 SELECTION_SCHEMA = "retro-taskset-selection-v1"
@@ -101,6 +101,7 @@ class SourceCandidate:
         return self.outcome.outcome_tree
 
     def repo_anchor(self) -> RepoAnchor:
+        reconstruction_evidence = self.base.evidence.get("reconstruction")
         return RepoAnchor(
             root_at_capture=str(self.repo_root),
             repo_id=git_state.repo_identity(self.repo_root),
@@ -113,6 +114,11 @@ class SourceCandidate:
             state_confidence=self.base.state_confidence or "approximate",
             subdir=".",
             environment_id=self.environment.environment_id if self.environment else None,
+            reconstruction=(
+                dict(reconstruction_evidence)
+                if isinstance(reconstruction_evidence, dict)
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,6 +258,7 @@ def select_source(
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
+    allow_reconstruction: bool = False,
     _catalog: Catalog | None = None,
 ) -> tuple[SourceCandidate | None, SourceRejection | None]:
     """Evaluate one rollout against every §5.1 eligibility condition."""
@@ -332,6 +339,44 @@ def select_source(
         )
     except git_state.GitError as error:
         return reject("HARNESS_ERROR", f"git failure during base resolution: {error}")
+    reconstructing = False
+    if not base.resolved and allow_reconstruction:
+        mutating_index = git_state.first_mutating_index(events)
+        clean_proof = git_state.rollout_clean_start_proof(
+            events,
+            before_index=mutating_index,
+        )
+        explicitly_dirty = bool(
+            (captured_start is not None and not captured_start.clean)
+            or (clean_proof.observed and not clean_proof.clean)
+        )
+        if not explicitly_dirty:
+            catalog_branch = (
+                catalog_record.git.get("branch")
+                if catalog_record is not None and isinstance(catalog_record.git, dict)
+                else None
+            )
+            recorded_branch = (
+                str(catalog_branch)
+                if isinstance(catalog_branch, str) and catalog_branch.strip()
+                else branch
+                if branch != "HEAD"
+                else None
+            )
+            try:
+                anchor = reconstruction.resolve_anchor(
+                    root=root,
+                    events=events,
+                    session_started_at=started_at,
+                    recorded_branch=recorded_branch,
+                )
+            except git_state.GitError as error:
+                return reject("HARNESS_ERROR", f"git failure during anchor resolution: {error}")
+            if anchor.resolved:
+                base = anchor
+                reconstructing = True
+            elif base.rejection_code == "NO_EXACT_BASE_SHA":
+                base = anchor
     if not base.resolved:
         return reject(
             base.rejection_code or "NO_EXACT_BASE_SHA",
@@ -359,6 +404,21 @@ def select_source(
             outcome.detail or "outcome commit could not be resolved",
             **outcome.evidence,
         )
+
+    if reconstructing:
+        base = reconstruction.verify_reconstruction(
+            root=root,
+            events=events,
+            anchor=base,
+            outcome_sha=outcome.outcome_sha or "",
+            captured_cwd=cwd_resolution.cwd,
+        )
+        if not base.resolved:
+            return reject(
+                base.rejection_code or "NO_EXACT_BASE_SHA",
+                base.detail or "anchored reconstruction could not be verified",
+                **base.evidence,
+            )
 
     assert base.base_sha and base.base_tree and outcome.outcome_sha and outcome.outcome_tree
     if base.base_tree == outcome.outcome_tree:
@@ -444,6 +504,7 @@ def select_sources(
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
+    allow_reconstruction: bool = False,
 ) -> SelectionResult:
     selected: list[SourceCandidate] = []
     rejections: list[SourceRejection] = []
@@ -458,6 +519,7 @@ def select_sources(
             require_environment=require_environment,
             stability_horizon_days=stability_horizon_days,
             repo_root=repo_root,
+            allow_reconstruction=allow_reconstruction,
             _catalog=catalog,
         )
         if candidate is not None:
@@ -732,6 +794,7 @@ def select_taskset(
     branch: str = "HEAD",
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
+    allow_reconstruction: bool = False,
     write: bool = True,
 ) -> TasksetSelection:
     """Select sessions into ``benchmarks/<name>/task-scorer/selection.json``.
@@ -769,6 +832,7 @@ def select_taskset(
         require_environment=require_environment,
         stability_horizon_days=stability_horizon_days,
         repo_root=repo_root,
+        allow_reconstruction=allow_reconstruction,
     )
     environment_provenance: dict[str, Any] = {
         "required": require_environment,

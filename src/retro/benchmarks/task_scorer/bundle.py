@@ -589,6 +589,7 @@ def _reselect(
     require_environment: bool,
     stability_horizon_days: int,
     repo_root: Path | None = None,
+    allow_reconstruction: bool = False,
 ) -> tuple[SourceCandidate | None, str | None, str]:
     candidate, rejection = select_source(
         layout=layout,
@@ -599,6 +600,7 @@ def _reselect(
         require_environment=require_environment,
         stability_horizon_days=stability_horizon_days,
         repo_root=repo_root,
+        allow_reconstruction=allow_reconstruction,
     )
     if candidate is None:
         code = rejection.code if rejection is not None else "NO_NORMALIZED_ROLLOUT"
@@ -620,6 +622,7 @@ def bundle_taskset(
     branch: str = "HEAD",
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
+    allow_reconstruction: bool = False,
     task_limits: TaskLimits | None = None,
     force: bool = False,
     write: bool = True,
@@ -701,6 +704,10 @@ def bundle_taskset(
                 require_environment=require_environment,
                 stability_horizon_days=stability_horizon_days,
                 repo_root=repo_root if repo_root is not None else recorded_override,
+                allow_reconstruction=(
+                    isinstance(entry.get("base"), Mapping)
+                    and entry["base"].get("resolution") == "anchored_reconstruction"
+                ),
             )
             if candidate is None:
                 outcomes.append(
@@ -744,6 +751,7 @@ def bundle_taskset(
             branch=branch,
             stability_horizon_days=stability_horizon_days,
             repo_root=repo_root,
+            allow_reconstruction=allow_reconstruction,
             write=write,
         )
         for rejection in selection.rejections:
