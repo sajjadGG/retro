@@ -32,9 +32,16 @@ from .benchmarks.task_scorer.build import (
     BuildConfigurationError,
     TasksetBuildSummary,
     build_taskset,
+    resolve_taskset_paths,
 )
 from .benchmarks.task_scorer.bundle import BundleError, bundle_taskset
 from .benchmarks.task_scorer.environment import DockerContainerRuntime, resolve_environment
+from .benchmarks.task_scorer.episodes import (
+    EpisodeError,
+    export_episodes,
+    materialize_episode,
+    score_episode,
+)
 from .benchmarks.task_scorer.ghostlab_cli import GhostlabError
 from .benchmarks.task_scorer.git_state import (
     CaptureExistsError,
@@ -42,6 +49,7 @@ from .benchmarks.task_scorer.git_state import (
     capture_repository_state,
 )
 from .benchmarks.task_scorer.run import (
+    AgentSpec,
     TasksetReportSummary,
     TasksetRunSummary,
     TaskVerificationError,
@@ -55,6 +63,7 @@ from .benchmarks.task_scorer.selection import (
     SourceCandidate,
     select_taskset,
 )
+from .benchmarks.task_scorer.suite import SuiteError, curate_taskset, load_policy, load_suite
 from .catalog import Catalog, SessionRecord, load_catalog, update_catalog
 from .catalog.cli import projects_app, rules_app, sessions_app
 from .config import (
@@ -129,9 +138,15 @@ taskset_app = typer.Typer(
 )
 benchmark_app.add_typer(taskset_app, name="taskset")
 
+experiment_app = typer.Typer(
+    no_args_is_help=True,
+    help="Freeze experiment setup, explicitly run candidate agents and clean owned artifacts.",
+)
+app.add_typer(experiment_app, name="experiment")
+
 dashboard_app = typer.Typer(
     no_args_is_help=True,
-    help="Build and inspect the local static dashboard.",
+    help="Build the static dashboard or enable opt-in localhost experiment controls.",
 )
 app.add_typer(dashboard_app, name="dashboard")
 
@@ -967,6 +982,14 @@ def taskset_select_cmd(
         resolve_path=True,
         help="One host/session-id selector per line",
     ),
+    repo_root: Optional[Path] = typer.Option(
+        None,
+        "--repo-root",
+        exists=True,
+        file_okay=False,
+        resolve_path=True,
+        help="Current checkout for relocated trajectories; exact captured Git proof is still required",
+    ),
     environment_file: Optional[Path] = typer.Option(
         None,
         "--environment-file",
@@ -1076,6 +1099,7 @@ def taskset_select_cmd(
             require_environment=not allow_unvalidated_environment,
             branch=branch,
             stability_horizon_days=stability_horizon_days,
+            repo_root=repo_root,
         )
     except (SelectionError, SchemaError) as exc:
         console.print(f"[red]taskset selection failed: {exc}[/red]")
@@ -1098,6 +1122,10 @@ def taskset_bundle_cmd(
         help="Bundle the recorded selection or select inputs again",
     ),
     host: Optional[str] = typer.Option(None, "--host", help="Host used with --reselect"),
+    repo_root: Optional[Path] = typer.Option(
+        None, "--repo-root", exists=True, file_okay=False, resolve_path=True,
+        help="Current checkout for relocated trajectories; defaults to the selection's explicit checkout",
+    ),
     session_file: Optional[Path] = typer.Option(
         None,
         "--session-file",
@@ -1139,6 +1167,7 @@ def taskset_bundle_cmd(
             environment_file=environment_file,
             require_environment=not allow_unvalidated_environment,
             branch=branch,
+            repo_root=repo_root,
         )
     except (BundleError, SelectionError, SchemaError) as exc:
         console.print(f"[red]taskset bundling failed: {exc}[/red]")
@@ -1223,6 +1252,124 @@ def taskset_build_cmd(
     _print_taskset_build(result)
 
 
+@taskset_app.command("curate")
+def taskset_curate_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    suite_id: Optional[str] = typer.Option(
+        None, "--suite", help="Immutable release ID; defaults to input hash",
+    ),
+    policy: Optional[Path] = typer.Option(
+        None, "--policy", exists=True, dir_okay=False, resolve_path=True,
+        help="Curation policy with grouped splits, task families and user priorities; default is test-only",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Freeze validated tasks into a provenance-gated train/evaluation release."""
+    try:
+        suite = curate_taskset(_layout(root), name, suite_id=suite_id, policy=load_policy(policy))
+    except (SuiteError, SchemaError, BuildConfigurationError, GhostlabError, OSError) as exc:
+        console.print(f"[red]taskset curation failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print_json(json.dumps(suite.manifest, ensure_ascii=False))
+    console.print(f"[green]Frozen suite:[/green] {suite.path}")
+
+
+@taskset_app.command("export")
+def taskset_export_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    suite_id: str = typer.Option(..., "--suite", help="Frozen curated suite"),
+    output: Path = typer.Option(..., "--out", resolve_path=True, help="New immutable export directory"),
+    split: str = typer.Option(
+        "train", "--split", help="train|validation|test; never defaults to held-out data",
+    ),
+    include_rewards: bool = typer.Option(
+        False, "--include-rewards",
+        help="Include hidden verifiers in private/ for a trusted training harness",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Export pinned actor inputs and optional separately stored verifier packages."""
+    try:
+        suite = load_suite(resolve_taskset_paths(_layout(root), name), suite_id)
+        manifest = export_episodes(suite, output, split=split, include_rewards=include_rewards)
+    except (
+        EpisodeError, SuiteError, SchemaError, TaskVerificationError,
+        BuildConfigurationError, GhostlabError, OSError,
+    ) as exc:
+        console.print(f"[red]taskset export failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print_json(json.dumps(manifest, ensure_ascii=False))
+    if include_rewards:
+        console.print(
+            "[yellow]private/ contains hidden reward code; mount it only in the trusted scorer.[/yellow]"
+        )
+    console.print("[yellow]Pinned container images are referenced, not bundled in this export.[/yellow]")
+
+
+@taskset_app.command("reset")
+def taskset_reset_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    suite_id: str = typer.Option(..., "--suite", help="Frozen curated suite"),
+    task_id: str = typer.Option(..., "--task-id", help="Task to materialize"),
+    output: Path = typer.Option(..., "--out", resolve_path=True, help="New episode directory"),
+    split: str = typer.Option("train", "--split", help="Required split membership: train|validation|test"),
+    seed: int = typer.Option(0, "--seed", min=0, help="Episode seed"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Reset a fresh Git-free workspace; setup and commands run only through Ghostlab."""
+    try:
+        suite = load_suite(resolve_taskset_paths(_layout(root), name), suite_id)
+        observation = materialize_episode(suite, task_id, output, split=split, seed=seed)
+    except (
+        EpisodeError, SuiteError, SchemaError, TaskVerificationError,
+        BuildConfigurationError, GhostlabError, OSError,
+    ) as exc:
+        console.print(f"[red]episode reset failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print_json(json.dumps(observation, ensure_ascii=False))
+
+
+@taskset_app.command("reward")
+def taskset_reward_cmd(
+    name: str = typer.Option(..., "--name", help="Taskset name"),
+    suite_id: str = typer.Option(..., "--suite", help="Frozen curated suite"),
+    task_id: str = typer.Option(..., "--task-id", help="Task to grade"),
+    candidate: Path = typer.Option(
+        ..., "--candidate", exists=True, resolve_path=True,
+        help="Terminal workspace or exported candidate archive",
+    ),
+    output: Path = typer.Option(..., "--out", resolve_path=True, help="New private reward-run directory"),
+    split: str = typer.Option("train", "--split", help="Required split membership: train|validation|test"),
+    seed: int = typer.Option(0, "--seed", min=0, help="Episode seed"),
+    ghostlab_bin: Optional[str] = typer.Option(None, "--ghostlab-bin", help="Ghostlab executable"),
+    trace: Optional[Path] = typer.Option(
+        None, "--trace", exists=True, dir_okay=False, resolve_path=True,
+        help="Optional terminal-agent event trace",
+    ),
+    resources: Optional[Path] = typer.Option(
+        None, "--resources", exists=True, dir_okay=False, resolve_path=True,
+        help="Optional recorded resource usage passed to the scorer",
+    ),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Return an attested terminal reward; infrastructure failure has no numeric reward."""
+    try:
+        suite = load_suite(resolve_taskset_paths(_layout(root), name), suite_id)
+        reward = score_episode(
+            suite, task_id, candidate, output, split=split, seed=seed, ghostlab_bin=ghostlab_bin,
+            trace_path=trace, resource_usage_path=resources,
+        )
+    except (
+        EpisodeError, SuiteError, SchemaError, TaskVerificationError,
+        BuildConfigurationError, GhostlabError, OSError,
+    ) as exc:
+        console.print(f"[red]episode reward failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print_json(json.dumps(reward, ensure_ascii=False))
+    if reward["status"] != "scored":
+        raise typer.Exit(1)
+
+
 @taskset_app.command("run")
 def taskset_run_cmd(
     name: str = typer.Option(..., "--name", help="Taskset name"),
@@ -1249,6 +1396,12 @@ def taskset_run_cmd(
         None,
         "--task-id",
         help="Run only these task IDs; may be repeated",
+    ),
+    suite_id: Optional[str] = typer.Option(
+        None, "--suite", help="Evaluate immutable curated inputs rather than the active task pool",
+    ),
+    split: Optional[str] = typer.Option(
+        None, "--split", help="Curated split: train|validation|test; --suite defaults to test",
     ),
     force: bool = typer.Option(False, "--force", help="Re-run existing hash-identical attempts"),
     token_budget: Optional[list[float]] = typer.Option(
@@ -1279,8 +1432,10 @@ def taskset_run_cmd(
             force=force,
             token_budgets=tuple(token_budget or ()),
             wall_time_budgets_ms=tuple(wall_time_budget_ms or ()),
+            suite_id=suite_id,
+            split=split,
         )
-    except (TaskVerificationError, BuildConfigurationError, GhostlabError) as exc:
+    except (TaskVerificationError, BuildConfigurationError, GhostlabError, SuiteError) as exc:
         console.print(f"[red]taskset run failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     _print_taskset_run(result)
@@ -1315,7 +1470,7 @@ def taskset_report_cmd(
             token_budgets=tuple(token_budget or ()),
             wall_time_budgets_ms=tuple(wall_time_budget_ms or ()),
         )
-    except (TaskVerificationError, BuildConfigurationError) as exc:
+    except (TaskVerificationError, BuildConfigurationError, SuiteError) as exc:
         console.print(f"[red]taskset report failed: {exc}[/red]")
         raise typer.Exit(1) from exc
     if json_output:
@@ -1368,6 +1523,152 @@ def _print_taskset_report(result: TasksetReportSummary) -> None:
     _print_rows("Budget conditionals", result.budget_rows())
     _print_rows("Invalid attempts", result.error_rows())
     console.print(f"[green]wrote report to {result.results_path}[/green]")
+
+
+def _print_experiment(record: dict[str, Any], json_output: bool) -> None:
+    from .dashboard.benchmarks import project_experiment
+
+    public = project_experiment(record)
+    if json_output:
+        console.print_json(json.dumps(public, ensure_ascii=False))
+        return
+    console.print(f"experiment: {public['experiment_id']} · {public['status']}")
+    console.print(f"  {public['title']}")
+    console.print(
+        f"  datasets={len(public['datasets'])} agents={len(public['agents'])} "
+        f"requested trials={public['requested_attempts']} seeds={','.join(map(str, public['seeds']))}"
+    )
+    if public["error"]:
+        console.print(f"[red]  {public['error']}[/red]")
+    if public["cleanup"]:
+        console.print(f"  cleanup: {json.dumps(public['cleanup'], ensure_ascii=False)}")
+
+
+@experiment_app.command("create")
+def experiment_create_cmd(
+    title: str = typer.Option(..., "--title", help="Name of the experiment"),
+    dataset: list[str] = typer.Option(
+        ..., "--dataset", help="NAME/SUITE or NAME/SUITE/SPLIT; may be repeated",
+    ),
+    agent: list[Path] = typer.Option(
+        ..., "--agent", exists=True, dir_okay=False, resolve_path=True,
+        help="Candidate Ghostlab config; may be repeated",
+    ),
+    description: str = typer.Option("", "--description", help="Question or hypothesis being tested"),
+    seeds: str = typer.Option("0,1,2", "--seeds", help="Comma-separated distinct non-negative seeds"),
+    experiment_id: Optional[str] = typer.Option(None, "--id", help="Optional path-safe experiment ID"),
+    agent_timeout: Optional[float] = typer.Option(None, "--agent-timeout", min=0.001),
+    scorer_timeout: Optional[float] = typer.Option(None, "--scorer-timeout", min=0.001),
+    json_output: bool = typer.Option(False, "--json", help="Emit safe setup/progress JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Save an immutable plan; this command never starts a model."""
+    from .benchmarks.task_scorer.experiments import ExperimentError, create_experiment
+    from .benchmarks.task_scorer.run import parse_seeds
+
+    selections = []
+    for value in dataset:
+        parts = value.split("/")
+        if len(parts) not in (2, 3) or not all(parts):
+            raise typer.BadParameter("dataset must be NAME/SUITE[/SPLIT]")
+        selections.append({
+            "name": parts[0], "suite_id": parts[1], "split": parts[2] if len(parts) == 3 else "test",
+        })
+    try:
+        record = create_experiment(
+            _layout(root), title=title, description=description, datasets=selections,
+            agents=[AgentSpec.from_path(path) for path in agent], seeds=parse_seeds(seeds),
+            experiment_id=experiment_id, aut_timeout_seconds=agent_timeout,
+            scorer_timeout_seconds=scorer_timeout,
+        )
+    except (ExperimentError, TaskVerificationError, GhostlabError, OSError) as exc:
+        console.print(f"[red]experiment planning failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_experiment(record, json_output)
+    if not json_output:
+        console.print("Plan saved. No model was called. Use retro experiment run to explicitly start it.")
+
+
+@experiment_app.command("list")
+def experiment_list_cmd(
+    json_output: bool = typer.Option(False, "--json", help="Emit safe job summaries"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """List experiment jobs separately from task datasets."""
+    from .benchmarks.task_scorer.experiments import ExperimentError, list_experiments
+    from .dashboard.benchmarks import project_experiment
+
+    try:
+        records = list_experiments(_layout(root))
+    except (ExperimentError, OSError) as exc:
+        console.print(f"[red]experiment listing failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    if json_output:
+        console.print_json(json.dumps([project_experiment(record) for record in records], ensure_ascii=False))
+    else:
+        for record in records:
+            _print_experiment(record, False)
+        if not records:
+            console.print("No experiment jobs.")
+
+
+@experiment_app.command("show")
+def experiment_show_cmd(
+    experiment_id: str = typer.Argument(..., help="Saved experiment ID"),
+    json_output: bool = typer.Option(False, "--json", help="Emit safe setup/progress JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Inspect a frozen job and its progress without starting agents."""
+    from .benchmarks.task_scorer.experiments import ExperimentError, load_experiment
+
+    try:
+        record = load_experiment(_layout(root), experiment_id)
+    except (ExperimentError, OSError) as exc:
+        console.print(f"[red]experiment inspection failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_experiment(record, json_output)
+
+
+@experiment_app.command("run")
+def experiment_run_cmd(
+    experiment_id: str = typer.Argument(..., help="Saved experiment ID"),
+    ghostlab_bin: Optional[str] = typer.Option(None, "--ghostlab-bin", help="Ghostlab executable name/path"),
+    json_output: bool = typer.Option(False, "--json", help="Emit safe setup/progress JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Explicitly start/resume a planned job; model charges may apply."""
+    from .benchmarks.task_scorer.experiments import ExperimentError, run_experiment
+
+    try:
+        record = run_experiment(_layout(root), experiment_id, ghostlab=ghostlab_bin)
+    except (ExperimentError, TaskVerificationError, GhostlabError, OSError) as exc:
+        console.print(f"[red]experiment run failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_experiment(record, json_output)
+    if record["status"] == "failed" or record.get("summary", {}).get("error_attempts", 0):
+        raise typer.Exit(1)
+
+
+@experiment_app.command("cleanup")
+def experiment_cleanup_cmd(
+    experiment_id: str = typer.Argument(..., help="Saved finished/interrupted experiment ID"),
+    prune_artifacts: bool = typer.Option(
+        False, "--prune-artifacts", help="Also delete this job's owned bulky candidate exports",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit safe cleanup/progress JSON"),
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+) -> None:
+    """Clean only owned experiment artifacts; retain task bundles, grades and evidence."""
+    from .benchmarks.task_scorer.experiments import ExperimentError, cleanup_experiment
+
+    try:
+        record = cleanup_experiment(_layout(root), experiment_id, prune_artifacts=prune_artifacts)
+    except (ExperimentError, OSError) as exc:
+        console.print(f"[red]experiment cleanup failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    _print_experiment(record, json_output)
+    if record.get("cleanup", {}).get("errors"):
+        raise typer.Exit(1)
 
 
 @benchmark_app.command("build")
@@ -2365,6 +2666,52 @@ def dashboard_view(
     )
 
 
+@dashboard_app.command("serve")
+def dashboard_serve(
+    root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
+    out: Optional[Path] = typer.Option(None, "--out", help="dashboard directory"),
+    port: int = typer.Option(8877, "--port", min=1, max=65535, help="Loopback-only HTTP port"),
+    agent: Optional[list[Path]] = typer.Option(
+        None, "--agent", exists=True, dir_okay=False, resolve_path=True,
+        help="Register a candidate Ghostlab agent config; may be repeated",
+    ),
+    ghostlab_bin: Optional[str] = typer.Option(
+        None, "--ghostlab-bin", help="Ghostlab executable name/path",
+    ),
+    max_attempts: int = typer.Option(
+        100, "--max-attempts", min=1, help="Maximum requested agent trials in one UI-created experiment",
+    ),
+) -> None:
+    """Serve local experiment planning, explicit job starts and private grader inspection."""
+    from .benchmarks.task_scorer.ghostlab_cli import GhostlabCli
+    from .dashboard import build_dashboard
+    from .dashboard.server import ControlError, DashboardServer, ExperimentController
+
+    layout, directory = _layout(root), resolve_dashboard_dir(out)
+    try:
+        specs = [AgentSpec.from_path(path) for path in agent or []]
+        build_dashboard(layout, directory, mode="auto", publish=True)
+        controller = ExperimentController(
+            layout, directory, agents=specs, ghostlab=GhostlabCli(ghostlab_bin),
+            max_attempts=max_attempts,
+        )
+        server = DashboardServer(controller, port)
+    except (ControlError, TaskVerificationError, GhostlabError, OSError) as exc:
+        console.print(f"[red]dashboard controls failed: {exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]local dashboard:[/green] http://127.0.0.1:{port}/index.html#/tasks")
+    console.print(
+        "Static exports stay read-only. Saving a plan does not run a model; starting a job may incur charges."
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("Stopping local controls; waiting for any active experiment to finish cleanup.")
+    finally:
+        server.server_close()
+        controller.close()
+
+
 @app.command("analyze")
 def analyze(
     root: Optional[Path] = typer.Option(None, help="rollout-memory root"),
@@ -2374,7 +2721,12 @@ def analyze(
     from .signals import analyze_sessions, generate_report, render_console_report
 
     lay = _layout(root)
-    stats = analyze_sessions(lay, host=_expand_host(host) if host else None)
+    with archive_lock(lay):
+        update_catalog(lay)
+        source = _CatalogSlice(
+            load_catalog(lay), host=_expand_host(host) if host else None, session_ids=None,
+        )
+    stats = analyze_sessions(lay, source)
     render_console_report(stats)
 
     report_path = lay.root / "analysis_report.md"

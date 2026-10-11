@@ -4,6 +4,26 @@
 
 ### Added
 
+- Frozen trajectory-derived benchmark suites with evidence-gated curation,
+  related-task/repository grouping, explicit train/validation/test splits,
+  exact-replay versus opted-in anchored-reconstruction provenance, and
+  immutable evaluation cohorts.
+- `retro benchmark taskset curate|export|reset|reward`, Git-free exact-tree
+  repository episodes, source-balanced training sampling, separately exported
+  hidden verifiers and attested terminal rewards that keep infrastructure
+  errors non-numeric. Exports reference pinned images; they do not train models.
+- Benchmark dashboard views for selection/build/curation yield, provenance,
+  mutation validation, audits, cohort-bound agent comparisons, reward heatmaps,
+  per-seed errors, conditional pass@k and source-bootstrap score intervals.
+- Separate Tasks, Evals datasets and Experiments pages, dismissible verification
+  warnings, and opt-in localhost job controls/private grader input-code-output
+  inspection. Static exports remain read-only and omit hidden grader code.
+- `retro experiment create|list|show|run|cleanup`, immutable pinned job setup,
+  per-trial progress and grades, default experiment-trace exclusion, and exact
+  owned-artifact cleanup without pruning task bundles or global Docker data.
+- Explicit relocated-checkout support for task selection and bundling without
+  mutating historical captures or inventing missing start-state proof.
+
 - Session catalog (`catalog/sessions.jsonl`): one record per archived session with
   agent, client surface (e.g. `codex-exec`, `copilot-vscode-agent`, `claude-cli`),
   interactive vs automated, subagent parent links, first prompt, timing, Git remote,

@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from retro.schema import NormalizedEvent, RawRef
 from retro.utils import event_text, iter_jsonl, iter_messages, truncate, truncate_summary
 
@@ -82,3 +84,12 @@ def test_iter_jsonl(tmp_path: Path):
     assert results[0] == (1, {"a": 1})
     assert results[1] == (3, {"b": 2})
     assert results[2] == (5, {"c": 3})
+    with pytest.raises(ValueError, match=":4: invalid JSONL"):
+        list(iter_jsonl(path, strict=True))
+
+
+def test_strict_jsonl_requires_object_records(tmp_path: Path):
+    path = tmp_path / "values.jsonl"
+    path.write_text('{"a": 1}\n[]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match=":2: JSONL record must be an object"):
+        list(iter_jsonl(path, strict=True))

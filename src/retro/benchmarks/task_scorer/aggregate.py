@@ -9,6 +9,7 @@ it.
 from __future__ import annotations
 
 import math
+import random
 import re
 import statistics
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -668,6 +669,7 @@ class TaskAggregate:
     requested_attempts: int
     scored_attempts: int
     status_counts: Mapping[str, int]
+    pass_at_k: Mapping[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -683,6 +685,7 @@ class TaskAggregate:
             "requested_attempts": self.requested_attempts,
             "scored_attempts": self.scored_attempts,
             "status_counts": dict(sorted(self.status_counts.items())),
+            "pass_at_k": dict(self.pass_at_k),
         }
 
 
@@ -721,6 +724,8 @@ class AgentAggregate:
     component_means: Mapping[str, float]
     resources: Mapping[str, Any]
     budget_conditionals: tuple[BudgetConditional, ...]
+    pass_at_k: Mapping[str, float] = field(default_factory=dict)
+    score_interval: Mapping[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -737,6 +742,9 @@ class AgentAggregate:
             "component_means": dict(sorted(self.component_means.items())),
             "resources": dict(sorted(self.resources.items())),
             "budget_conditionals": [budget.to_dict() for budget in self.budget_conditionals],
+            "pass_at_k": dict(self.pass_at_k),
+            "score_interval": dict(self.score_interval) if self.score_interval is not None else None,
+            "coverage_complete": self.scored_attempts == self.requested_attempts,
         }
 
 
@@ -746,6 +754,7 @@ class BenchmarkAggregate:
     eval_id: str
     agents: tuple[AgentAggregate, ...]
     generated_at: str | None = None
+    cohort: Mapping[str, Any] | None = None
 
     def agent(self, agent_id: str) -> AgentAggregate | None:
         for candidate in self.agents:
@@ -762,6 +771,8 @@ class BenchmarkAggregate:
         }
         if self.generated_at:
             payload["generated_at"] = self.generated_at
+        if self.cohort is not None:
+            payload["cohort"] = dict(self.cohort)
         return payload
 
 
@@ -775,6 +786,45 @@ def _pstdev(values: Sequence[float]) -> float | None:
     if len(values) == 1:
         return 0.0
     return statistics.pstdev(values)
+
+
+def estimate_pass_at_k(trials: int, successes: int, k: int) -> float:
+    """Unbiased pass@k over exchangeable scored trials, not over infrastructure errors."""
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in (trials, successes, k)):
+        raise ValueError("pass@k counts must be integers")
+    if not 0 <= successes <= trials or not 1 <= k <= trials:
+        raise ValueError("pass@k requires 0 <= successes <= trials and 1 <= k <= trials")
+    if trials - successes < k:
+        return 1.0
+    failure_probability = math.prod(
+        (trials - successes - index) / (trials - index) for index in range(k)
+    )
+    return 1.0 - failure_probability
+
+
+def source_score_interval(values: Sequence[float], *, samples: int = 2000) -> dict[str, Any] | None:
+    """Conditional source-resampling interval; insufficient sources have no interval."""
+    if len(values) < 2:
+        return None
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 100:
+        raise ValueError("source bootstrap needs at least 100 samples")
+    if any(not math.isfinite(value) or not 0 <= value <= 1 for value in values):
+        raise ValueError("source bootstrap scores must be finite and in [0, 1]")
+    rng = random.Random(0)
+    ordered = sorted(values)
+    means = sorted(
+        statistics.fmean(rng.choice(ordered) for _ in ordered) for _ in range(samples)
+    )
+    return {
+        "method": "source_percentile_bootstrap",
+        "confidence": 0.95,
+        "lower": means[int(0.025 * (samples - 1))],
+        "upper": means[int(0.975 * (samples - 1))],
+        "sources": len(values),
+        "resamples": samples,
+        "seed": 0,
+        "conditional_on_scored_sources": True,
+    }
 
 
 def _resolve_source(
@@ -975,11 +1025,7 @@ def _aggregate_agent(
                 f"task {task_id!r} has no immutable pass threshold provenance"
             )
         scores = [record.score for record in group if record.valid and record.score is not None]
-        passes = [
-            1.0 if (record.score or 0.0) + TOTAL_MATCH_TOLERANCE >= threshold else 0.0
-            for record in group
-            if record.valid and record.score is not None
-        ]
+        passes = [float(record.passed is True) for record in group if record.valid]
         task_status_counts: dict[str, int] = {}
         for record in group:
             task_status_counts[record.status] = task_status_counts.get(record.status, 0) + 1
@@ -996,6 +1042,10 @@ def _aggregate_agent(
                 requested_attempts=len(group),
                 scored_attempts=len(scores),
                 status_counts=task_status_counts,
+                pass_at_k={
+                    str(k): estimate_pass_at_k(len(passes), sum(int(value) for value in passes), k)
+                    for k in (1, 2, 4, 8) if k <= len(passes)
+                },
             )
         )
 
@@ -1022,6 +1072,15 @@ def _aggregate_agent(
 
     source_means = [source.mean_score for source in sources if source.mean_score is not None]
     source_pass_rates = [source.pass_rate for source in sources if source.pass_rate is not None]
+    complete_ks = set.intersection(
+        *(set(task.pass_at_k) for task in tasks)
+    ) if tasks else set()
+    pass_at_k: dict[str, float] = {}
+    for key in sorted(complete_ks, key=int):
+        pass_at_k[key] = statistics.fmean(
+            statistics.fmean(task.pass_at_k[key] for task in source_tasks)
+            for source_tasks in by_source.values()
+        )
 
     scored = [record for record in records if record.valid]
     requested_total = requested if requested is not None else len(records)
@@ -1059,6 +1118,8 @@ def _aggregate_agent(
         component_means=component_means,
         resources=resources,
         budget_conditionals=tuple(budgets),
+        pass_at_k=pass_at_k,
+        score_interval=source_score_interval(source_means),
     )
 
 

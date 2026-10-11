@@ -1,8 +1,18 @@
 # Rollout-to-Task-and-Scorer Pipeline
 
-Status: implementation specification v1
+Status: implemented core v1 with curated suite and terminal-reward extensions
 
 Date: 2026-08-29
+
+Implementation update: 2026-10-10. The core schemas, Git selection/bundling,
+environment resolver, task/scorer construction, repeated mutant validation,
+independent audit, Ghostlab candidate execution and aggregation now exist.
+The original gap analysis below describes its 2026-08-29 baseline, not the
+current checkout. Frozen release policies, grouped splits, exact-tree public
+workspaces, terminal training rewards/exports and benchmark visualization are
+documented in [Trajectory-derived environment releases](trajectory_environment_releases.md).
+Live sandbox/model trials and RL optimization are not implied by implementation
+or by model-free tests.
 
 Owners:
 
@@ -47,7 +57,7 @@ These are implementation decisions, not open design themes.
 11. **Source-normalized aggregation.** Each rollout has equal default aggregate weight regardless of how many tasks were extracted from it.
 12. **Content-addressed and resumable.** Every source bundle, task, scorer, agent config, and run is hashed. Re-running an unchanged stage reuses its artifact.
 
-## 3. Current repository facts and required gaps
+## 3. Original repository baseline and required gaps
 
 The design is based on Retro commit `bc4a06d4f58fd8874828f33610417ec372dc0454` and Ghostlab commit `096bf3aab21ac9bd441aa249f03f5d41cd626603`.
 

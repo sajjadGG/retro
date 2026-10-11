@@ -12,8 +12,10 @@ from retro.benchmarks.task_scorer.aggregate import (
     AttemptRecord,
     aggregate_attempts,
     classify_status,
+    estimate_pass_at_k,
     iter_status_rows,
     load_attempts,
+    source_score_interval,
     validate_score_report,
     write_aggregate,
 )
@@ -140,6 +142,37 @@ def test_valid_report_totals_match_components() -> None:
     assert result.passed is True
     assert result.unscored_weight == pytest.approx(0.0)
     assert result.errors == ()
+
+
+def test_pass_at_k_uses_without_replacement_estimator():
+    assert estimate_pass_at_k(4, 1, 1) == pytest.approx(0.25)
+    assert estimate_pass_at_k(4, 1, 2) == pytest.approx(0.5)
+    assert estimate_pass_at_k(4, 1, 4) == 1
+    assert estimate_pass_at_k(4, 0, 4) == 0
+    with pytest.raises(ValueError, match="requires"):
+        estimate_pass_at_k(1, 1, 2)
+
+
+def test_source_bootstrap_is_reproducible_and_does_not_invent_single_source_certainty():
+    assert source_score_interval([1]) is None
+    interval = source_score_interval([0.2, 0.6, 1])
+    assert interval == source_score_interval([1, 0.6, 0.2])
+    assert interval is not None
+    assert interval["lower"] <= 0.6 <= interval["upper"]
+    assert interval["sources"] == 3
+
+
+def test_pass_at_k_is_source_normalized_and_outages_are_not_trials():
+    records = [
+        _attempt("t1", "s1", "agent", 0, score=1),
+        _attempt("t1", "s1", "agent", 1, score=0),
+        _attempt("t2", "s2", "agent", 0, score=0),
+        _attempt("t2", "s2", "agent", 1, status="scorer_error", score=None),
+    ]
+    agent = aggregate_attempts(records).agents[0]
+    assert agent.pass_at_k == {"1": pytest.approx(0.25)}
+    assert agent.coverage == pytest.approx(0.75)
+    assert agent.score_interval is not None
 
 
 def test_hard_gate_failure_forces_a_zero_total() -> None:

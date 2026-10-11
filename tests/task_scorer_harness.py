@@ -479,7 +479,7 @@ PRESERVING_FEATURE = (
 CHANGING_FEATURE = 'def greet(name):\n    return f"goodbye {name}"\n'
 
 BASE_SHA = "1" * 40
-BASE_TREE = "2" * 40
+BASE_TREE = "fcc28dbf3461c9d4e3bd0c3c211312ed8db5704a"
 OUTCOME_SHA = "3" * 40
 OUTCOME_TREE = "4" * 40
 

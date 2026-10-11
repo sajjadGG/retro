@@ -31,7 +31,7 @@ _EDIT_RESULT_PATH_RES = (
 )
 
 
-def iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
+def iter_jsonl(path: Path, *, strict: bool = False) -> Iterator[tuple[int, dict[str, Any]]]:
     """Yield (line_number, parsed_dict) for each non-empty line in a JSONL file."""
     with path.open("r", encoding="utf-8") as fh:
         for i, raw_line in enumerate(fh, start=1):
@@ -39,9 +39,14 @@ def iter_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
             if not line:
                 continue
             try:
-                yield i, json.loads(line)
-            except json.JSONDecodeError:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                if strict:
+                    raise ValueError(f"{path}:{i}: invalid JSONL: {error.msg}") from error
                 continue
+            if strict and not isinstance(record, dict):
+                raise ValueError(f"{path}:{i}: JSONL record must be an object")
+            yield i, record
 
 
 def event_text(ev: NormalizedEvent) -> str:

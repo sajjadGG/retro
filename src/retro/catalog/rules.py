@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..config import RetroConfig, validate_rule_spec
+from ..experiment_traces import EXPERIMENT_RULE_ID, EXPERIMENT_TAG, is_experiment_tag
+from ..importers.base import is_ghostlab_copilot_session_id, is_ghostlab_originator
 from .models import SessionRecord
 from .projects import path_glob_matches
 
@@ -33,6 +35,14 @@ class CatalogRule:
 
 
 _BUILTIN_RULES = (
+    CatalogRule(
+        id=EXPERIMENT_RULE_ID,
+        description="Explicit experiment markers, verified Ghostlab provenance, or their child agents.",
+        enabled=True,
+        match={},
+        tags=[EXPERIMENT_TAG, "ignore"],
+        builtin=True,
+    ),
     CatalogRule(
         id="builtin.temp-dir",
         description="Scratch sessions launched from an operating-system temporary directory.",
@@ -107,6 +117,10 @@ def evaluate_rules(record: SessionRecord, config: RetroConfig) -> dict[str, list
             continue
         for tag in rule.tags:
             sources.setdefault(tag, []).append(f"rule:{rule.id}")
+            if rule.id == EXPERIMENT_RULE_ID and record.experiment_parent_key:
+                sources[tag].append(
+                    f"rule:{rule.id}:parent:{record.experiment_parent_key}"
+                )
     return sources
 
 
@@ -176,6 +190,8 @@ def rule_matches(record: SessionRecord, rule: CatalogRule | dict[str, Any]) -> b
 
 
 def _builtin_matches(record: SessionRecord, rule_id: str) -> bool:
+    if rule_id == EXPERIMENT_RULE_ID:
+        return has_experiment_provenance(record) or bool(record.experiment_parent_key)
     if rule_id == "builtin.empty":
         has_prompt = bool(
             record.first_prompt and record.first_prompt.strip()
@@ -191,6 +207,24 @@ def _builtin_matches(record: SessionRecord, rule_id: str) -> bool:
         return record.is_subagent
     if rule_id == "builtin.temp-dir":
         return any(is_temp_path(value) for value in (record.cwd, record.cwd_resolved) if value)
+    return False
+
+
+def has_experiment_provenance(record: SessionRecord) -> bool:
+    """Recognize direct evidence, independently of derived tags and overrides."""
+    if any(
+        marker.get("directive") == "tag"
+        and is_experiment_tag(marker.get("value"))
+        for marker in record.markers
+    ):
+        return True
+    if record.host == "codex":
+        return is_ghostlab_originator(record.originator)
+    if record.host == "vscode-copilot":
+        if is_ghostlab_copilot_session_id(record.session_id):
+            return True
+        if record.parent_key and record.parent_key.startswith("vscode-copilot/"):
+            return is_ghostlab_copilot_session_id(record.parent_key.split("/", 1)[1])
     return False
 
 

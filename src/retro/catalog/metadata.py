@@ -26,6 +26,7 @@ class HostMetadata:
     models: list[str] = field(default_factory=list)
     started_at: str | None = None
     ended_at: str | None = None
+    originator: str | None = None
 
 
 def extract_host_metadata(host: str, session_id: str, raw_dir: Path) -> HostMetadata:
@@ -144,6 +145,7 @@ def _codex_metadata(session_id: str, raw_dir: Path) -> HostMetadata:
         models=_strings(payload.get("model")),
         started_at=_text(payload.get("timestamp") or payload.get("created_at")),
         ended_at=_text(thread.get("updated_at")),
+        originator=originator,
     )
 
 

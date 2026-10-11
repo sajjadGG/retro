@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import RetroConfig, load_config
+from ..experiment_traces import EXPERIMENT_RULE_ID, is_experiment_tag
 from ..schema import read_events
 from ..storage import Layout
 from ..utils import (
@@ -33,12 +35,12 @@ from .projects import (
     resolve_cwd,
     resolve_git_and_project,
 )
-from .rules import evaluate_rules, is_temp_path
+from .rules import evaluate_rules, has_experiment_provenance, is_temp_path
 
 CATALOG_SCHEMA = 1
-EXTRACTOR_VERSION = "catalog-v1-v3-compatible-16"
+EXTRACTOR_VERSION = "catalog-v1-v3-compatible-17"
 EVALUATION_STATE_SCHEMA = 1
-TAG_EVALUATOR_VERSION = "catalog-tags-v3"
+TAG_EVALUATOR_VERSION = "catalog-tags-v4"
 PROJECT_EVALUATOR_VERSION = "catalog-projects-v3"
 _NORMALIZED_SUFFIX = ".events.jsonl"
 _TOOL_CALL_TYPES = {"tool_call", "command", "file_edit", "file_read", "subagent_start"}
@@ -83,6 +85,7 @@ class EvaluationContext:
     ignore: IgnoreResult
     ephemeral: bool
     git_signature: str
+    experiment_parent_key: str | None = None
 
 
 @dataclass
@@ -310,6 +313,17 @@ def update_catalog(
         if prior is None:
             added.append(key)
 
+    changed.extend(
+        _update_experiment_lineage(
+            existing,
+            config=config,
+            annotations=annotations,
+            evaluation_state=evaluation_state,
+            tag_policy_digest=tag_policy_digest,
+            project_policy_digest=project_policy_digest,
+        )
+    )
+    changed = sorted(set(changed))
     if keys is None:
         for stale in set(evaluation_state) - set(existing):
             del evaluation_state[stale]
@@ -325,6 +339,75 @@ def update_catalog(
         total=len(existing),
         excluded_total=excluded_total,
     )
+
+
+def _update_experiment_lineage(
+    records: dict[str, SessionRecord],
+    *,
+    config: RetroConfig,
+    annotations: dict[str, AnnotationState],
+    evaluation_state: dict[str, dict[str, str]],
+    tag_policy_digest: str,
+    project_policy_digest: str,
+) -> list[str]:
+    parents: dict[str, str] = {}
+    if EXPERIMENT_RULE_ID not in config.disabled_rules:
+        children: dict[str, list[str]] = {}
+        roots = {
+            key for key, record in records.items() if has_experiment_provenance(record)
+        }
+        for key, record in records.items():
+            if record.parent_key:
+                children.setdefault(record.parent_key, []).append(key)
+        pending = deque(sorted(roots))
+        seen = set(roots)
+        while pending:
+            parent = pending.popleft()
+            for child in sorted(children.get(parent, [])):
+                if child in seen:
+                    continue
+                seen.add(child)
+                parents[child] = parent
+                pending.append(child)
+
+    changed: list[str] = []
+    for key, prior in sorted(records.items()):
+        experiment_parent = parents.get(key)
+        if prior.experiment_parent_key == experiment_parent:
+            continue
+        record = SessionRecord.from_dict(prior.to_dict())
+        record.experiment_parent_key = experiment_parent
+        annotation = annotations.get(key, AnnotationState())
+        context = _evaluation_context(record, prior=prior)
+        _reevaluate_project(
+            record,
+            config=config,
+            annotation=annotation,
+            context=context,
+        )
+        _reevaluate_tags(
+            record,
+            config=config,
+            annotation=annotation,
+            context=context,
+        )
+        project_evaluation = _project_evaluation_digest(
+            project_policy_digest,
+            annotation.project_digest,
+            context,
+        )
+        evaluation_state[key] = {
+            "tag": _tag_evaluation_digest(
+                tag_policy_digest,
+                annotation.tag_digest,
+                context,
+                project_evaluation,
+            ),
+            "project": project_evaluation,
+        }
+        records[key] = record
+        changed.append(key)
+    return changed
 
 
 def _build_content_record(
@@ -402,6 +485,7 @@ def _build_content_record(
         tag_sources={},
         excluded=False,
         fingerprint=source_digest,
+        originator=metadata.originator,
     )
     return record
 
@@ -438,6 +522,7 @@ def _evaluation_context(
         ignore=ignore,
         ephemeral=ephemeral,
         git_signature=git_signature,
+        experiment_parent_key=record.experiment_parent_key,
     )
 
 
@@ -463,6 +548,7 @@ def _reevaluate_project(
         models=list(record.models),
         started_at=record.started_at,
         ended_at=record.ended_at,
+        originator=record.originator,
     )
     marker_project = next(
         (
@@ -683,6 +769,13 @@ def _scan_events(path: Path) -> EventSummary:
                 summary.markers.extend(
                     parse_markers(text, event_id=event.event_id)
                 )
+            else:
+                summary.markers.extend(
+                    marker
+                    for marker in parse_markers(text, event_id=event.event_id)
+                    if marker["directive"] == "tag"
+                    and is_experiment_tag(marker.get("value"))
+                )
         elif event.event_type == "message" and event.actor == "assistant":
             summary.counts["assistant_messages"] += 1
         if event.event_type in _TOOL_CALL_TYPES and event.actor in {"assistant", "subagent"}:
@@ -889,6 +982,7 @@ def _tag_evaluation_digest(
                 context.cwd_resolved or "",
                 context.ignore.signature,
                 project_evaluation_digest,
+                context.experiment_parent_key or "",
             )
         ).encode()
     ).hexdigest()

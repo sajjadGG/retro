@@ -18,8 +18,10 @@ from retro.benchmarks.task_scorer.build import (
 from retro.benchmarks.task_scorer.ghostlab_cli import (
     CommandOutcome,
     GhostlabCli,
+    GhostlabContractError,
     sha256_file,
     sha256_json,
+    sha256_text,
 )
 from retro.benchmarks.task_scorer.run import (
     AgentSpec,
@@ -32,6 +34,7 @@ from retro.benchmarks.task_scorer.run import (
     verify_published_task,
 )
 from retro.benchmarks.task_scorer.schema import ATTEMPT_STATUSES, BenchmarkAttempt
+from retro.locking import LockUnavailableError, exclusive_lock
 from tests.task_scorer_harness import (
     BASE_TREE,
     TASK_PROMPT,
@@ -47,6 +50,58 @@ from tests.task_scorer_harness import (
 )
 
 SOURCE_ID = "codex__019abc"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 /opt/native.py --model not-a-label",
+        ["sh", "-c", "python3 /opt/native.py --model not-a-label"],
+        ["python3", "-c", "print('inline code')", "--model", "not-a-label"],
+        ["python3", "/opt/native.py", "--model", "first", "--model", "second"],
+        ["python3", "/opt/native.py", "--", "--model", "not-a-label"],
+        ["python3", "/opt/native.py", "--model"],
+        ["python3", "/opt/native.py", "--model", "value with spaces"],
+        ["python3", "/opt/native.py", "--model", "$PRIVATE_TOKEN"],
+        ["python3", "/opt/native.py", "--model", 123],
+    ],
+)
+def test_runtime_labels_do_not_guess_models_from_shell_or_ambiguous_argv(
+    tmp_path: Path, command: Any,
+) -> None:
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps({"id": "native-agent", "runner": {"command": command}}))
+    labels = AgentSpec.from_path(path).runtime_labels()
+    assert "model" not in labels
+    assert "not-a-label" not in json.dumps(labels)
+
+
+@pytest.mark.parametrize("model_arg", [["--model", "mai-code-1.1"], ["--model=mai-code-1.1"]])
+def test_runtime_labels_parse_only_named_process_model_and_script_basename(
+    tmp_path: Path, model_arg: list[str],
+) -> None:
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps({
+        "id": "native-agent",
+        "runner": {
+            "command": ["/usr/bin/python3", "/opt/native.py", *model_arg, "--token", "secret-value"],
+            "parser": "copilot-json",
+        },
+        "sandbox": {"backend": "openshell"},
+    }))
+    assert AgentSpec.from_path(path).runtime_labels() == {
+        "model": "mai-code-1.1", "backend": "openshell", "parser": "copilot-json",
+        "runner": "python3", "script": "native.py",
+    }
+
+
+def test_explicit_runtime_model_label_takes_precedence_over_process_argv(tmp_path: Path) -> None:
+    path = tmp_path / "agent.json"
+    path.write_text(json.dumps({
+        "id": "native-agent", "runtime": {"model": "explicit-model"},
+        "runner": {"command": ["python3", "/opt/native.py", "--model", "argv-model"]},
+    }))
+    assert AgentSpec.from_path(path).runtime_labels()["model"] == "explicit-model"
 
 
 class _Published:
@@ -772,9 +827,15 @@ def test_solving_agent_scores_and_writes_an_immutable_attempt(published: _Publis
         "judge_launcher": "not_run",
     }
 
-    # The attempt worked in a fresh materialization of the published base bundle.
-    assert (attempt.attempt_dir / "workspace" / "src" / "legacy.py").is_file()
-    assert not (attempt.attempt_dir / "workspace" / "src" / "feature.py").is_file()
+    assert not (attempt.attempt_dir / "workspace").exists()
+    assert not (attempt.attempt_dir / ".runtime-inputs").exists()
+    metadata = json.loads((attempt.attempt_dir / "attempt-metadata.json").read_text())
+    assert metadata["experiment_id"] == "eval-1"
+    assert metadata["tags"] == ["experiment", "experiment/eval-1"]
+    assert metadata["source_prompt_sha256"] == task.prompt_sha256
+    assert metadata["execution_prompt_sha256"] != task.prompt_sha256
+    assert artifact_run["prompt_sha256"] == metadata["execution_prompt_sha256"]
+    assert "#retro:ignore" in (attempt.attempt_dir / "prompt.txt").read_text()
     with tarfile.open(attempt.attempt_dir / "agent" / "candidate-state.tar.zst") as archive:
         assert "src/feature.py" in archive.getnames()
 
@@ -806,6 +867,211 @@ def test_attempts_are_hash_addressed_and_resume(published: _Published) -> None:
     )
     assert forced.reused is False
     assert forced.attempt_id == first.attempt_id
+
+
+@pytest.mark.parametrize("remove_checkpoint", [False, True])
+def test_interrupted_candidate_export_is_recovered_without_rerunning_agent(
+    published: _Published, monkeypatch: pytest.MonkeyPatch, remove_checkpoint: bool,
+) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    client = published.client()
+    config = published.run_config(ghostlab=client)
+    first = run_attempt(published.paths, config, task, published.agent(), 0)
+    (first.attempt_dir / "attempt.json").unlink()
+    (first.attempt_dir / "score-report.json").unlink()
+    if remove_checkpoint:
+        (first.attempt_dir / "candidate-phase.json").unlink()
+
+    def must_not_run(_request):
+        pytest.fail("a verified candidate export must survive an interrupted job")
+
+    monkeypatch.setattr(client, "artifact_run", must_not_run)
+    resumed = run_attempt(published.paths, config, task, published.agent(), 0)
+    assert resumed.status == "scored"
+    assert resumed.attempt_id == first.attempt_id
+    assert resumed.candidate_state_sha256 == first.candidate_state_sha256
+    assert (resumed.attempt_dir / "agent" / "invocations.log").read_text().splitlines() == ["candidate-good"]
+    assert not (resumed.attempt_dir / "workspace").exists()
+
+
+def test_interrupted_attested_score_is_recovered_without_rerunning_stages(
+    published: _Published, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    client = published.client()
+    config = published.run_config(ghostlab=client)
+    first = run_attempt(published.paths, config, task, published.agent(), 0)
+    (first.attempt_dir / "attempt.json").unlink()
+    score_hash = sha256_file(first.attempt_dir / "score-report.json")
+
+    def must_not_run(_request):
+        pytest.fail("verified candidate and score evidence must be reused")
+
+    monkeypatch.setattr(client, "artifact_run", must_not_run)
+    monkeypatch.setattr(client, "scorer_run", must_not_run)
+    resumed = run_attempt(published.paths, config, task, published.agent(), 0)
+    assert resumed.status == "scored"
+    assert resumed.score == first.score
+    assert sha256_file(first.attempt_dir / "score-report.json") == score_hash
+
+
+def test_experiment_marker_identity_is_part_of_the_execution_fingerprint(published: _Published) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    original = task.prompt_path.read_bytes()
+    first = run_attempt(
+        published.paths, published.run_config(experiment_id="trial-a"), task, published.agent(), 0,
+    )
+    second = run_attempt(
+        published.paths, published.run_config(experiment_id="trial-b", eval_id="eval-2"),
+        task, published.agent(), 0,
+    )
+    assert first.attempt_id != second.attempt_id
+    assert task.prompt_path.read_bytes() == original
+    metadata = json.loads((second.attempt_dir / "attempt-metadata.json").read_text())
+    assert metadata["experiment_job_id"] == "trial-b"
+    assert "#retro:tag=experiment/trial-b" in (second.attempt_dir / "prompt.txt").read_text()
+
+
+def test_legacy_long_eval_ids_are_bounded_only_in_trace_labels(published: _Published) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    identity = "long-evaluation-" + "x" * 70
+    attempt = run_attempt(
+        published.paths, published.run_config(eval_id=identity), task, published.agent(), 0,
+    )
+    metadata = json.loads((attempt.attempt_dir / "attempt-metadata.json").read_text())
+    assert metadata["eval_id"] == identity
+    assert len(metadata["experiment_id"]) == 53
+    assert attempt.status == "scored"
+
+
+def test_attempt_lock_prevents_concurrent_standalone_overwrites(published: _Published) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    config = published.run_config()
+    directory = published.paths.attempt_dir(config.eval_id, task.task_id, published.agent().agent_id, 0)
+    with exclusive_lock(directory / ".attempt.lock"):
+        with pytest.raises(LockUnavailableError):
+            run_attempt(published.paths, config, task, published.agent(), 0)
+    assert not (directory / "attempt.json").exists()
+
+
+def test_modified_candidate_checkpoint_is_reported_without_automatic_paid_rerun(
+    published: _Published, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = published.client()
+    task = verify_published_task(published.paths, published.task_id)
+    config = published.run_config(ghostlab=client)
+    original = run_attempt(published.paths, config, task, published.agent(), 0)
+    metadata_path = original.attempt_dir / "attempt-metadata.json"
+    original_hashes = json.loads(metadata_path.read_text())["candidate_exports"]
+    (original.attempt_dir / "attempt.json").unlink()
+    candidate = original.attempt_dir / "agent" / "candidate-state.tar.zst"
+    candidate.write_bytes(b"tampered candidate export")
+
+    def no_execution(_request):
+        pytest.fail("a damaged checkpoint must not silently launch a paid replacement")
+
+    monkeypatch.setattr(client, "artifact_run", no_execution)
+    recovered = run_attempt(published.paths, config, task, published.agent(), 0)
+    assert recovered.status == "harness_error"
+    assert "changed" in str(recovered.error)
+    assert candidate.read_bytes() == b"tampered candidate export"
+    assert json.loads(metadata_path.read_text())["candidate_exports"] == original_hashes
+
+
+def test_candidate_phase_cleanup_refuses_symlinked_workspace_without_touching_target(
+    published: _Published,
+) -> None:
+    task = verify_published_task(published.paths, published.task_id)
+    directory = published.paths.attempt_dir("eval-1", task.task_id, published.agent().agent_id, 0)
+    directory.mkdir(parents=True)
+    target = published.tmp_path / "not-an-attempt-workspace"
+    target.mkdir()
+    witness = target / "preserve.txt"
+    witness.write_text("preserve")
+    (directory / "workspace").symlink_to(target, target_is_directory=True)
+    attempt = run_attempt(published.paths, published.run_config(), task, published.agent(), 0)
+    assert attempt.status == "harness_error"
+    assert witness.read_text() == "preserve"
+    assert json.loads((directory / "cleanup.json").read_text())["errors"]
+
+
+def test_candidate_setup_error_persists_failure_before_disposable_inputs_are_cleaned(
+    published: _Published, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken_setup(self, _image, destination, **_kwargs):
+        destination.mkdir()
+        (destination / "partial.txt").write_text("partial snapshot")
+        raise RuntimeError("snapshot unavailable")
+
+    monkeypatch.setattr(AgentSpec, "execution_config", broken_setup)
+    task = verify_published_task(published.paths, published.task_id)
+    attempt = run_attempt(published.paths, published.run_config(), task, published.agent(), 0)
+    assert attempt.status == "harness_error"
+    assert "snapshot unavailable" in str(attempt.error)
+    assert (attempt.attempt_dir / "attempt.json").is_file()
+    assert (attempt.attempt_dir / "attempt-metadata.json").is_file()
+    assert not (attempt.attempt_dir / "workspace").exists()
+    assert not (attempt.attempt_dir / ".runtime-inputs").exists()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_scorer_duplicate_staging_is_cleaned_but_attested_input_and_reports_are_retained(
+    published: _Published, monkeypatch: pytest.MonkeyPatch, failure: bool,
+) -> None:
+    client = published.client()
+    scorer = client.scorer_run
+
+    def staged_scorer(request):
+        result = scorer(request)
+        staging = request.run_dir / "scorer-staging"
+        for name in ("candidate/repo", "repo", "repository", "reference"):
+            tree = staging / name
+            tree.mkdir(parents=True)
+            (tree / "duplicate.txt").write_text("heavy duplicate repository")
+        inputs = staging / "input"
+        inputs.mkdir()
+        input_path = inputs / "score-input.json"
+        score_input = {
+            "schema_version": "retro-score-input-v1",
+            "task_id": request.task_path.parent.parent.name,
+            "attempt_id": request.attempt_id,
+            "repo_path": "/candidate/repo", "task_path": "/input/task.json", "seed": request.seed,
+        }
+        input_path.write_text(json.dumps(score_input, indent=2) + "\n")
+        (inputs / "task.json").write_bytes(request.task_path.read_bytes())
+        (inputs / "resources.json").write_bytes(request.resource_usage_path.read_bytes())
+        attestation = json.loads(result.run_report_path.read_text())
+        attestation["hashes"]["score_input_sha256"] = sha256_text(
+            json.dumps(score_input, sort_keys=True, separators=(",", ":"))
+        )
+        result.run_report_path.write_text(json.dumps(attestation))
+        if failure:
+            raise GhostlabContractError("failure after scorer evidence was persisted")
+        return result
+
+    monkeypatch.setattr(client, "scorer_run", staged_scorer)
+    task = verify_published_task(published.paths, published.task_id)
+    attempt = run_attempt(published.paths, published.run_config(ghostlab=client), task, published.agent(), 0)
+    assert attempt.status == ("invalid_result" if failure else "scored")
+    assert (attempt.attempt_dir / "attempt.json").is_file()
+    staging = attempt.attempt_dir / "scorer" / "scorer-staging"
+    assert all(not (staging / name).exists() for name in ("candidate", "repo", "repository", "reference"))
+    assert all((staging / "input" / name).is_file() for name in (
+        "score-input.json", "task.json", "resources.json",
+    ))
+    attestation = json.loads((attempt.attempt_dir / "scorer" / "scorer-run.json").read_text())
+    input_path = staging / "input" / "score-input.json"
+    canonical_hash = sha256_text(
+        json.dumps(json.loads(input_path.read_text()), sort_keys=True, separators=(",", ":"))
+    )
+    assert attestation["hashes"]["score_input_sha256"] == canonical_hash
+    assert sha256_file(input_path) != canonical_hash
+    assert (attempt.attempt_dir / "score-report.json").is_file()
+    metadata = json.loads((attempt.attempt_dir / "attempt-metadata.json").read_text())
+    assert metadata["scorer_inputs"]["scorer/scorer-staging/input/score-input.json"] == {
+        "path": str(staging / "input" / "score-input.json"),
+        "sha256": sha256_file(input_path),
+    }
 
 
 def test_cached_score_is_not_reused_without_its_bound_private_attestation(

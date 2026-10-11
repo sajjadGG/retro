@@ -601,6 +601,65 @@
     return el("section", {class: "panel" + (extra ? " " + extra : "")}, [title ? el("h2", {text: title}) : null].concat(children || []));
   }
 
+  var dismissedNotices = null;
+  var noticeStorageAvailable = true;
+  var NOTICE_STORAGE_KEY = "retro-dismissed-warnings-v1";
+
+  function noticeState() {
+    if (dismissedNotices !== null) { return dismissedNotices; }
+    dismissedNotices = [];
+    try {
+      if (!global.localStorage) { throw new Error("Browser storage is unavailable"); }
+      var saved = global.localStorage.getItem(NOTICE_STORAGE_KEY);
+      var values = saved ? JSON.parse(saved) : [];
+      if (!Array.isArray(values) || values.some(function (value) { return typeof value !== "string"; })) {
+        throw new Error("Saved warning dismissals are invalid");
+      }
+      dismissedNotices = values.slice(-64);
+    } catch (error) {
+      noticeStorageAvailable = false;
+      if (global.console) { global.console.warn("Warning dismissals will last for this tab only:", error); }
+    }
+    return dismissedNotices;
+  }
+
+  function dismissibleNotice(content, identity, label) {
+    var key = JSON.stringify([(manifest.archive || {}).root || "", identity]);
+    var values = noticeState();
+    var status = el("span", {class: "muted notice-storage-status", role: "status"});
+    var reopen = el("button", {type: "button", class: "ghost notice-reopen",
+      text: "Show dismissed warning", "aria-label": "Show dismissed " + label});
+    var dismiss = el("button", {type: "button", class: "ghost notice-dismiss",
+      text: "Dismiss", "aria-label": "Dismiss " + label});
+    var wrapper = el("div", {class: "dismissible-notice"}, [content, reopen, status]);
+    function update(hidden) {
+      content.hidden = hidden;
+      reopen.hidden = !hidden;
+    }
+    function save() {
+      if (noticeStorageAvailable) {
+        try { global.localStorage.setItem(NOTICE_STORAGE_KEY, JSON.stringify(dismissedNotices)); }
+        catch (error) {
+          noticeStorageAvailable = false;
+          if (global.console) { global.console.warn("Could not save warning dismissal:", error); }
+        }
+      }
+      status.textContent = noticeStorageAvailable ? "" : "Dismissal lasts for this tab only; browser storage is unavailable.";
+    }
+    dismiss.addEventListener("click", function () {
+      if (dismissedNotices.indexOf(key) === -1) { dismissedNotices.push(key); }
+      dismissedNotices = dismissedNotices.slice(-64);
+      save(); update(true); reopen.focus();
+    });
+    reopen.addEventListener("click", function () {
+      dismissedNotices = dismissedNotices.filter(function (value) { return value !== key; });
+      save(); update(false); dismiss.focus();
+    });
+    content.appendChild(dismiss);
+    update(values.indexOf(key) !== -1);
+    return wrapper;
+  }
+
   function kpi(label, value, deltaFraction, hint) {
     var children = [el("div", {class: "label", text: label}), el("div", {class: "value", text: value})];
     if (deltaFraction !== null && deltaFraction !== undefined && !isNaN(deltaFraction)) {
@@ -915,6 +974,7 @@
     dailySeries: dailySeries, dayKey: dayKey, localDayKey: localDayKey, streak: streak,
     rangeStart: rangeStart, rangeDays: rangeDays, percentile: percentile,
     fmt: fmt, el: el, clear: clear, panel: panel, kpi: kpi, pill: pill, tableOf: tableOf,
+    dismissibleNotice: dismissibleNotice,
     barChart: barChart, mixBar: mixBar, histogram: histogram, colorFor: colorFor,
     virtualList: virtualList, parseHash: parseHash, buildHash: buildHash, go: go
   };

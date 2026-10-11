@@ -89,6 +89,73 @@ def test_selects_eligible_source(archive: Layout, repo):
     assert anchor.repo_id.startswith("sha256:")
 
 
+def test_explicit_checkout_replays_a_relocated_capture_without_rewriting_it(archive: Layout, repo):
+    root, shas = repo
+    old_root = root.parent / "deleted-worktree"
+    install_session(
+        archive,
+        events=rollout_events(base_sha=shas["base_sha"], include_commit=False),
+        cwd=str(old_root),
+        raw_files={
+            "repo_start.json": repo_state_json(old_root, shas["base_sha"], shas["base_tree"]),
+            "repo_end.json": repo_state_json(
+                old_root,
+                shas["outcome_sha"],
+                shas["outcome_tree"],
+                captured_at="2026-08-01T19:00:00Z",
+            ),
+        },
+    )
+    raw_start = archive.raw_dir("codex", "session-1") / "repo_start.json"
+    original = raw_start.read_bytes()
+
+    candidate, rejection = selection.select_source(
+        layout=archive, host="codex", session_id="session-1", require_environment=False
+    )
+    assert candidate is None
+    assert rejection is not None and rejection.code == "NO_REPO_CWD"
+
+    candidate, rejection = selection.select_source(
+        layout=archive,
+        host="codex",
+        session_id="session-1",
+        repo_root=root,
+        require_environment=False,
+    )
+    assert rejection is None
+    assert candidate is not None
+    assert candidate.base_sha == shas["base_sha"]
+    assert candidate.outcome_sha == shas["outcome_sha"]
+    assert candidate.cwd == str(old_root)
+    assert candidate.repo_root_overridden
+    assert candidate.base.evidence["captured_root"] == str(old_root)
+    assert candidate.outcome.evidence["captured_root"] == str(old_root)
+    assert candidate.selection_record()["resolved_repo_root"] == str(root)
+    assert raw_start.read_bytes() == original
+
+
+def test_relocated_checkout_does_not_create_missing_clean_start_proof(archive: Layout, repo):
+    root, shas = repo
+    install_session(
+        archive,
+        events=rollout_events(
+            base_sha=shas["base_sha"],
+            commit_short=shas["outcome_sha"][:7],
+            include_clean_status=False,
+        ),
+        cwd=str(root.parent / "deleted-worktree"),
+    )
+    candidate, rejection = selection.select_source(
+        layout=archive,
+        host="codex",
+        session_id="session-1",
+        repo_root=root,
+        require_environment=False,
+    )
+    assert candidate is None
+    assert rejection is not None and rejection.code == "DIRTY_START_STATE"
+
+
 def test_rejects_missing_normalized_rollout(archive: Layout):
     candidate, rejection = selection.select_source(
         layout=archive, host="codex", session_id="ghost", require_environment=False

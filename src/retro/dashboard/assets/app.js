@@ -10,7 +10,9 @@
   var loadStateNode = document.getElementById("loadstate");
   var footerNode = document.getElementById("footer-build");
   var helpNode = document.getElementById("help");
-  var NAV_PARENT = {project: "projects", session: "sessions", signal: "signals"};
+  var NAV_PARENT = {project: "projects", session: "sessions", signal: "signals",
+    benchmarks: "tasks", "benchmark-task": "tasks", task: "tasks",
+    dataset: "evals", "benchmark-eval": "experiments", "agent-run": "experiments", experiment: "experiments"};
   var context = null;
 
   function applyTheme(theme) {
@@ -59,10 +61,22 @@
     C.clear(bannerNode);
     if (messages.length) {
       bannerNode.hidden = false;
-      bannerNode.className = "banner " + tone;
-      bannerNode.appendChild(el("strong", {text: "capture health"}));
-      bannerNode.appendChild(el("ul", null, messages.map(function (message) { return el("li", {text: message}); })));
-      if (note) { bannerNode.appendChild(el("div", {class: "muted", text: note})); }
+      bannerNode.className = "banner-shell";
+      var content = el("div", {class: "banner " + tone});
+      var onlyBenchmarks = messages.every(function (message) { return /^\d+ benchmark artifact warnings/.test(message); });
+      content.appendChild(el("strong", {text: onlyBenchmarks ? "benchmark verification" : "data status"}));
+      content.appendChild(el("ul", null, messages.map(function (message) {
+        if (/^\d+ benchmark artifact warnings/.test(message)) {
+          return el("li", null, [
+            "Some saved benchmark records need verification. This does not mean the latest verified tasks failed. ",
+            el("a", {href: "#/experiments", text: "See affected versions and what to do"})
+          ]);
+        }
+        return el("li", {text: message});
+      })));
+      if (note) { content.appendChild(el("div", {class: "muted", text: note})); }
+      bannerNode.appendChild(C.dismissibleNotice(content, ["global", messages.slice().sort(),
+        (C.manifest.benchmarks || {}).warning_sha256 || ""], "global warning"));
       return;
     }
     if (note) {
@@ -153,8 +167,8 @@
       el("h2", {text: "Keyboard"}),
       el("dl", {class: "kv"}, [
         el("dt", {text: "/"}), el("dd", {text: "search sessions"}),
-        el("dt", {text: "g o / g p / g s / g i / g q"}), el("dt", {text: ""}),
-        el("dd", {text: "overview, projects, sessions, signals, data quality"}), el("dd", {text: ""}),
+        el("dt", {text: "g o / g p / g s / g i / g b / g e / g x / g q"}), el("dt", {text: ""}),
+        el("dd", {text: "overview, projects, sessions, signals, tasks, evals, experiments, data quality"}), el("dd", {text: ""}),
         el("dt", {text: "↑ ↓ / Enter"}), el("dd", {text: "move and open rows in the sessions list"}),
         el("dt", {text: "t"}), el("dd", {text: "cycle theme"}),
         el("dt", {text: "Esc"}), el("dd", {text: "close this dialog"})
@@ -174,7 +188,8 @@
     if (event.metaKey || event.ctrlKey || event.altKey) { return; }
     if (pendingGo) {
       pendingGo = false;
-      var destination = {o: "overview", p: "projects", s: "sessions", i: "signals", q: "quality"}[event.key];
+      var destination = {o: "overview", p: "projects", s: "sessions", i: "signals",
+        b: "tasks", e: "evals", x: "experiments", q: "quality"}[event.key];
       if (destination) { event.preventDefault(); C.go(destination, "", {}); }
       return;
     }

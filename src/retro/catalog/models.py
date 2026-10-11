@@ -35,6 +35,8 @@ class SessionRecord:
     tag_sources: dict[str, list[str]]
     excluded: bool
     fingerprint: str
+    originator: str | None = None
+    experiment_parent_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -64,6 +66,8 @@ class SessionRecord:
             "tag_sources": copy.deepcopy(self.tag_sources),
             "excluded": self.excluded,
             "fingerprint": self.fingerprint,
+            "originator": self.originator,
+            "experiment_parent_key": self.experiment_parent_key,
         }
 
     @classmethod
@@ -147,6 +151,14 @@ class SessionRecord:
             },
             excluded=bool(value.get("excluded", False)),
             fingerprint=str(value.get("fingerprint") or ""),
+            originator=(
+                str(value["originator"]) if value.get("originator") is not None else None
+            ),
+            experiment_parent_key=(
+                str(value["experiment_parent_key"])
+                if value.get("experiment_parent_key") is not None
+                else None
+            ),
         )
 
 

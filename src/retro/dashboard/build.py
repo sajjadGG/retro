@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..storage import Layout
+from .benchmarks import BenchmarkView, read_benchmarks, write_benchmarks
 from .facts import (
     COLUMNS,
     FLAGS,
@@ -40,6 +41,7 @@ class DashboardInputs:
     signals: SignalStoreView
     sync: SyncView
     model: DashboardModel
+    benchmarks: BenchmarkView = field(default_factory=BenchmarkView)
 
 
 @dataclass
@@ -59,6 +61,11 @@ class BuildReport:
     excluded_detail_shards: int = 0
     detail_cached: int = 0
     detail_written: int = 0
+    benchmark_tasksets: int = 0
+    benchmark_tasks: int = 0
+    benchmark_suites: int = 0
+    benchmark_evaluations: int = 0
+    benchmark_shards: int = 0
     bytes_total: int = 0
     index_bytes: int = 0
     duration_s: float = 0.0
@@ -81,6 +88,11 @@ class BuildReport:
             "excluded_detail_shards": self.excluded_detail_shards,
             "detail_cached": self.detail_cached,
             "detail_written": self.detail_written,
+            "benchmark_tasksets": self.benchmark_tasksets,
+            "benchmark_tasks": self.benchmark_tasks,
+            "benchmark_suites": self.benchmark_suites,
+            "benchmark_evaluations": self.benchmark_evaluations,
+            "benchmark_shards": self.benchmark_shards,
             "bytes_total": self.bytes_total,
             "index_bytes": self.index_bytes,
             "duration_s": round(self.duration_s, 3),
@@ -115,8 +127,14 @@ def build(
     data_dir = output_dir / "data"
     writer = ShardWriter(model, data_dir, cache_dir=cache_dir, mode=resolved_mode)
     shard_report = writer.write_all()
+    benchmarks = write_benchmarks(inputs.benchmarks, data_dir)
 
     warnings = input_warnings(catalog, signals)
+    if inputs.benchmarks.warnings:
+        warnings.append(
+            f"{len(inputs.benchmarks.warnings)} benchmark artifact warnings; "
+            "see Tasks and Experiments for affected records and reasons"
+        )
     manifest = {
         "schema": SCHEMA,
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -163,6 +181,7 @@ def build(
         },
         "quality": model.quality,
         "sync": model.sync,
+        "benchmarks": benchmarks,
         "warnings": warnings,
     }
     write_js(data_dir / "manifest.js", "manifest", manifest)
@@ -184,6 +203,11 @@ def build(
         excluded_detail_shards=shard_report.excluded_detail_shards,
         detail_cached=shard_report.detail_cached,
         detail_written=shard_report.detail_written,
+        benchmark_tasksets=benchmarks["tasksets"],
+        benchmark_tasks=benchmarks["tasks"],
+        benchmark_suites=benchmarks["suites"],
+        benchmark_evaluations=benchmarks["evaluations"],
+        benchmark_shards=benchmarks["shards"],
         warnings=warnings,
     )
     report.index_bytes = index_path.stat().st_size if index_path.exists() else 0
@@ -194,13 +218,16 @@ def build(
 
 
 def load_inputs(layout: Layout) -> DashboardInputs:
-    """Read the catalog, signal store and sync reports, then build the fact table."""
+    """Read published archive contracts and build the session fact table."""
     catalog = read_catalog(layout)
     signals = read_signals(layout)
     mark_stale_signals(catalog, signals)
     sync = read_sync_runs(layout)
     model = build_model(layout, catalog, signals, sync)
-    return DashboardInputs(layout=layout, catalog=catalog, signals=signals, sync=sync, model=model)
+    benchmarks = read_benchmarks(layout, catalog)
+    return DashboardInputs(
+        layout=layout, catalog=catalog, signals=signals, sync=sync, model=model, benchmarks=benchmarks,
+    )
 
 
 def _included_dictionaries(model) -> dict[str, Any]:
