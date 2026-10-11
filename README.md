@@ -871,6 +871,46 @@ benchmark, so sources that yield multiple tasks do not receive extra weight.
 Agent failure, harness failure, scorer failure, and a correctly observed task
 failure remain distinct statuses.
 
+#### Commit-mined sources and outcome-informed sampling
+
+Most historical rollouts never captured clean-start proof, so they are rejected
+with `NO_EXACT_BASE_SHA`. A commit does not have that problem: its first parent
+*is* the pre-change state. `--sources commits` (or `both`) mines non-merge
+commits from the repositories Retro already saw in your catalog, or from the
+repeatable `--commit-repo`:
+
+```bash
+retro benchmark taskset select \
+  --name personal-git-v1 \
+  --sources both \
+  --commit-window-days 180 \
+  --strategy stratified --seed 0 --limit 40 --max-per-repo 10 \
+  --environment-config /outside/repo/retro-environment.json
+```
+
+Mining is read-only: Retro runs `git rev-list`, `git show`, `git diff` and
+`git cat-file` and never checks anything out in your working tree. A commit is
+eligible when it changes a non-test source file, is not a merge, revert, or a
+docs/lockfile/vendored-only change, stays inside `--commit-max-files`
+(default 50) and `--commit-max-lines` (default 2000), and was not reverted
+inside the stability horizon. The bundle records whether the commit touched
+tests. When a captured session ran in the same repository, overlaps or precedes
+the commit by at most `--commit-link-window-hours` (default 6) and edited files
+the commit changed, Retro links it, keeps the rollout in the bundle, and uses
+your real first prompt as prompt provenance; otherwise the commit message is the
+provenance, marked `commit_message`, for the TaskDefiner to back-translate.
+
+Selection is sampled rather than sorted. The default `--strategy stratified`
+walks (repository, work kind, diff size) strata round-robin with a seeded order
+that puts informative outcomes first: sources you corrected or that failed and
+were fixed rank above clean surviving successes, which rank above unlabeled
+ones. `--seed` reproduces an ordering exactly, `--max-per-repo` stops one
+repository from dominating (default 25% of `--limit` when limiting), and
+`--strategy lexicographic` restores the original ordering. Every selected source
+carries `outcome_labels` — commit survival, pushback proxies, signal outcome,
+each with evidence references — and the command prints yield by source kind,
+outcome label and rejection code.
+
 The environment resolver prioritizes an explicit external config, then a
 project Dockerfile/devcontainer declaration, validated CI commands, and an
 explicit RepoLaunch executable. It validates fresh base and outcome checkouts

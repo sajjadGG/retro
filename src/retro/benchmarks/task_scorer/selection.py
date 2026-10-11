@@ -18,17 +18,13 @@ from ...catalog import Catalog, load_catalog
 from ...schema import BUILTIN_HOSTS, Host, NormalizedEvent, read_events
 from ...storage import Layout
 from ...utils import atomic_write_text
-from . import git_state
+from . import git_state, sampling
 from .schema import ProjectEnvironment, RepoAnchor, SchemaError, require_rejection_code
 
 SELECTION_SCHEMA = "retro-taskset-selection-v1"
 DEFAULT_STABILITY_HORIZON_DAYS = 7
-_ACCEPTANCE_RE = re.compile(
-    r"^\s*(?:lgtm|looks good(?: to me)?|approved|ship it|merge it|"
-    r"that works|accepted|i accept(?: this)?)(?:[\s,.!]|$)",
-    re.IGNORECASE,
-)
-_ACCEPTANCE_RETRACTION_RE = re.compile(r"\b(?:but|however|except|not|don't|do not)\b", re.IGNORECASE)
+DEFAULT_SAMPLING_STRATEGY = "stratified"
+SOURCE_SELECTORS: tuple[str, ...] = ("sessions", "commits", "both")
 
 EnvironmentResolver = Callable[["SourceCandidate"], Optional[ProjectEnvironment]]
 
@@ -67,8 +63,8 @@ class SourceCandidate:
     source_id: str
     host: str
     session_id: str
-    normalized_path: Path
-    raw_dir: Path
+    normalized_path: Path | None
+    raw_dir: Path | None
     repo_root: Path
     cwd: str
     branch: str
@@ -79,6 +75,9 @@ class SourceCandidate:
     events: Sequence[NormalizedEvent] = ()
     environment: ProjectEnvironment | None = None
     repo_root_overridden: bool = False
+    kind: str = "session"
+    provenance: dict[str, Any] | None = None
+    outcome_labels: dict[str, Any] | None = None
 
     @property
     def base_sha(self) -> str:
@@ -120,8 +119,11 @@ class SourceCandidate:
             "source_id": self.source_id,
             "host": self.host,
             "session_id": self.session_id,
-            "normalized_path": str(self.normalized_path),
-            "raw_dir": str(self.raw_dir),
+            "source_kind": self.kind,
+            "normalized_path": (
+                str(self.normalized_path) if self.normalized_path is not None else None
+            ),
+            "raw_dir": str(self.raw_dir) if self.raw_dir is not None else None,
             "repo_root": str(self.repo_root),
             "cwd": self.cwd,
             "repo_root_overridden": self.repo_root_overridden,
@@ -141,6 +143,10 @@ class SourceCandidate:
                 "resolution": self.outcome.resolution,
                 "evidence": self.outcome.evidence,
             },
+            "provenance": dict(self.provenance) if self.provenance is not None else None,
+            "outcome_labels": (
+                dict(self.outcome_labels) if self.outcome_labels is not None else None
+            ),
             "environment_id": self.environment.environment_id if self.environment else None,
             "environment": self.environment.to_dict() if self.environment else None,
         }
@@ -154,6 +160,7 @@ class SourceCandidate:
             "source_id": self.source_id,
             "host": self.host,
             "session_id": self.session_id,
+            "source_kind": self.kind,
             "base_sha": self.base_sha,
             "base_tree": self.base_tree,
             "outcome_sha": self.outcome_sha,
@@ -170,6 +177,10 @@ class SourceCandidate:
             "ended_at": self.ended_at,
             "base_evidence": dict(self.base.evidence),
             "outcome_evidence": dict(self.outcome.evidence),
+            "provenance": dict(self.provenance) if self.provenance is not None else None,
+            "outcome_labels": (
+                dict(self.outcome_labels) if self.outcome_labels is not None else None
+            ),
         }
 
 
@@ -178,11 +189,26 @@ class SelectionResult:
     selected: list[SourceCandidate] = field(default_factory=list)
     rejections: list[SourceRejection] = field(default_factory=list)
     environment: dict[str, Any] = field(default_factory=dict)
+    sampling: dict[str, Any] = field(default_factory=dict)
 
     def rejection_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for rejection in self.rejections:
             counts[rejection.code] = counts.get(rejection.code, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def kind_counts(self) -> dict[str, int]:
+        """Selected sources per source kind; the yield summary reports this."""
+        counts: dict[str, int] = {}
+        for candidate in self.selected:
+            counts[candidate.kind] = counts.get(candidate.kind, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def label_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for candidate in self.selected:
+            label = str((candidate.outcome_labels or {}).get("label") or "unlabeled")
+            counts[label] = counts.get(label, 0) + 1
         return dict(sorted(counts.items()))
 
     def to_dict(self) -> dict[str, Any]:
@@ -194,8 +220,11 @@ class SelectionResult:
                 "selected": len(self.selected),
                 "rejected": len(self.rejections),
                 "by_code": self.rejection_counts(),
+                "by_kind": self.kind_counts(),
+                "by_label": self.label_counts(),
             },
             "environment": dict(self.environment),
+            "sampling": dict(self.sampling),
         }
 
 
@@ -230,16 +259,7 @@ def _session_bounds(
 
 def _user_accepted(events: Sequence[NormalizedEvent]) -> bool:
     """True when the rollout contains an explicit user acceptance message."""
-    from ...utils import event_text
-
-    for event in reversed(list(events)):
-        if event.event_type != "message" or event.actor != "user":
-            continue
-        text = event_text(event).strip().lower()
-        return bool(_ACCEPTANCE_RE.search(text)) and not bool(
-            _ACCEPTANCE_RETRACTION_RE.search(text)
-        )
-    return False
+    return sampling.user_accepted(events)
 
 
 def select_source(
@@ -435,6 +455,110 @@ def select_source(
     return candidate, None
 
 
+def _signal_store(layout: Layout) -> Any:
+    from ...signals.store import load_signal_store
+
+    try:
+        return load_signal_store(layout)
+    except (OSError, ValueError):
+        return None
+
+
+def label_candidate(
+    candidate: SourceCandidate,
+    *,
+    signals: Any = None,
+    stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
+) -> SourceCandidate:
+    """Attach outcome labels (commit survival, pushback, signal outcome)."""
+    if candidate.outcome_labels is not None:
+        return candidate
+    key = f"{candidate.host}/{candidate.session_id}"
+    values = signals.values(key) if signals is not None else {}
+    evidence = signals.evidence(key) if signals is not None else {}
+    labels = sampling.compute_outcome_labels(
+        repo_root=candidate.repo_root,
+        outcome_sha=candidate.outcome_sha,
+        branch=candidate.branch,
+        events=candidate.events,
+        signal_values=values,
+        signal_evidence=evidence,
+        stability_horizon_days=stability_horizon_days,
+    )
+    return replace(candidate, outcome_labels=labels.to_dict())
+
+
+def _repo_label(root: Path) -> str:
+    return git_state.canonical_remote(root) or str(root)
+
+
+def _work_kind(candidate: SourceCandidate, signals: Any) -> str:
+    provenance = candidate.provenance or {}
+    recorded = provenance.get("work_kind")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    if signals is not None:
+        value = signals.values(f"{candidate.host}/{candidate.session_id}").get("work.kind")
+        if isinstance(value, str) and value:
+            return value
+    return "unknown"
+
+
+def sample_candidates(
+    candidates: Sequence[SourceCandidate],
+    *,
+    strategy: str = DEFAULT_SAMPLING_STRATEGY,
+    seed: int = 0,
+    max_per_repo: int | None = None,
+    limit: int | None = None,
+    signals: Any = None,
+) -> tuple[list[SourceCandidate], list[SourceRejection], dict[str, Any]]:
+    """Order candidates deterministically and drop anything over the caps."""
+    units = []
+    for candidate in candidates:
+        size = sampling.diff_size(candidate.repo_root, candidate.base_sha, candidate.outcome_sha)
+        units.append(
+            sampling.sampling_unit(
+                source_id=candidate.source_id,
+                repo_key=git_state.repo_identity(candidate.repo_root),
+                repo_label=_repo_label(candidate.repo_root),
+                work_kind=_work_kind(candidate, signals),
+                files_changed=size["files_changed"],
+                lines_changed=size["lines_changed"],
+                labels=candidate.outcome_labels,
+            )
+        )
+    plan = sampling.plan_sample(
+        units, strategy=strategy, seed=seed, max_per_repo=max_per_repo, limit=limit
+    )
+    by_id = {candidate.source_id: candidate for candidate in candidates}
+    kept = [by_id[source_id] for source_id in plan.kept if source_id in by_id]
+    dropped = [
+        SourceRejection(
+            source_id=decision.source_id,
+            host=by_id[decision.source_id].host,
+            session_id=by_id[decision.source_id].session_id,
+            code="SAMPLED_OUT",
+            detail=(
+                "per-repository cap reached"
+                if decision.reason == "repo_cap"
+                else "selection limit reached"
+            ),
+            evidence={
+                "reason": decision.reason,
+                "stratum": decision.stratum_id,
+                "repo": decision.repo_label,
+                "label": decision.label,
+                "strategy": plan.strategy,
+                "seed": plan.seed,
+            },
+        )
+        for decision in plan.dropped
+        if decision.source_id in by_id
+    ]
+    return kept, dropped, plan.to_dict()
+
+
 def select_sources(
     *,
     layout: Layout,
@@ -444,10 +568,17 @@ def select_sources(
     require_environment: bool = True,
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
+    strategy: str = DEFAULT_SAMPLING_STRATEGY,
+    seed: int = 0,
+    max_per_repo: int | None = None,
+    limit: int | None = None,
+    extra_candidates: Sequence[SourceCandidate] = (),
+    extra_rejections: Sequence[SourceRejection] = (),
 ) -> SelectionResult:
     selected: list[SourceCandidate] = []
-    rejections: list[SourceRejection] = []
+    rejections: list[SourceRejection] = list(extra_rejections)
     catalog = load_catalog(layout)
+    signals = _signal_store(layout)
     for host, session_id in sessions:
         candidate, rejection = select_source(
             layout=layout,
@@ -461,12 +592,31 @@ def select_sources(
             _catalog=catalog,
         )
         if candidate is not None:
-            selected.append(candidate)
+            selected.append(
+                label_candidate(
+                    candidate, signals=signals, stability_horizon_days=stability_horizon_days
+                )
+            )
         if rejection is not None:
             rejections.append(rejection)
+    selected.extend(
+        label_candidate(
+            candidate, signals=signals, stability_horizon_days=stability_horizon_days
+        )
+        for candidate in extra_candidates
+    )
     selected.sort(key=lambda item: item.source_id)
+    selected, dropped, plan = sample_candidates(
+        selected,
+        strategy=strategy,
+        seed=seed,
+        max_per_repo=max_per_repo,
+        limit=limit,
+        signals=signals,
+    )
+    rejections.extend(dropped)
     rejections.sort(key=lambda item: (item.source_id, item.code))
-    return SelectionResult(selected=selected, rejections=rejections)
+    return SelectionResult(selected=selected, rejections=rejections, sampling=plan)
 
 
 def selection_path(layout: Layout, name: str) -> Path:
@@ -486,6 +636,9 @@ def write_selection(layout: Layout, name: str, result: SelectionResult) -> Path:
                 ("normalized_path", candidate.normalized_path),
                 ("raw_dir", candidate.raw_dir),
             ):
+                if candidate_path is None:
+                    record[key] = None
+                    continue
                 try:
                     record[key] = candidate_path.relative_to(layout.root).as_posix()
                 except ValueError:
@@ -733,18 +886,38 @@ def select_taskset(
     stability_horizon_days: int = DEFAULT_STABILITY_HORIZON_DAYS,
     repo_root: Path | None = None,
     write: bool = True,
+    sources: str = "sessions",
+    strategy: str = DEFAULT_SAMPLING_STRATEGY,
+    seed: int = 0,
+    max_per_repo: int | None = None,
+    limit: int | None = None,
+    commit_repos: Sequence[Path] | None = None,
+    commit_limits: Any = None,
 ) -> TasksetSelection:
-    """Select sessions into ``benchmarks/<name>/task-scorer/selection.json``.
+    """Select sources into ``benchmarks/<name>/task-scorer/selection.json``.
 
-    ``host``/``session_file`` mirror the spec CLI flags. Environment validation is
-    never inferred from ambient setup: pass ``environment_file`` with an explicit
-    validated contract, or pass ``require_environment=False`` to record an
-    unvalidated selection (which cannot generate adjacent tasks).
+    ``host``/``session_file`` mirror the spec CLI flags. ``sources`` chooses the
+    lanes: captured sessions (default), commits mined from the user's own Git
+    history, or both. Environment validation is never inferred from ambient
+    setup: pass ``environment_file`` with an explicit validated contract, or pass
+    ``require_environment=False`` to record an unvalidated selection (which
+    cannot generate adjacent tasks).
     """
+    from . import commit_sources as commit_sources_mod
+
     require_safe_id(name, "taskset name")
-    selectors = resolve_sessions(
-        layout=layout, host=host, session_file=session_file, sessions=sessions
-    )
+    if sources not in SOURCE_SELECTORS:
+        raise SelectionError(f"unknown source selector {sources!r}; expected {SOURCE_SELECTORS}")
+    selectors: list[tuple[str, str]] = []
+    if sources in ("sessions", "both"):
+        try:
+            selectors = resolve_sessions(
+                layout=layout, host=host, session_file=session_file, sessions=sessions
+            )
+        except SelectionError:
+            if sources == "sessions":
+                raise
+            selectors = []
     contract: EnvironmentContract | None = None
     resolver: EnvironmentResolver | None = None
     if environment_file is not None and environment_resolver is not None:
@@ -761,6 +934,32 @@ def select_taskset(
             "require_environment=False to record an unvalidated selection. Ambient "
             "developer setup is never recorded as validated."
         )
+    commit_candidates: list[SourceCandidate] = []
+    commit_rejections: list[SourceRejection] = []
+    commit_provenance: dict[str, Any] | None = None
+    if sources in ("commits", "both"):
+        limits = commit_limits or commit_sources_mod.CommitLimits()
+        try:
+            commit_candidates, commit_rejections = commit_sources_mod.select_commit_sources(
+                layout=layout,
+                repos=commit_repos,
+                branch=branch,
+                limits=limits,
+                stability_horizon_days=stability_horizon_days,
+            )
+        except commit_sources_mod.CommitSourceError as error:
+            raise SelectionError(str(error)) from error
+        commit_candidates = _resolve_environments(
+            commit_candidates,
+            resolver=resolver,
+            require_environment=require_environment,
+            rejections=commit_rejections,
+        )
+        commit_provenance = {
+            "limits": limits.to_dict(),
+            "repos": [str(path) for path in (commit_repos or [])],
+            "mined": len(commit_candidates),
+        }
     result = select_sources(
         layout=layout,
         sessions=[(item[0], item[1]) for item in selectors],  # type: ignore[misc]
@@ -769,6 +968,12 @@ def select_taskset(
         require_environment=require_environment,
         stability_horizon_days=stability_horizon_days,
         repo_root=repo_root,
+        strategy=strategy,
+        seed=seed,
+        max_per_repo=max_per_repo,
+        limit=limit,
+        extra_candidates=commit_candidates,
+        extra_rejections=commit_rejections,
     )
     environment_provenance: dict[str, Any] = {
         "required": require_environment,
@@ -786,7 +991,13 @@ def select_taskset(
             and all(candidate.environment is not None for candidate in result.selected)
         ),
     }
-    result = replace(result, environment=environment_provenance)
+    sampling_provenance = dict(result.sampling)
+    sampling_provenance["sources"] = sources
+    if commit_provenance is not None:
+        sampling_provenance["commits"] = commit_provenance
+    result = replace(
+        result, environment=environment_provenance, sampling=sampling_provenance
+    )
     path = write_selection(layout, name, result) if write else None
     return TasksetSelection(
         name=name,
@@ -795,6 +1006,50 @@ def select_taskset(
         path=path,
         contract=contract,
     )
+
+
+def _resolve_environments(
+    candidates: Sequence[SourceCandidate],
+    *,
+    resolver: EnvironmentResolver | None,
+    require_environment: bool,
+    rejections: list[SourceRejection],
+) -> list[SourceCandidate]:
+    """Apply the environment contract to externally built candidates."""
+    resolved: list[SourceCandidate] = []
+    for candidate in candidates:
+        environment: ProjectEnvironment | None = None
+        if resolver is not None:
+            try:
+                environment = resolver(candidate)
+            except (OSError, RuntimeError, ValueError) as error:
+                rejections.append(
+                    SourceRejection(
+                        source_id=candidate.source_id,
+                        host=candidate.host,
+                        session_id=candidate.session_id,
+                        code="ENVIRONMENT_UNAVAILABLE",
+                        detail=f"environment resolution failed: {error}",
+                        evidence={"base_sha": candidate.base_sha},
+                    )
+                )
+                continue
+        if environment is not None and environment.base_sha != candidate.base_sha:
+            environment = None
+        if environment is None and require_environment:
+            rejections.append(
+                SourceRejection(
+                    source_id=candidate.source_id,
+                    host=candidate.host,
+                    session_id=candidate.session_id,
+                    code="ENVIRONMENT_UNAVAILABLE",
+                    detail="no validated project environment for this repository state",
+                    evidence={"base_sha": candidate.base_sha},
+                )
+            )
+            continue
+        resolved.append(replace(candidate, environment=environment) if environment else candidate)
+    return resolved
 
 
 def load_selection(path: Path) -> dict[str, Any]:
@@ -808,9 +1063,11 @@ def load_selection(path: Path) -> dict[str, Any]:
 
 
 __all__ = [
+    "DEFAULT_SAMPLING_STRATEGY",
     "DEFAULT_STABILITY_HORIZON_DAYS",
     "ENVIRONMENT_CONTRACT_SCHEMA",
     "SELECTION_SCHEMA",
+    "SOURCE_SELECTORS",
     "EnvironmentContract",
     "EnvironmentResolver",
     "SelectionError",
@@ -819,6 +1076,7 @@ __all__ = [
     "SourceRejection",
     "TasksetSelection",
     "discover_sessions",
+    "label_candidate",
     "load_environment_contract",
     "load_selection",
     "load_session_file",
@@ -826,6 +1084,7 @@ __all__ = [
     "parse_session_selector",
     "require_safe_id",
     "resolve_sessions",
+    "sample_candidates",
     "select_source",
     "select_sources",
     "select_taskset",
