@@ -1582,6 +1582,24 @@ def validate_scorer_package(
     return manifest, computed, warnings
 
 
+def seal_scorer_package(scorer_dir: Path, package_sha256: str) -> None:
+    """Record Retro's computed package hash inside ``scorer.json``.
+
+    Ghostlab re-hashes the package before it runs a scorer and compares the
+    result with the manifest's declaration, so an undeclared hash is not a
+    neutral default: it is an unverifiable package. The declaration is excluded
+    from the hash itself, so sealing never changes the identity it attests to.
+    """
+    manifest_path = scorer_dir / "scorer.json"
+    payload = read_json(manifest_path, label="scorer.json")
+    if not isinstance(payload, dict):
+        raise StageFailure("BUILDER_CONTRACT_ERROR", "scorer.json is not a JSON object")
+    if payload.get("package_sha256") == package_sha256:
+        return
+    payload["package_sha256"] = package_sha256
+    write_json(manifest_path, payload)
+
+
 def compute_scorer_package_hash(scorer_dir: Path) -> str:
     manifest_path = scorer_dir / "scorer.json"
     manifest = read_json(manifest_path, label="scorer.json")
@@ -2287,6 +2305,8 @@ def _stage_scorer_built(
         manifest, package_sha256, warnings = validate_scorer_package(
             cached_scorer, task_id, forbidden_substrings=forbidden
         )
+        seal_scorer_package(cached_scorer, package_sha256)
+        manifest["package_sha256"] = package_sha256
         return (
             cached_scorer,
             manifest,
@@ -2336,6 +2356,8 @@ def _stage_scorer_built(
     manifest, package_sha256, warnings = validate_scorer_package(
         scorer_dir, task_id, forbidden_substrings=forbidden
     )
+    seal_scorer_package(scorer_dir, package_sha256)
+    manifest["package_sha256"] = package_sha256
     cases_path = result.export_path("validation-cases.json")
     if cases_path is None:
         raise StageFailure(

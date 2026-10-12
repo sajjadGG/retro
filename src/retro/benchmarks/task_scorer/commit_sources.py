@@ -358,6 +358,60 @@ def _first_user_message(events: Sequence[NormalizedEvent]) -> tuple[str | None, 
     return None, None
 
 
+def _last_matched_edit_at(
+    events: Sequence[NormalizedEvent], root: Path, matched: Iterable[str]
+) -> datetime | None:
+    """When the session last edited a file this commit also changed.
+
+    A session window alone is weak evidence: a multi-week host session contains
+    every commit made while it was open. The edit timestamp is what ties a
+    session to one commit, so linking is gated on it.
+    """
+    wanted = set(matched)
+    names = {PurePosixPath(item).name for item in wanted}
+    latest: datetime | None = None
+    for event in events:
+        if event.event_type != "file_edit":
+            continue
+        paths = _relative_paths(event_file_paths(event), root)
+        if not paths:
+            continue
+        if not (paths & wanted) and not ({PurePosixPath(p).name for p in paths} & names):
+            continue
+        moment = _parse_timestamp(event.timestamp)
+        if moment is None:
+            continue
+        if latest is None or moment > latest:
+            latest = moment
+    return latest
+
+
+def _user_message_for(
+    events: Sequence[NormalizedEvent], cutoff: datetime | None
+) -> tuple[str | None, str | None]:
+    """The user request that was open when the commit's work happened.
+
+    Falls back to the session's first user message when nothing is timestamped
+    at or before ``cutoff``, which keeps short single-goal sessions unchanged.
+    """
+    if cutoff is None:
+        return _first_user_message(events)
+    chosen: tuple[str, str | None] | None = None
+    for event in events:
+        if event.event_type != "message" or event.actor != "user":
+            continue
+        text = event_text(event).strip()
+        if not text:
+            continue
+        moment = _parse_timestamp(event.timestamp)
+        if moment is not None and moment > cutoff:
+            break
+        chosen = (text, event.event_id)
+    if chosen is None:
+        return _first_user_message(events)
+    return chosen
+
+
 def _record_repo_paths(record: Any) -> list[str]:
     values = [record.git.get("root"), record.cwd_resolved, record.cwd]
     return [value for value in values if isinstance(value, str) and value.strip()]
@@ -418,8 +472,12 @@ def link_session(
     """Link the captured session that most likely produced *commit*.
 
     A session qualifies when it ran in the same repository, its window contains
-    the commit (or ends at most ``link_window_hours`` before it), and its edited
-    files intersect the commit's changed files. The strongest file overlap wins.
+    the commit (or ends at most ``link_window_hours`` before it), its edited
+    files intersect the commit's changed files, and — when those edits carry
+    timestamps — it touched one of them within ``link_window_hours`` of the
+    commit. The strongest file overlap wins, and prompt provenance is the user
+    request that was open when those edits happened rather than whatever the
+    session happened to open with weeks earlier.
     """
     bounds = limits or CommitLimits()
     commit_at = _parse_timestamp(commit.committed_at) or _parse_timestamp(commit.authored_at)
@@ -459,10 +517,16 @@ def link_session(
             )
         if not matched:
             continue
+        matched_edit_at = _last_matched_edit_at(events, root, matched)
+        if matched_edit_at is not None:
+            drift = abs((commit_at - matched_edit_at).total_seconds())
+            if drift > window.total_seconds():
+                continue
+            gap = min(gap, drift / 60.0)
         rank = (-len(matched), gap, record.key)
         if best is not None and rank >= best:
             continue
-        prompt, prompt_event_id = _first_user_message(events)
+        prompt, prompt_event_id = _user_message_for(events, matched_edit_at)
         best = rank
         best_link = SessionLink(
             session_key=record.key,

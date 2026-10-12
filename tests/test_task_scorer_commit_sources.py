@@ -8,9 +8,11 @@ from pathlib import Path
 import pytest
 
 from retro.benchmarks.task_scorer import bundle as bundle_mod
-from retro.benchmarks.task_scorer import commit_sources, selection
+from retro.benchmarks.task_scorer import commit_sources, selection, task_lint
 from retro.benchmarks.task_scorer.schema import ProjectEnvironment, SourceBundleManifest
+from retro.schema import read_events
 from retro.storage import Layout
+from retro.utils import event_text
 from tests.task_scorer_helpers import (
     event,
     git,
@@ -128,6 +130,7 @@ def _install_linked_session(layout: Layout, root: Path, *, session_id: str = "li
                 actor="user",
                 payload={"text": "Make divide reject a zero denominator."},
                 session_id=session_id,
+                timestamp="2026-08-01T11:05:00Z",
             ),
             event(
                 2,
@@ -135,6 +138,7 @@ def _install_linked_session(layout: Layout, root: Path, *, session_id: str = "li
                 event_type="file_edit",
                 payload={"file_path": str(root / "src" / "calc.py"), "text": "guard"},
                 session_id=session_id,
+                timestamp="2026-08-01T11:45:00Z",
             ),
         ],
         cwd=str(root),
@@ -256,6 +260,127 @@ def test_sessions_outside_the_link_window_are_not_linked(archive: Layout, mined)
     assert (candidate.provenance or {})["prompt_provenance"]["mode"] == "commit_message"
 
 
+def test_long_session_editing_the_files_days_earlier_is_not_linked(archive: Layout, mined):
+    """A host session that stays open for weeks contains every commit made
+    meanwhile; only edit proximity ties one of them to this commit."""
+    root, shas = mined
+    session_id = "long-1"
+    install_session(
+        archive,
+        session_id=session_id,
+        events=[
+            event(
+                1,
+                actor="user",
+                payload={"text": "Push both repositories and open the pull requests."},
+                session_id=session_id,
+                timestamp="2026-07-20T10:00:00Z",
+            ),
+            event(
+                2,
+                actor="assistant",
+                event_type="file_edit",
+                payload={"file_path": str(root / "src" / "calc.py"), "text": "unrelated"},
+                session_id=session_id,
+                timestamp="2026-07-20T10:30:00Z",
+            ),
+        ],
+        cwd=str(root),
+    )
+    _catalog(
+        archive,
+        [
+            {
+                "schema": 2,
+                "key": f"codex/{session_id}",
+                "host": "codex",
+                "session_id": session_id,
+                "started_at": "2026-07-20T09:00:00+00:00",
+                "ended_at": "2026-08-20T09:00:00+00:00",
+                "cwd": str(root),
+                "cwd_resolved": str(root),
+                "git": {"root": str(root), "branch": "main"},
+                "first_prompt": "Push both repositories and open the pull requests.",
+                "excluded": False,
+            }
+        ],
+    )
+    candidate, _rejection = commit_sources.select_commit_source(
+        layout=archive, root=root, sha=shas["feature"], branch="main"
+    )
+    assert candidate is not None
+    provenance = candidate.provenance or {}
+    assert provenance["prompt_provenance"]["mode"] == "commit_message"
+    assert provenance["linkage"] is None
+
+
+def test_linked_prompt_is_the_request_open_when_the_files_were_edited(archive: Layout, mined):
+    root, shas = mined
+    session_id = "multi-1"
+    install_session(
+        archive,
+        session_id=session_id,
+        events=[
+            event(
+                1,
+                actor="user",
+                payload={"text": "Set up the release pipeline."},
+                session_id=session_id,
+                timestamp="2026-08-01T09:30:00Z",
+            ),
+            event(
+                2,
+                actor="user",
+                payload={"text": "Make divide reject a zero denominator."},
+                session_id=session_id,
+                timestamp="2026-08-01T11:30:00Z",
+            ),
+            event(
+                3,
+                actor="assistant",
+                event_type="file_edit",
+                payload={"file_path": str(root / "src" / "calc.py"), "text": "guard"},
+                session_id=session_id,
+                timestamp="2026-08-01T11:45:00Z",
+            ),
+            event(
+                4,
+                actor="user",
+                payload={"text": "status"},
+                session_id=session_id,
+                timestamp="2026-08-01T13:30:00Z",
+            ),
+        ],
+        cwd=str(root),
+    )
+    _catalog(
+        archive,
+        [
+            {
+                "schema": 2,
+                "key": f"codex/{session_id}",
+                "host": "codex",
+                "session_id": session_id,
+                "started_at": "2026-08-01T09:00:00+00:00",
+                "ended_at": "2026-08-01T14:00:00+00:00",
+                "cwd": str(root),
+                "cwd_resolved": str(root),
+                "git": {"root": str(root), "branch": "main"},
+                "first_prompt": "Set up the release pipeline.",
+                "excluded": False,
+            }
+        ],
+    )
+    candidate, _rejection = commit_sources.select_commit_source(
+        layout=archive, root=root, sha=shas["feature"], branch="main"
+    )
+    assert candidate is not None
+    prompt_provenance = (candidate.provenance or {})["prompt_provenance"]
+    assert prompt_provenance["mode"] == "linked_session"
+    assert prompt_provenance["prompt"] == "Make divide reject a zero denominator."
+    assert prompt_provenance["event_id"] == f"{session_id}:2"
+
+
 def test_catalog_repositories_are_discovered(archive: Layout, mined):
     root, _shas = mined
     _install_linked_session(archive, root)
@@ -308,7 +433,16 @@ def test_commit_source_bundles_match_the_bundle_contract(archive: Layout, mined)
     assert manifest.repo.state_confidence == "exact_clean_commit"
     assert manifest.provenance is not None
     assert manifest.outcome_labels is not None
-    assert (built.path / "rollout" / "events.jsonl").read_text(encoding="utf-8") == ""
+    rollout = [
+        json.loads(line)
+        for line in (built.path / "rollout" / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [record["payload"]["text"] for record in rollout] == [
+        "fix: guard divide against zero"
+    ]
 
     provenance = json.loads(
         (built.path / "context" / "source-provenance.json").read_text(encoding="utf-8")
@@ -329,6 +463,27 @@ def test_linked_commit_bundles_carry_the_session_rollout(archive: Layout, mined)
     built = bundle_mod.build_source_bundle(candidate, layout=archive, name="mined")
     events = (built.path / "rollout" / "events.jsonl").read_text(encoding="utf-8")
     assert "Make divide reject a zero denominator." in events
+    assert bundle_mod.verify_bundle(built.path)
+
+
+def test_unlinked_commit_bundles_carry_the_commit_message_as_a_user_event(
+    archive: Layout, mined
+):
+    """Commit-message back-translation needs a user event; an empty rollout
+    would fail the replay lint's user-provenance gate for every task."""
+    root, shas = mined
+    candidate, _rejection = commit_sources.select_commit_source(
+        layout=archive, root=root, sha=shas["feature"], branch="main"
+    )
+    assert candidate is not None
+    assert (candidate.provenance or {})["prompt_provenance"]["mode"] == "commit_message"
+    built = bundle_mod.build_source_bundle(candidate, layout=archive, name="mined")
+    events = list(read_events(built.path / "rollout" / "events.jsonl"))
+    assert len(events) == 1
+    assert events[0].actor == "user" and events[0].event_type == "message"
+    assert "guard divide against zero" in event_text(events[0])
+    facts = task_lint.BundleFacts.from_bundle(built.path)
+    assert facts.user_event_ids == {events[0].event_id}
     assert bundle_mod.verify_bundle(built.path)
 
 

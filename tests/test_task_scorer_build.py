@@ -28,6 +28,7 @@ from retro.benchmarks.task_scorer.build import (
     build_source,
     build_sources,
     coerce_lint_outcome,
+    compute_scorer_package_hash,
     compute_task_id,
     evaluate_repeatability,
     evaluate_validation_case,
@@ -35,6 +36,7 @@ from retro.benchmarks.task_scorer.build import (
     normalize_prompt,
     pack_directory,
     resolve_lint_fn,
+    seal_scorer_package,
     unpack_bundle,
     validate_scorer_package,
 )
@@ -1034,6 +1036,24 @@ def test_scorer_package_safety_scan_rejects_oracle_references(tmp_path: Path) ->
             package, PACKAGE_TASK_ID, forbidden_substrings=("repo/outcome",)
         )
     assert excinfo.value.code == "SCORER_UNSAFE"
+
+
+def test_scorer_package_is_sealed_with_the_computed_hash(tmp_path: Path) -> None:
+    """Ghostlab verifies the declared package hash before running a scorer, so
+    an undeclared one makes the package unrunnable."""
+    package = make_scorer_package(tmp_path / "scorer", PACKAGE_TASK_ID)
+    payload = json.loads((package / "scorer.json").read_text())
+    assert payload.get("package_sha256") in (None, "")
+
+    _manifest, package_sha256, _warnings = validate_scorer_package(package, PACKAGE_TASK_ID)
+    seal_scorer_package(package, package_sha256)
+
+    sealed = json.loads((package / "scorer.json").read_text())
+    assert sealed["package_sha256"] == package_sha256
+    assert compute_scorer_package_hash(package) == package_sha256
+    again, repeated, _ = validate_scorer_package(package, PACKAGE_TASK_ID)
+    assert repeated == package_sha256
+    assert again["package_sha256"] == package_sha256
 
 
 def test_scorer_package_hash_mismatch_is_rejected(tmp_path: Path) -> None:
