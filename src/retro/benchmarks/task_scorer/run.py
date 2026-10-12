@@ -1464,7 +1464,7 @@ def _verify_scorer_package(
     if declared is not None and declared not in accepted:
         raise TaskVerificationError(
             f"published task {task_id} scorer.json declares {declared}, but the package "
-            f"hash is {computed}"
+            f"hash is {computed}; the scorer package changed after publication"
         )
     if not isinstance(recorded, str) or not recorded:
         raise TaskVerificationError(
